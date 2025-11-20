@@ -15,17 +15,14 @@ bool bufferCheck(const T* deviceBuffer, const T* hostBuffer, size_t elem_count) 
     return same;
 }
 
-template<typename BuildT>
-void mainDilateGrid(
-    nanovdb::NanoGrid<BuildT> *deviceGridOriginal,
-    nanovdb::NanoGrid<BuildT> *deviceGridDilated,
-    nanovdb::NanoGrid<BuildT> *indexGridOriginal,
-    nanovdb::NanoGrid<BuildT> *indexGridDilated,
-    uint32_t nnType,
+void mainSparseConvolutionIGEMM(
+    const std::vector<nanovdb::Coord>& inputPoints,
+    const std::vector<nanovdb::Coord>& outputPoints,
     uint32_t benchmark_iters)
 {
     nanovdb::util::cuda::Timer gpuTimer;
 
+#if 0
     // Initialize dilator
     nanovdb::tools::cuda::DilateGrid<BuildT> dilator( deviceGridOriginal );
     dilator.setOperation(nanovdb::tools::morphology::NearestNeighbors(nnType));
@@ -88,15 +85,5 @@ void mainDilateGrid(
         auto dummyHandle = pruner.getHandle();
         gpuTimer.stop();
     }
-
+#endif
 }
-
-template
-void mainDilateGrid(
-    nanovdb::NanoGrid<nanovdb::ValueOnIndex> *deviceGridOriginal,
-    nanovdb::NanoGrid<nanovdb::ValueOnIndex> *deviceGridDilated,
-    nanovdb::NanoGrid<nanovdb::ValueOnIndex> *indexGridOriginal,
-    nanovdb::NanoGrid<nanovdb::ValueOnIndex> *indexGridDilated,
-    uint32_t nnType,
-    uint32_t benchmark_iters
-);

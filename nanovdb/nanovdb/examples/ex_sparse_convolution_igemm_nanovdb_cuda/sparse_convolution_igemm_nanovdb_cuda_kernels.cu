@@ -1,9 +1,8 @@
 // Copyright Contributors to the OpenVDB Project
 // SPDX-License-Identifier: Apache-2.0
 
-#include <nanovdb/tools/cuda/DilateGrid.cuh>
-#include <nanovdb/tools/cuda/PruneGrid.cuh>
-#include <nanovdb/util/cuda/Injection.cuh>
+#include <nanovdb/tools/cuda/PointsToGrid.cuh>
+#include <nanovdb/tools/cuda/MergeGrids.cuh>
 
 template<typename T>
 bool bufferCheck(const T* deviceBuffer, const T* hostBuffer, size_t elem_count) {
@@ -15,12 +14,73 @@ bool bufferCheck(const T* deviceBuffer, const T* hostBuffer, size_t elem_count) 
     return same;
 }
 
+template<class BufferT>
+void printGridDiagnostics(nanovdb::GridHandle<BufferT>& handle)
+{
+    using BuildT = nanovdb::ValueOnIndex;
+
+    auto deviceGrid = handle.template deviceGrid<BuildT>();
+    if (!deviceGrid) throw std::logic_error("No GPU grid found in printGridDiagnostics()");
+
+    auto valueCount = nanovdb::util::cuda::DeviceGridTraits<BuildT>::getValueCount(deviceGrid);
+    auto treeData = nanovdb::util::cuda::DeviceGridTraits<BuildT>::getTreeData(deviceGrid);
+    auto gridSize = nanovdb::util::cuda::DeviceGridTraits<BuildT>::getGridSize(deviceGrid);
+    auto indexBBox = nanovdb::util::cuda::DeviceGridTraits<BuildT>::getIndexBBox(deviceGrid, treeData);
+
+    std::cout << "======= Grid info =======" << std::endl;
+    std::cout << "Allocated values         : " << valueCount << std::endl;
+    std::cout << "Active voxels            : " << treeData.mVoxelCount << std::endl;
+    auto minCorner = indexBBox.min(), maxCorner = indexBBox.max();
+    std::cout << "Index-space bounding box : [" << minCorner.x() << "," << minCorner.y() << "," << minCorner.z()
+              << "] -> [" << maxCorner.x() << "," << maxCorner.y() << "," << maxCorner.z() << "]" << std::endl;
+    std::cout << "Leaf nodes               : " << treeData.mNodeCount[0] << std::endl;
+    std::cout << "Lower internal nodes     : " << treeData.mNodeCount[1] << std::endl;
+    std::cout << "Upper internal nodes     : " << treeData.mNodeCount[2] << std::endl;
+    std::cout << "Leaf-level occupancy     : "
+              << 100.f * (float)(treeData.mVoxelCount)/(float)(treeData.mNodeCount[0] * 512)
+              << "%" << std::endl;
+    std::cout << "Memory usage             : " << gridSize << " bytes" << std::endl;
+}
+
 void mainSparseConvolutionIGEMM(
     const std::vector<nanovdb::Coord>& inputPoints,
     const std::vector<nanovdb::Coord>& outputPoints,
     uint32_t benchmark_iters)
 {
+    using BuildT = nanovdb::ValueOnIndex;
+
     nanovdb::util::cuda::Timer gpuTimer;
+
+    gpuTimer.start("Building input grid");
+    auto inputBuffer = nanovdb::cuda::DeviceBuffer::create( inputPoints.size() * sizeof(nanovdb::Coord), nullptr, false);
+    cudaCheck(cudaMemcpy(inputBuffer.deviceData(), inputPoints.data(), inputPoints.size() * sizeof(nanovdb::Coord), cudaMemcpyHostToDevice));
+    nanovdb::tools::cuda::PointsToGrid<BuildT> converter;
+    converter.setChecksum(nanovdb::CheckMode::Default);
+    auto inputHandle = converter.getHandle(static_cast<nanovdb::Coord*>(inputBuffer.deviceData()), inputPoints.size());
+    auto inputGrid = inputHandle.deviceGrid<BuildT>();
+    gpuTimer.stop();
+
+    std::cout << "Input Grid Diagnostics:" << std::endl;
+    printGridDiagnostics(inputHandle);
+
+    gpuTimer.start("Building output grid");
+    auto outputBuffer = nanovdb::cuda::DeviceBuffer::create( outputPoints.size() * sizeof(nanovdb::Coord), nullptr, false);
+    cudaCheck(cudaMemcpy(outputBuffer.deviceData(), outputPoints.data(), outputPoints.size() * sizeof(nanovdb::Coord), cudaMemcpyHostToDevice));
+    converter.setChecksum(nanovdb::CheckMode::Default);
+    auto outputHandle = converter.getHandle(static_cast<nanovdb::Coord*>(outputBuffer.deviceData()), outputPoints.size());
+    auto outputGrid = outputHandle.deviceGrid<BuildT>();
+    gpuTimer.stop();
+
+    std::cout << "Output Grid Diagnostics:" << std::endl;
+    printGridDiagnostics(outputHandle);
+
+    // Initialize merger
+    nanovdb::tools::cuda::MergeGrids<BuildT> merger( inputGrid, outputGrid );
+    merger.setChecksum(nanovdb::CheckMode::Default);
+    merger.setVerbose(0);
+    auto mergedHandle = merger.getHandle();
+    printGridDiagnostics(mergedHandle);
+
 
 #if 0
     // Initialize dilator

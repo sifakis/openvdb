@@ -1,8 +1,15 @@
 // Copyright Contributors to the OpenVDB Project
 // SPDX-License-Identifier: Apache-2.0
 
+#include <nanovdb/cuda/UnifiedBuffer.h>
 #include <nanovdb/tools/cuda/PointsToGrid.cuh>
 #include <nanovdb/tools/cuda/MergeGrids.cuh>
+#include <nanovdb/util/cuda/DeviceGridTraits.cuh>
+
+#include <thrust/universal_vector.h>
+#include <random>
+
+#include "ampere_conv_kernel.h"
 
 template<typename T>
 bool bufferCheck(const T* deviceBuffer, const T* hostBuffer, size_t elem_count) {
@@ -48,15 +55,21 @@ void mainSparseConvolutionIGEMM(
     uint32_t benchmark_iters)
 {
     using BuildT = nanovdb::ValueOnIndex;
-
+    using BufferT = nanovdb::cuda::UnifiedBuffer;
+    static constexpr int Di = 64;
+    static constexpr int Do = 128;
+    using inputArrayT = float (&) [][Di];
+    using outputArrayT = float (&) [][Do];
+    using filterArrayT = float (&) [3][3][3][Do][Di];
+    
     nanovdb::util::cuda::Timer gpuTimer;
 
     gpuTimer.start("Building input grid");
-    auto inputBuffer = nanovdb::cuda::DeviceBuffer::create( inputPoints.size() * sizeof(nanovdb::Coord), nullptr, false);
+    auto inputBuffer = BufferT::create( inputPoints.size() * sizeof(nanovdb::Coord), nullptr, false);
     cudaCheck(cudaMemcpy(inputBuffer.deviceData(), inputPoints.data(), inputPoints.size() * sizeof(nanovdb::Coord), cudaMemcpyHostToDevice));
     nanovdb::tools::cuda::PointsToGrid<BuildT> converter;
     converter.setChecksum(nanovdb::CheckMode::Default);
-    auto inputHandle = converter.getHandle(static_cast<nanovdb::Coord*>(inputBuffer.deviceData()), inputPoints.size());
+    auto inputHandle = converter.getHandle<nanovdb::Coord*, BufferT>(static_cast<nanovdb::Coord*>(inputBuffer.deviceData()), inputPoints.size());
     auto inputGrid = inputHandle.deviceGrid<BuildT>();
     gpuTimer.stop();
 
@@ -64,10 +77,10 @@ void mainSparseConvolutionIGEMM(
     printGridDiagnostics(inputHandle);
 
     gpuTimer.start("Building output grid");
-    auto outputBuffer = nanovdb::cuda::DeviceBuffer::create( outputPoints.size() * sizeof(nanovdb::Coord), nullptr, false);
+    auto outputBuffer = BufferT::create( outputPoints.size() * sizeof(nanovdb::Coord), nullptr, false);
     cudaCheck(cudaMemcpy(outputBuffer.deviceData(), outputPoints.data(), outputPoints.size() * sizeof(nanovdb::Coord), cudaMemcpyHostToDevice));
     converter.setChecksum(nanovdb::CheckMode::Default);
-    auto outputHandle = converter.getHandle(static_cast<nanovdb::Coord*>(outputBuffer.deviceData()), outputPoints.size());
+    auto outputHandle = converter.getHandle<nanovdb::Coord*, BufferT>(static_cast<nanovdb::Coord*>(outputBuffer.deviceData()), outputPoints.size());
     auto outputGrid = outputHandle.deviceGrid<BuildT>();
     gpuTimer.stop();
 
@@ -75,12 +88,56 @@ void mainSparseConvolutionIGEMM(
     printGridDiagnostics(outputHandle);
 
     // Initialize merger
+    gpuTimer.start("Merging input/output grids (for testing)");
     nanovdb::tools::cuda::MergeGrids<BuildT> merger( inputGrid, outputGrid );
     merger.setChecksum(nanovdb::CheckMode::Default);
     merger.setVerbose(0);
     auto mergedHandle = merger.getHandle();
+    gpuTimer.stop();
+
+    std::cout << "Merged Grid Diagnostics:" << std::endl;
     printGridDiagnostics(mergedHandle);
 
+    // Allocate and initialize benchmark data
+
+    std::random_device rd;
+    std::mt19937 generator(rd());
+    std::uniform_int_distribution<int> distribution(-256, 256);
+
+    gpuTimer.start("Initializing input (activation) data");
+    auto inputValueCount = nanovdb::util::cuda::DeviceGridTraits<BuildT>::getValueCount(inputGrid);
+    auto inputVoxelCount = nanovdb::util::cuda::DeviceGridTraits<BuildT>::getActiveVoxelCount(inputGrid);
+    auto inputData = thrust::universal_vector<float>(inputValueCount*Di);
+    auto inputArray = reinterpret_cast<inputArrayT>(*inputData.data().get());
+    for (int i = 0; i < Di; i++) inputArray[0][i] = 0.f;
+#pragma omp parallel for
+    for (int v = 1; v <= inputVoxelCount; v++)
+        for (int i = 0; i < Di; i++)
+            inputArray[v][i] = ((float)distribution(generator))/256.0f; // Use only up to 7 bits in the mantissa
+    gpuTimer.stop();
+    
+    gpuTimer.start("Initializing output (including reference) data");
+    auto outputValueCount = nanovdb::util::cuda::DeviceGridTraits<BuildT>::getValueCount(outputGrid);
+    auto outputVoxelCount = nanovdb::util::cuda::DeviceGridTraits<BuildT>::getActiveVoxelCount(outputGrid);
+    auto outputData = thrust::universal_vector<float>(outputValueCount*Do);
+    auto outputArray = reinterpret_cast<outputArrayT>(*outputData.data().get());
+    auto outputReferenceData = thrust::universal_vector<float>(outputValueCount*Do);
+    auto outputReferenceArray = reinterpret_cast<outputArrayT>(*outputReferenceData.data().get());
+#pragma omp parallel for
+    for (int v = 0; v <= inputValueCount; v++)
+        for (int i = 0; i < Di; i++)
+            outputArray[v][i] = outputReferenceArray[v][i] = 0.f;
+    gpuTimer.stop();
+
+    gpuTimer.start("Initializing filter data");
+    auto filterData = thrust::universal_vector<float>(3*3*3*Do*Di);
+    auto filterArray = reinterpret_cast<filterArrayT>(*filterData.data().get());
+#pragma omp parallel for
+    for (int i = 0; i < filterData.size(); i++)
+        filterData[i] = ((float)distribution(generator))/256.0f; // Use only up to 7 bits in the mantissa
+    gpuTimer.stop();
+
+    auto inputLeafCount = inputGrid->tree().nodeCount(0);
 
 #if 0
     // Initialize dilator

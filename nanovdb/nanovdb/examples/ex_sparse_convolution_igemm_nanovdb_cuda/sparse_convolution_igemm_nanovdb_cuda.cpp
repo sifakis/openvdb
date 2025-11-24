@@ -39,16 +39,17 @@ int main(int argc, char *argv[])
     std::mt19937 generator(rd());
 
     static const int ambient_voxels = 1024*1024*2;
-    static const float occupancy = .5f;
+    static const float input_occupancy = .5f;
+    static const float output_occupancy = 1.f;
     static const float overlap = .45f;
     nanovdb::Coord offset(-8,-16,-24);    
 
     // Mark input voxels at requested occupancy
-    int target_active_voxels = (int) (occupancy*(float)ambient_voxels);
+    int target_input_voxels = (int) (input_occupancy*(float)ambient_voxels);
     std::vector<bool> voxmap(ambient_voxels);
     int active_voxels = 0;
     std::uniform_int_distribution<int> distribution(0, ambient_voxels-1);
-    while (active_voxels < target_active_voxels) {
+    while (active_voxels < target_input_voxels) {
         int i = distribution(generator);
         if (!voxmap[i]) {
             voxmap[i] = true;
@@ -77,7 +78,8 @@ int main(int argc, char *argv[])
         }
     }
     // Then sample more voxels until desired occupancy is met
-    while (active_voxels < target_active_voxels) {
+    int target_output_voxels = (int) (output_occupancy*(float)ambient_voxels);
+    while (active_voxels < target_output_voxels) {
         int i = distribution(generator);
         if (!voxmap[i]) {
             voxmap[i] = true;

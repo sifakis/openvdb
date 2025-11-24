@@ -166,6 +166,60 @@ if(NANOVDB_USE_MAGICAVOXEL)
   endif()
 endif()
 
+add_library(nanovdb INTERFACE)
+target_include_directories(nanovdb INTERFACE ../)
+target_compile_options(nanovdb INTERFACE
+  "$<$<COMPILE_LANG_AND_ID:CXX,GNU>:-Wno-invalid-offsetof>"
+  "$<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/bigobj>")
+
+if(NANOVDB_USE_CUTLASS)
+  if(NANOVDB_ALLOW_FETCHCONTENT)
+    if(NOT cutlass_POPULATED)
+      message(STATUS "Downloading CUTLASS...")
+
+      FetchContent_Declare(
+        cutlass
+        GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
+        GIT_TAG main # IMPORTANT: Consider using a specific, stable release tag (e.g., v3.4.0)
+      )
+
+      FetchContent_GetProperties(cutlass)
+      if(NOT cutlass_POPULATED)
+        FetchContent_Populate(cutlass)
+        set(cutlass_SOURCE_DIR ${cutlass_SOURCE_DIR})
+      endif()
+    endif()
+  endif()
+endif()
+
+if(NANOVDB_USE_CUDA)
+  if(NANOVDB_USE_CUTLASS)
+    # 1. First, assume the path is the fetched directory if FetchContent was allowed
+    # Note: FetchContent_Populate defines cutlass_SOURCE_DIR in the local scope.
+    if(NANOVDB_ALLOW_FETCHCONTENT AND DEFINED cutlass_SOURCE_DIR)
+      set(CUTLASS_ROOT ${cutlass_SOURCE_DIR})
+    # 2. If fetching was not allowed OR the variable wasn't defined, try to find it
+    else()
+      find_path(CUTLASS_ROOT include/cutlass/cutlass.h)
+    endif()
+
+    if(CUTLASS_ROOT)
+      # Use the found/fetched root to set the INTERFACE include paths
+      target_include_directories(nanovdb INTERFACE
+        ${CUTLASS_ROOT}/include
+        ${CUTLASS_ROOT}/tools/util/include
+      )
+    else()
+      # This will be triggered if neither FetchContent nor find_path succeeded.
+      message(FATAL_ERROR "NANOVDB_USE_CUTLASS is ON, but CUTLASS headers not found.
+      Please set CUTLASS_ROOT or ensure NANOVDB_ALLOW_FETCHCONTENT=ON.")
+    endif()
+    
+    target_compile_definitions(nanovdb INTERFACE -DNANOVDB_USE_CUTLASS)
+  endif()
+
+endif()
+
 ###############################################################################
 # Installation
 ###############################################################################
@@ -289,12 +343,6 @@ set(NANOVDB_INCLUDE_UTIL_CUDA_FILES
   util/cuda/DeviceGridTraits.cuh
   util/cuda/Injection.cuh
 )
-
-add_library(nanovdb INTERFACE)
-target_include_directories(nanovdb INTERFACE ../)
-target_compile_options(nanovdb INTERFACE
-  "$<$<COMPILE_LANG_AND_ID:CXX,GNU>:-Wno-invalid-offsetof>"
-  "$<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/bigobj>")
 
 if(WIN32)
   target_compile_definitions(nanovdb INTERFACE -DNOMINMAX -D_USE_MATH_DEFINES)

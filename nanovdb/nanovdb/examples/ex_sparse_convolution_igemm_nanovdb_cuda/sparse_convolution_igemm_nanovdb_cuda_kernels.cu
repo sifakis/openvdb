@@ -21,6 +21,48 @@ bool bufferCheck(const T* deviceBuffer, const T* hostBuffer, size_t elem_count) 
     return same;
 }
 
+struct IGEMM_Settings
+{
+    //
+    // Convolution geometry
+    //
+
+    static constexpr int T = 3;     // X-dimension of convolution filter
+    static constexpr int R = 3;     // Y-dimension of convolution filter
+    static constexpr int S = 3;     // Z-dimension of convolution filter
+    
+    static constexpr int Z = 4;     // X-dimension of output block
+    static constexpr int P = 2;     // Y-dimension of output block
+    static constexpr int Q = 2;     // Z-dimension of output block
+
+    static constexpr int D = Z+T-1; // X-dimension of input block (inluding halo)
+    static constexpr int H = P+R-1; // X-dimension of input block (inluding halo)
+    static constexpr int W = Q+S-1; // X-dimension of input block (inluding halo)
+
+    static_assert(D==6, "Only convolution geometry supported is 4x2x2 block and 3x3x3 filter size");
+    static_assert(H==4, "Only convolution geometry supported is 4x2x2 block and 3x3x3 filter size");
+    static_assert(W==4, "Only convolution geometry supported is 4x2x2 block and 3x3x3 filter size");
+
+    static constexpr int C = 64;    // Input feature dimension
+    static constexpr int K = 128;   // Output feature dimension
+    
+    //
+    // Leaf node geometry
+    //
+
+    static constexpr int Bx = 8/Z;  // Block count along X-dimension of leaf node
+    static constexpr int By = 8/P;  // Block count along Y-dimension of leaf node
+    static constexpr int Bz = 8/Q;  // Block count along Z-dimension of leaf node
+
+    //
+    // Filter offset (coordinate offset in the input domain that the [0,0,0] filter spoke corresponds to)
+    //
+
+    static constexpr int Dx = -1;  // Filter centered at (0,0,0), thus (0,0,0) spoke corresponds
+    static constexpr int Dy = -1;  // to a (-1,-1,-1) grid offset
+    static constexpr int Dz = -1;
+};
+
 template<class BufferT>
 void printGridDiagnostics(nanovdb::GridHandle<BufferT>& handle)
 {
@@ -137,70 +179,59 @@ void mainSparseConvolutionIGEMM(
         filterData[i] = ((float)distribution(generator))/256.0f; // Use only up to 7 bits in the mantissa
     gpuTimer.stop();
 
-    auto inputLeafCount = inputGrid->tree().nodeCount(0);
+    gpuTimer.start("Initializing scatter indices");
+    auto outputLeafCount = outputGrid->tree().nodeCount(0);
+    auto blockCount = outputLeafCount
+        * IGEMM_Settings::Bx * IGEMM_Settings::By * IGEMM_Settings::Bz;
 
-#if 0
-    // Initialize dilator
-    nanovdb::tools::cuda::DilateGrid<BuildT> dilator( deviceGridOriginal );
-    dilator.setOperation(nanovdb::tools::morphology::NearestNeighbors(nnType));
-    dilator.setChecksum(nanovdb::CheckMode::Default);
-    dilator.setVerbose(1);
-
-    auto handle = dilator.getHandle();
-    auto dstGrid = handle.template deviceGrid<BuildT>();
-
-    // Check for correctness
-    if (bufferCheck((char*)dstGrid, (char*)indexGridDilated->data(), indexGridDilated->gridSize()))
-        std::cout << "Result of DilateGrid check out CORRECT against reference" << std::endl;
-    else
-        std::cout << "Result of DilateGrid compares INCORRECT against reference" << std::endl;
-
-    // Re-run warm-started iterations
-    dilator.setVerbose(0);
-    for (int i = 0; i < benchmark_iters; i++) {
-        gpuTimer.start("Re-running entire dilation after warmstart");
-        auto dummyHandle = dilator.getHandle();
-        gpuTimer.stop();
+    auto outputVoxelsPerBlock = IGEMM_Settings::Z * IGEMM_Settings::P * IGEMM_Settings::Q;
+    using ScatterIndexT = uint64_t
+        [IGEMM_Settings::Bx][IGEMM_Settings::By][IGEMM_Settings::Bz]
+        [IGEMM_Settings::Z ][IGEMM_Settings::P ][IGEMM_Settings::Q ];
+    auto scatterIndexData = thrust::universal_vector<uint64_t>(blockCount*outputVoxelsPerBlock);
+    auto scatterIndexArray = reinterpret_cast<ScatterIndexT*>(scatterIndexData.data().get());
+    
+#pragma omp parallel for
+    for (int l = 0; l < outputLeafCount; l++) {
+        auto &leaf = outputGrid->tree().getFirstLeaf()[l];
+        for (int bi = 0; bi < IGEMM_Settings::Bx; bi++)
+        for (int bj = 0; bj < IGEMM_Settings::By; bj++)
+        for (int bk = 0; bk < IGEMM_Settings::Bz; bk++) {
+            nanovdb::Coord blockOffset(bi*IGEMM_Settings::Z, bj*IGEMM_Settings::P, bk*IGEMM_Settings::Q);
+            for (int i = 0; i < IGEMM_Settings::Z; i++)
+            for (int j = 0; j < IGEMM_Settings::P; j++)
+            for (int k = 0; k < IGEMM_Settings::Q; k++) {
+                auto localCoord = blockOffset.offsetBy(i,j,k);
+                scatterIndexArray[l][bi][bj][bk][i][j][k] = leaf.getValue(localCoord);
+            }
+        }
     }
-
-    uint32_t dstLeafCount = nanovdb::util::cuda::DeviceGridTraits<BuildT>::getTreeData(dstGrid).mNodeCount[0];
-    nanovdb::cuda::DeviceBuffer dstLeafMaskBuffer;
-    nanovdb::Mask<3>* dstLeafMasks = nullptr;
-    if (dstLeafCount) {
-        dstLeafMaskBuffer = nanovdb::cuda::DeviceBuffer::create( std::size_t(dstLeafCount) * sizeof(nanovdb::Mask<3>), nullptr, false );
-        dstLeafMasks = static_cast<nanovdb::Mask<3>*>(dstLeafMaskBuffer.deviceData());
-        if (!dstLeafMasks) throw std::runtime_error("No GPU buffer for dstLeafMask");
-    }
-
-    const unsigned int numThreads = 128;
-    auto numBlocks = [numThreads] (unsigned int n) {return (n + numThreads - 1) / numThreads;};
-    gpuTimer.start("Injecting un-dilated topology as a pruning mask");
-    if (dstLeafCount)
-        nanovdb::util::cuda::lambdaKernel<<<numBlocks(dstLeafCount), numThreads>>>(dstLeafCount,
-            nanovdb::util::cuda::InjectGridMaskFunctor<BuildT>(),
-            deviceGridOriginal, dstGrid, dstLeafMasks );
     gpuTimer.stop();
 
-    // Initialize pruner
-    nanovdb::tools::cuda::PruneGrid<BuildT> pruner( dstGrid, dstLeafMasks );
-    pruner.setChecksum(nanovdb::CheckMode::Default);
-    pruner.setVerbose(1);
-
-    auto prunedHandle = pruner.getHandle();
-    auto prunedGrid = prunedHandle.template deviceGrid<BuildT>();
-
-    // Check for correctness
-    if (bufferCheck((char*)prunedGrid, (char*)indexGridOriginal->data(), indexGridOriginal->gridSize()))
-        std::cout << "Result of PruneGrid check out CORRECT against reference" << std::endl;
-    else
-        std::cout << "Result of PruneGrid compares INCORRECT against reference" << std::endl;
-
-    // Re-run warm-started iterations
-    pruner.setVerbose(0);
-    for (int i = 0; i < benchmark_iters; i++) {
-        gpuTimer.start("Re-running entire pruning after warmstart");
-        auto dummyHandle = pruner.getHandle();
-        gpuTimer.stop();
+    gpuTimer.start("Initializing gather indices");
+    auto inputVoxelsPerBlock = IGEMM_Settings::D * IGEMM_Settings::H * IGEMM_Settings::W;
+    using GatherIndexT = uint64_t
+        [IGEMM_Settings::Bx][IGEMM_Settings::By][IGEMM_Settings::Bz]
+        [IGEMM_Settings::D ][IGEMM_Settings::H ][IGEMM_Settings::W ];
+    auto gatherIndexData = thrust::universal_vector<uint64_t>(blockCount*inputVoxelsPerBlock);
+    auto gatherIndexArray = reinterpret_cast<GatherIndexT*>(gatherIndexData.data().get());
+#pragma omp parallel for
+    for (int l = 0; l < outputLeafCount; l++) {
+        auto &outputLeaf = outputGrid->tree().getFirstLeaf()[l];
+        const auto origin = outputLeaf.origin();
+        for (int bi = 0; bi < IGEMM_Settings::Bx; bi++)
+        for (int bj = 0; bj < IGEMM_Settings::By; bj++)
+        for (int bk = 0; bk < IGEMM_Settings::Bz; bk++) {
+            nanovdb::Coord blockOffset(bi*IGEMM_Settings::Z, bj*IGEMM_Settings::P, bk*IGEMM_Settings::Q);
+            for (int i = 0; i < IGEMM_Settings::D; i++)
+            for (int j = 0; j < IGEMM_Settings::H; j++)
+            for (int k = 0; k < IGEMM_Settings::W; k++) {
+                auto localCoord = blockOffset.offsetBy(i+IGEMM_Settings::Dx,j+IGEMM_Settings::Dy,k+IGEMM_Settings::Dz);
+                auto globalCoord = origin+localCoord;
+                gatherIndexArray[l][bi][bj][bk][i][j][k] = inputGrid->tree().getValue(globalCoord);
+            }
+        }
     }
-#endif
+    gpuTimer.stop();
+    
 }

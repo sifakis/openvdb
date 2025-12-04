@@ -36,8 +36,8 @@ struct IGEMM_Settings
     static constexpr int Q = 2;     // Z-dimension of output block
 
     static constexpr int D = Z+T-1; // X-dimension of input block (inluding halo)
-    static constexpr int H = P+R-1; // X-dimension of input block (inluding halo)
-    static constexpr int W = Q+S-1; // X-dimension of input block (inluding halo)
+    static constexpr int H = P+R-1; // Y-dimension of input block (inluding halo)
+    static constexpr int W = Q+S-1; // Z-dimension of input block (inluding halo)
 
     static_assert(D==6, "Only convolution geometry supported is 4x2x2 block and 3x3x3 filter size");
     static_assert(H==4, "Only convolution geometry supported is 4x2x2 block and 3x3x3 filter size");
@@ -62,6 +62,89 @@ struct IGEMM_Settings
     static constexpr int Dy = -1;  // to a (-1,-1,-1) grid offset
     static constexpr int Dz = -1;
 };
+
+template<class SettingsT, int Di, int Do, class ValueType>
+void SparseConvolveCPUReference(
+    nanovdb::NanoGrid<nanovdb::ValueOnIndex> *srcGrid,
+    nanovdb::NanoGrid<nanovdb::ValueOnIndex> *dstGrid,
+    const ValueType (*filter)[SettingsT::R][SettingsT::S][Do][Di],
+    const ValueType (*inputArray)[Di],
+    ValueType (*outputArray)[Do])
+{
+    auto dstLeafCout = dstGrid->nodeCount<0>();
+    auto srcAcc = srcGrid->getAccessor();
+#pragma omp parallel for firstPrivate(srcAcc)
+    for ( int dstLeafID = 0; dstLeafID < dstLeafCout; ++dstLeafID )
+    {
+        auto& dstLeaf = dstGrid->tree().getFirstLeaf()[dstLeafID];
+        for ( auto dstLeafIt = dstLeaf.cbeginValueOn(); dstLeafIt; ++dstLeafIt ) {
+            const auto dstIndex = *dstLeafIt;
+            const auto dstCoord = dstLeafIt.getCoord();
+            for ( int i = 0; i < Do; ++i )
+                outputArray[dstIndex][i] = 0.f;
+            for ( int di = 0; di < SettingsT::T; ++di )
+            for ( int dj = 0; dj < SettingsT::R; ++dj )
+            for ( int dk = 0; dk < SettingsT::S; ++dk )
+            {
+                const auto srcCoord = dstCoord.offsetBy(di+SettingsT::Dx, dj+SettingsT::Dy, dk+SettingsT::Dz);
+                const auto srcIndex = srcAcc.getValue(srcCoord);
+                if (srcIndex)
+                    for ( int out = 0; out < Do; ++out )
+                    for ( int in  = 0; in  < Di; ++in  )
+                        outputArray[dstIndex][out] += filter[di][dj][dk][out][in] * inputArray[srcIndex][in];
+            }
+        }
+    }
+}
+
+template<class SettingsT, int Di, int Do, class ValueType>
+void SparseConvolveCudaReference(
+    nanovdb::NanoGrid<nanovdb::ValueOnIndex> *srcGrid,
+    nanovdb::NanoGrid<nanovdb::ValueOnIndex> *dstGrid,
+    const ValueType (*filter)[SettingsT::R][SettingsT::S][Do][Di],
+    const ValueType (*inputArray)[Di],
+    ValueType (*outputArray)[Do])
+{
+    auto dstLeafCout = dstGrid->nodeCount<0>();
+    auto srcAcc = srcGrid->getAccessor();
+#pragma omp parallel for firstPrivate(srcAcc)
+    for ( int dstLeafID = 0; dstLeafID < dstLeafCout; ++dstLeafID )
+    {
+        auto& dstLeaf = dstGrid->tree().getFirstLeaf()[dstLeafID];
+        for ( auto dstLeafIt = dstLeaf.cbeginValueOn(); dstLeafIt; ++dstLeafIt ) {
+            const auto dstIndex = *dstLeafIt;
+            const auto dstCoord = dstLeafIt.getCoord();
+            for ( int i = 0; i < Do; ++i )
+                outputArray[dstIndex][i] = 0.f;
+            for ( int di = 0; di < SettingsT::T; ++di )
+            for ( int dj = 0; dj < SettingsT::R; ++dj )
+            for ( int dk = 0; dk < SettingsT::S; ++dk )
+            {
+                const auto srcCoord = dstCoord.offsetBy(di+SettingsT::Dx, dj+SettingsT::Dy, dk+SettingsT::Dz);
+                const auto srcIndex = srcAcc.getValue(srcCoord);
+                if (srcIndex)
+                    for ( int out = 0; out < Do; ++out )
+                    for ( int in  = 0; in  < Di; ++in  )
+                        outputArray[dstIndex][out] += filter[di][dj][dk][out][in] * inputArray[srcIndex][in];
+            }
+        }
+    }
+}
+
+template<int Do, class ValueType>
+void ResultCompare(
+    const std::size_t size,
+    const ValueType (*outputArray1)[Do],
+    const ValueType (*outputArray2)[Do]
+)
+{
+    ValueType result = 0.f;
+#pragma omp parallel for reduction(max:result)
+    for (int i = 0; i < size; i++)
+        for (int j = 0; j < Do; j++)
+            result = std::max(result, std::abs(outputArray1[i][j]-outputArray2[i][j]));
+    std::cout << "Discrepancy = " << result << std::endl;
+}
 
 template<class BufferT>
 void printGridDiagnostics(nanovdb::GridHandle<BufferT>& handle)
@@ -102,7 +185,7 @@ void mainSparseConvolutionIGEMM(
     static constexpr int Do = 128;
     using inputArrayT = float (&) [][Di];
     using outputArrayT = float (&) [][Do];
-    using filterArrayT = float (&) [3][3][3][Do][Di];
+    using filterT = float (&) [3][3][3][Do][Di];
     
     nanovdb::util::cuda::Timer gpuTimer;
 
@@ -173,7 +256,7 @@ void mainSparseConvolutionIGEMM(
 
     gpuTimer.start("Initializing filter data");
     auto filterData = thrust::universal_vector<float>(3*3*3*Do*Di);
-    auto filterArray = reinterpret_cast<filterArrayT>(*filterData.data().get());
+    auto filter = reinterpret_cast<filterT>(*filterData.data().get());
 #pragma omp parallel for
     for (int i = 0; i < filterData.size(); i++)
         filterData[i] = ((float)distribution(generator))/256.0f; // Use only up to 7 bits in the mantissa
@@ -234,4 +317,31 @@ void mainSparseConvolutionIGEMM(
     }
     gpuTimer.stop();
     
+    gpuTimer.start("Reference (CPU) execution");
+    SparseConvolveCPUReference<IGEMM_Settings, Di, Do>(
+        inputGrid,
+        outputGrid,
+        filter,
+        inputArray,
+        outputReferenceArray
+    );
+    gpuTimer.stop();
+
+    gpuTimer.start("Reference (CUDA) execution");
+    SparseConvolveCudaReference<IGEMM_Settings, Di, Do>(
+        inputGrid,
+        outputGrid,
+        filter,
+        inputArray,
+        outputArray
+    );
+    gpuTimer.stop();
+
+    ResultCompare<Do>(
+        outputValueCount,
+        outputArray,
+        outputReferenceArray
+    );
+        
+    gpuTimer.stop();
 }

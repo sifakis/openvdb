@@ -135,6 +135,44 @@ void SparseConvolveCudaReference(
     lambda_kernel_wrapper<<<dstLeafCount,Do>>>(convolver);
 }
 
+template<class SettingsT, int Di, int Do, class ValueType>
+void SparseConvolveScatterGatherMapsReference(
+    uint64_t (*gather_idx_buf) [SettingsT::D][SettingsT::H][SettingsT::W],
+    uint64_t (*scatter_idx_buf)[SettingsT::Z][SettingsT::P][SettingsT::Q],
+    const std::size_t blockCount,
+    nanovdb::NanoGrid<nanovdb::ValueOnIndex> *srcGrid,
+    nanovdb::NanoGrid<nanovdb::ValueOnIndex> *dstGrid,
+    const ValueType (*filter)[SettingsT::R][SettingsT::S][Do][Di],
+    const ValueType (*inputArray)[Di],
+    ValueType (*outputArray)[Do])
+{
+    auto convolver = [=] __device__ () {
+        int blockID = blockIdx.x;
+        auto gatherIndices = gather_idx_buf[blockID];
+        auto scatterIndices = scatter_idx_buf[blockID];
+        int out = threadIdx.x;
+
+        for ( int i = 0; i < SettingsT::Z; ++i )
+        for ( int j = 0; j < SettingsT::P; ++j )
+        for ( int k = 0; k < SettingsT::Q; ++k ) {
+            const auto dstIndex = scatterIndices[i][j][k];
+            if (dstIndex) {
+                outputArray[dstIndex][out] = 0.f;
+                for ( int di = 0; di < SettingsT::T; ++di )
+                for ( int dj = 0; dj < SettingsT::R; ++dj )
+                for ( int dk = 0; dk < SettingsT::S; ++dk ) {
+                    const auto srcIndex = gatherIndices[i+di][j+dj][k+dk];
+                    if (srcIndex)
+                        for ( int in = 0; in < Di; ++in )
+                            outputArray[dstIndex][out] += filter[di][dj][dk][out][in] * inputArray[srcIndex][in];
+                }
+            }
+        }
+    };
+
+    lambda_kernel_wrapper<<<blockCount,Do>>>(convolver);
+}
+
 template<int Do, class ValueType>
 void ResultCompare(
     const std::size_t size,
@@ -272,11 +310,10 @@ void mainSparseConvolutionIGEMM(
         * IGEMM_Settings::Bx * IGEMM_Settings::By * IGEMM_Settings::Bz;
 
     auto outputVoxelsPerBlock = IGEMM_Settings::Z * IGEMM_Settings::P * IGEMM_Settings::Q;
-    using ScatterIndexT = uint64_t
-        [IGEMM_Settings::Bx][IGEMM_Settings::By][IGEMM_Settings::Bz]
-        [IGEMM_Settings::Z ][IGEMM_Settings::P ][IGEMM_Settings::Q ];
+    using ScatterIndexT = uint64_t [IGEMM_Settings::Z][IGEMM_Settings::P][IGEMM_Settings::Q];
+    using ScatterIndexArrayT = ScatterIndexT [IGEMM_Settings::Bx][IGEMM_Settings::By][IGEMM_Settings::Bz];
     auto scatterIndexData = thrust::universal_vector<uint64_t>(blockCount*outputVoxelsPerBlock);
-    auto scatterIndexArray = reinterpret_cast<ScatterIndexT*>(scatterIndexData.data().get());
+    auto scatterIndexArray = reinterpret_cast<ScatterIndexArrayT*>(scatterIndexData.data().get());
     
 #pragma omp parallel for
     for (int l = 0; l < outputLeafCount; l++) {
@@ -297,11 +334,10 @@ void mainSparseConvolutionIGEMM(
 
     gpuTimer.start("Initializing gather indices");
     auto inputVoxelsPerBlock = IGEMM_Settings::D * IGEMM_Settings::H * IGEMM_Settings::W;
-    using GatherIndexT = uint64_t
-        [IGEMM_Settings::Bx][IGEMM_Settings::By][IGEMM_Settings::Bz]
-        [IGEMM_Settings::D ][IGEMM_Settings::H ][IGEMM_Settings::W ];
+    using GatherIndexT = uint64_t [IGEMM_Settings::D][IGEMM_Settings::H][IGEMM_Settings::W];
+    using GatherIndexArrayT = GatherIndexT [IGEMM_Settings::Bx][IGEMM_Settings::By][IGEMM_Settings::Bz];
     auto gatherIndexData = thrust::universal_vector<uint64_t>(blockCount*inputVoxelsPerBlock);
-    auto gatherIndexArray = reinterpret_cast<GatherIndexT*>(gatherIndexData.data().get());
+    auto gatherIndexArray = reinterpret_cast<GatherIndexArrayT*>(gatherIndexData.data().get());
 #pragma omp parallel for
     for (int l = 0; l < outputLeafCount; l++) {
         auto &outputLeaf = outputGrid->tree().getFirstLeaf()[l];
@@ -331,18 +367,32 @@ void mainSparseConvolutionIGEMM(
     );
     gpuTimer.stop();
 
-    for (int run = 0; run < 20; ++run) {
-        gpuTimer.start("Reference (CPU) execution");
-        // SparseConvolveCPUReference<IGEMM_Settings, Di, Do>(
-        SparseConvolveCudaReference<IGEMM_Settings, Di, Do>(
-            inputGrid,
-            outputGrid,
-            filter,
-            inputArray,
-            outputArray
-        );
-        gpuTimer.stop();
-    }
+
+#if 0
+    // CPU version; may be extremely slow for all but the smallest resolutions
+    gpuTimer.start("Reference (CPU) execution");
+    SparseConvolveCPUReference<IGEMM_Settings, Di, Do>(
+        inputGrid,
+        outputGrid,
+        filter,
+        inputArray,
+        outputArray
+    );
+    gpuTimer.stop();
+#endif
+
+    gpuTimer.start("Reference (Gather-Scatter) execution");
+    SparseConvolveScatterGatherMapsReference<IGEMM_Settings, Di, Do>(
+        reinterpret_cast<GatherIndexT*>(gatherIndexArray),
+        reinterpret_cast<ScatterIndexT*>(scatterIndexArray),
+        blockCount,
+        inputGrid,
+        outputGrid,
+        filter,
+        inputArray,
+        outputArray
+    );
+    gpuTimer.stop();
 
     ResultCompare<Do>(
         outputValueCount,

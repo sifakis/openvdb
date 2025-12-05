@@ -71,10 +71,10 @@ void SparseConvolveCPUReference(
     const ValueType (*inputArray)[Di],
     ValueType (*outputArray)[Do])
 {
-    auto dstLeafCout = dstGrid->nodeCount<0>();
+    auto dstLeafCount = dstGrid->nodeCount<0>();
     auto srcAcc = srcGrid->getAccessor();
 #pragma omp parallel for firstPrivate(srcAcc)
-    for ( int dstLeafID = 0; dstLeafID < dstLeafCout; ++dstLeafID )
+    for ( int dstLeafID = 0; dstLeafID < dstLeafCount; ++dstLeafID )
     {
         auto& dstLeaf = dstGrid->tree().getFirstLeaf()[dstLeafID];
         for ( auto dstLeafIt = dstLeaf.cbeginValueOn(); dstLeafIt; ++dstLeafIt ) {
@@ -97,6 +97,10 @@ void SparseConvolveCPUReference(
     }
 }
 
+template <typename Functor>
+__global__
+void lambda_kernel_wrapper(Functor func) { func(); }
+
 template<class SettingsT, int Di, int Do, class ValueType>
 void SparseConvolveCudaReference(
     nanovdb::NanoGrid<nanovdb::ValueOnIndex> *srcGrid,
@@ -105,30 +109,30 @@ void SparseConvolveCudaReference(
     const ValueType (*inputArray)[Di],
     ValueType (*outputArray)[Do])
 {
-    auto dstLeafCout = dstGrid->nodeCount<0>();
-    auto srcAcc = srcGrid->getAccessor();
-#pragma omp parallel for firstPrivate(srcAcc)
-    for ( int dstLeafID = 0; dstLeafID < dstLeafCout; ++dstLeafID )
-    {
+    auto dstLeafCount = dstGrid->nodeCount<0>();
+
+    auto convolver = [=] __device__ () {
+        int dstLeafID = blockIdx.x;
+        int out = threadIdx.x;
         auto& dstLeaf = dstGrid->tree().getFirstLeaf()[dstLeafID];
         for ( auto dstLeafIt = dstLeaf.cbeginValueOn(); dstLeafIt; ++dstLeafIt ) {
             const auto dstIndex = *dstLeafIt;
             const auto dstCoord = dstLeafIt.getCoord();
-            for ( int i = 0; i < Do; ++i )
-                outputArray[dstIndex][i] = 0.f;
+            outputArray[dstIndex][out] = 0.f;
             for ( int di = 0; di < SettingsT::T; ++di )
             for ( int dj = 0; dj < SettingsT::R; ++dj )
             for ( int dk = 0; dk < SettingsT::S; ++dk )
             {
                 const auto srcCoord = dstCoord.offsetBy(di+SettingsT::Dx, dj+SettingsT::Dy, dk+SettingsT::Dz);
-                const auto srcIndex = srcAcc.getValue(srcCoord);
+                const auto srcIndex = srcGrid->tree().getValue(srcCoord);
                 if (srcIndex)
-                    for ( int out = 0; out < Do; ++out )
-                    for ( int in  = 0; in  < Di; ++in  )
+                    for ( int in = 0; in < Di; ++in )
                         outputArray[dstIndex][out] += filter[di][dj][dk][out][in] * inputArray[srcIndex][in];
             }
         }
-    }
+    };
+
+    lambda_kernel_wrapper<<<dstLeafCount,Do>>>(convolver);
 }
 
 template<int Do, class ValueType>
@@ -317,8 +321,8 @@ void mainSparseConvolutionIGEMM(
     }
     gpuTimer.stop();
     
-    gpuTimer.start("Reference (CPU) execution");
-    SparseConvolveCPUReference<IGEMM_Settings, Di, Do>(
+    gpuTimer.start("Reference (GPU) execution");
+    SparseConvolveCudaReference<IGEMM_Settings, Di, Do>(
         inputGrid,
         outputGrid,
         filter,
@@ -327,15 +331,18 @@ void mainSparseConvolutionIGEMM(
     );
     gpuTimer.stop();
 
-    gpuTimer.start("Reference (CUDA) execution");
-    SparseConvolveCudaReference<IGEMM_Settings, Di, Do>(
-        inputGrid,
-        outputGrid,
-        filter,
-        inputArray,
-        outputArray
-    );
-    gpuTimer.stop();
+    for (int run = 0; run < 20; ++run) {
+        gpuTimer.start("Reference (CPU) execution");
+        // SparseConvolveCPUReference<IGEMM_Settings, Di, Do>(
+        SparseConvolveCudaReference<IGEMM_Settings, Di, Do>(
+            inputGrid,
+            outputGrid,
+            filter,
+            inputArray,
+            outputArray
+        );
+        gpuTimer.stop();
+    }
 
     ResultCompare<Do>(
         outputValueCount,

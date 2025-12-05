@@ -140,8 +140,6 @@ void SparseConvolveScatterGatherMapsReference(
     uint64_t (*gather_idx_buf) [SettingsT::D][SettingsT::H][SettingsT::W],
     uint64_t (*scatter_idx_buf)[SettingsT::Z][SettingsT::P][SettingsT::Q],
     const std::size_t blockCount,
-    nanovdb::NanoGrid<nanovdb::ValueOnIndex> *srcGrid,
-    nanovdb::NanoGrid<nanovdb::ValueOnIndex> *dstGrid,
     const ValueType (*filter)[SettingsT::R][SettingsT::S][Do][Di],
     const ValueType (*inputArray)[Di],
     ValueType (*outputArray)[Do])
@@ -386,8 +384,6 @@ void mainSparseConvolutionIGEMM(
         reinterpret_cast<GatherIndexT*>(gatherIndexArray),
         reinterpret_cast<ScatterIndexT*>(scatterIndexArray),
         blockCount,
-        inputGrid,
-        outputGrid,
         filter,
         inputArray,
         outputArray
@@ -399,6 +395,6 @@ void mainSparseConvolutionIGEMM(
         outputArray,
         outputReferenceArray
     );
-        
+
     gpuTimer.stop();
 }

@@ -121,6 +121,29 @@ struct IGEMM_Layouts
             tuple<_1, tuple<_0,_4,_3,_2>>{}
         );
     }
+
+    static auto xformedOutputComposedLayout(const int N, const uint64_t* scatter_idx_buf)
+    {
+        // TODO: Simplify these, no need to create the dense strides just to replace them
+
+        // Tensor Output
+        auto output_layout = make_ordered_layout(
+            make_shape( K,   make_shape( N,   Z,   P,   Q)),
+            make_tuple(_0{}, make_tuple(_4{},_3{},_2{},_1{})));
+
+        // Output scatter layout
+        auto ES = E<0>{};  // Scatter basis    (1,0) (idx_buffer_idx) 
+        auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)    
+        auto out_basis_stride = make_stride( EC, make_stride(Z*P*Q*ES, P*Q*ES, Q*ES, _1{}*ES)); // -> (crd0, crd1)
+        auto out_basis_layout = make_layout(shape(output_layout), out_basis_stride);
+        auto out_scatter_layout = make_layout(
+            make_shape(_1{},_1{}),
+            make_stride(example::CustomStride{example::IndexedGather{scatter_idx_buf}, K}, _1{}));
+        return composition(
+            out_scatter_layout,
+            make_arithmetic_tuple(_0{},_0{}),
+            out_basis_layout);
+    }
 };
 
 template<class GeometryT, int Di, int Do, class ValueType>
@@ -244,6 +267,15 @@ void ResultCompare(
         for (int j = 0; j < Do; j++)
             result = std::max(result, std::abs(outputArray1[i][j]-outputArray2[i][j]));
     std::cout << "Discrepancy = " << result << std::endl;
+}
+
+template<class Operator, class FilterTensor, class ActivationTensor, class ActivationTensorIndex, class OutputTensor>
+__global__
+__launch_bounds__(Operator::MaxThreadsPerBlock, Operator::MinBlocksPerMultiprocessor)
+  void kernel_entrypoint_custom(FilterTensor mFlt, ActivationTensor mAct, ActivationTensorIndex mActI, OutputTensor mOut) {
+  extern __shared__ char smem_buf[];
+  Operator op;
+  op(mFlt, mAct, mActI, mOut, smem_buf);
 }
 
 template<class BufferT>
@@ -439,6 +471,7 @@ void mainSparseConvolutionIGEMM(
     gpuTimer.stop();
 #endif
 
+#if 0
     gpuTimer.start("Reference (Gather-Scatter) execution");
     SparseConvolveScatterGatherMapsReference<IGEMM_Geometry, Di, Do>(
         reinterpret_cast<GatherIndexT*>(gatherIndexArray),
@@ -455,6 +488,7 @@ void mainSparseConvolutionIGEMM(
         outputArray,
         outputReferenceArray
     );
+#endif
 
     IGEMM_Layouts<IGEMM_Geometry> layouts;
 
@@ -473,5 +507,34 @@ void mainSparseConvolutionIGEMM(
         layouts.filterLayout()
     );
 
-    gpuTimer.stop();
+    Tensor tXformedOutScatter = make_tensor(
+        make_gmem_ptr(outputData.data().get()),
+        layouts.xformedOutputComposedLayout(blockCount, scatterIndexData.data().get())
+    );
+
+    // ((BLK_M, BLK_N), (m', n'))
+    Tensor gOutput_mn = zipped_divide(tXformedOutScatter, typename AmpereUnpredicatedFprop::TilerOut{});
+    dim3 launch_grid {static_cast<uint32_t>(size<1,1>(gOutput_mn)), static_cast<uint32_t>(size<1,0>(gOutput_mn)), 1};
+    constexpr size_t smem_size = sizeof(typename AmpereUnpredicatedFprop::SharedStorage);
+
+    cudaCheck(cudaFuncSetAttribute(
+            kernel_entrypoint_custom<AmpereUnpredicatedFprop, decltype(tFilter), decltype(tXformedActGather), decltype(tGatherIndex), decltype(tXformedOutScatter)>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_size));
+
+    int num_iterations = 1;
+    for (int i = 0; i < num_iterations; ++i) {
+        gpuTimer.start("Scatter-Gather Cutlass IGEMM (GPU) execution");
+        kernel_entrypoint_custom<AmpereUnpredicatedFprop, decltype(tFilter), decltype(tXformedActGather), decltype(tGatherIndex), decltype(tXformedOutScatter)>
+            <<<launch_grid, AmpereUnpredicatedFprop::MaxThreadsPerBlock, smem_size>>>(
+                tFilter, tXformedActGather, tGatherIndex, tXformedOutScatter);
+        gpuTimer.stop();
+    }
+
+    ResultCompare<Do>(
+        outputValueCount,
+        outputArray,
+        outputReferenceArray
+    );
+
 }

@@ -10,6 +10,7 @@
 #include <random>
 
 #include "ampere_conv_kernel.h"
+#include "gather_tensor.hpp"
 
 template<typename T>
 bool bufferCheck(const T* deviceBuffer, const T* hostBuffer, size_t elem_count) {
@@ -21,7 +22,7 @@ bool bufferCheck(const T* deviceBuffer, const T* hostBuffer, size_t elem_count) 
     return same;
 }
 
-struct IGEMM_Settings
+struct IGEMM_Geometry
 {
     //
     // Convolution geometry
@@ -61,13 +62,72 @@ struct IGEMM_Settings
     static constexpr int Dx = -1;  // Filter centered at (0,0,0), thus (0,0,0) spoke corresponds
     static constexpr int Dy = -1;  // to a (-1,-1,-1) grid offset
     static constexpr int Dz = -1;
+
 };
 
-template<class SettingsT, int Di, int Do, class ValueType>
+
+template<class GeometryT>
+struct IGEMM_Layouts
+{
+    static constexpr auto T = Int<GeometryT::T>{};
+    static constexpr auto R = Int<GeometryT::R>{};
+    static constexpr auto S = Int<GeometryT::S>{};
+    static constexpr auto Z = Int<GeometryT::Z>{};
+    static constexpr auto P = Int<GeometryT::P>{};
+    static constexpr auto Q = Int<GeometryT::Q>{};
+    static constexpr auto D = Int<GeometryT::D>{};
+    static constexpr auto H = Int<GeometryT::H>{};
+    static constexpr auto W = Int<GeometryT::W>{};
+    static constexpr auto C = Int<GeometryT::C>{};
+    static constexpr auto K = Int<GeometryT::K>{};
+
+    static auto xformedActivationComposedLayout(const int N, const uint64_t* gather_idx_buf)
+    {
+        // Input gather layout
+        // inner_layout(make_coord((nzpq), (csrt))) => (idx_buffer_idx, dense_c_idx)
+        auto EG = E<0>{};  // Gather basis     (1,0) (idx_buffer_idx) 
+        auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)    
+        auto xformed_act_logical_inner = make_layout(
+            make_shape (make_shape (       N,      Z,    P,  Q), make_shape ( C,      T,    R,  S)),
+            make_stride(make_stride(D*H*W*EG, H*W*EG, W*EG, EG), make_stride(EC, H*W*EG, W*EG, EG)));
+
+        // outer_layout(make_coord(idx_buffer_idx, dense_c_idx)) => idx
+        // IndexedGather obtains idx by applying (gmem_base_ptr + gather_idx_buf[idx_buffer_idx] + dense_offset)
+        auto xformed_act_gather_outer = make_layout(
+            make_shape(_1{},_1{}),
+            make_stride(example::CustomStride{example::IndexedGather{gather_idx_buf}, C}, _1{}));
+
+        // Compose the inner and outer layouts
+        // gather_composed(make_coord((nzpq), (csrt))) => idx
+        return composition(
+            xformed_act_gather_outer,
+            make_arithmetic_tuple(_0{}, _0{}),
+            xformed_act_logical_inner);
+    }
+
+    static auto gatherIndexLayout(const int N)
+    {
+        // Input gather index layout
+        // inner_layout_index(make_coord((nzpq), (csrt))) => idx_buffer_idx
+        return make_layout(
+            make_shape (make_shape (    N,   D, H,  W  ), make_shape ( C  , _1{}, _1{}, _1{})),
+            make_stride(make_stride(D*H*W, H*W, W, _1{}), make_stride(_0{}, _0{}, _0{}, _0{})));
+    }
+
+    static auto filterLayout()
+    {
+        return make_ordered_layout(
+            make_shape(K, make_shape(C, T, R, S)),
+            tuple<_1, tuple<_0,_4,_3,_2>>{}
+        );
+    }
+};
+
+template<class GeometryT, int Di, int Do, class ValueType>
 void SparseConvolveCPUReference(
     nanovdb::NanoGrid<nanovdb::ValueOnIndex> *srcGrid,
     nanovdb::NanoGrid<nanovdb::ValueOnIndex> *dstGrid,
-    const ValueType (*filter)[SettingsT::R][SettingsT::S][Do][Di],
+    const ValueType (*filter)[GeometryT::R][GeometryT::S][Do][Di],
     const ValueType (*inputArray)[Di],
     ValueType (*outputArray)[Do])
 {
@@ -82,11 +142,11 @@ void SparseConvolveCPUReference(
             const auto dstCoord = dstLeafIt.getCoord();
             for ( int i = 0; i < Do; ++i )
                 outputArray[dstIndex][i] = 0.f;
-            for ( int di = 0; di < SettingsT::T; ++di )
-            for ( int dj = 0; dj < SettingsT::R; ++dj )
-            for ( int dk = 0; dk < SettingsT::S; ++dk )
+            for ( int di = 0; di < GeometryT::T; ++di )
+            for ( int dj = 0; dj < GeometryT::R; ++dj )
+            for ( int dk = 0; dk < GeometryT::S; ++dk )
             {
-                const auto srcCoord = dstCoord.offsetBy(di+SettingsT::Dx, dj+SettingsT::Dy, dk+SettingsT::Dz);
+                const auto srcCoord = dstCoord.offsetBy(di+GeometryT::Dx, dj+GeometryT::Dy, dk+GeometryT::Dz);
                 const auto srcIndex = srcAcc.getValue(srcCoord);
                 if (srcIndex)
                     for ( int out = 0; out < Do; ++out )
@@ -101,11 +161,11 @@ template <typename Functor>
 __global__
 void lambda_kernel_wrapper(Functor func) { func(); }
 
-template<class SettingsT, int Di, int Do, class ValueType>
+template<class GeometryT, int Di, int Do, class ValueType>
 void SparseConvolveCudaReference(
     nanovdb::NanoGrid<nanovdb::ValueOnIndex> *srcGrid,
     nanovdb::NanoGrid<nanovdb::ValueOnIndex> *dstGrid,
-    const ValueType (*filter)[SettingsT::R][SettingsT::S][Do][Di],
+    const ValueType (*filter)[GeometryT::R][GeometryT::S][Do][Di],
     const ValueType (*inputArray)[Di],
     ValueType (*outputArray)[Do])
 {
@@ -119,11 +179,11 @@ void SparseConvolveCudaReference(
             const auto dstIndex = *dstLeafIt;
             const auto dstCoord = dstLeafIt.getCoord();
             outputArray[dstIndex][out] = 0.f;
-            for ( int di = 0; di < SettingsT::T; ++di )
-            for ( int dj = 0; dj < SettingsT::R; ++dj )
-            for ( int dk = 0; dk < SettingsT::S; ++dk )
+            for ( int di = 0; di < GeometryT::T; ++di )
+            for ( int dj = 0; dj < GeometryT::R; ++dj )
+            for ( int dk = 0; dk < GeometryT::S; ++dk )
             {
-                const auto srcCoord = dstCoord.offsetBy(di+SettingsT::Dx, dj+SettingsT::Dy, dk+SettingsT::Dz);
+                const auto srcCoord = dstCoord.offsetBy(di+GeometryT::Dx, dj+GeometryT::Dy, dk+GeometryT::Dz);
                 const auto srcIndex = srcGrid->tree().getValue(srcCoord);
                 if (srcIndex)
                     for ( int in = 0; in < Di; ++in )
@@ -135,12 +195,12 @@ void SparseConvolveCudaReference(
     lambda_kernel_wrapper<<<dstLeafCount,Do>>>(convolver);
 }
 
-template<class SettingsT, int Di, int Do, class ValueType>
+template<class GeometryT, int Di, int Do, class ValueType>
 void SparseConvolveScatterGatherMapsReference(
-    uint64_t (*gather_idx_buf) [SettingsT::D][SettingsT::H][SettingsT::W],
-    uint64_t (*scatter_idx_buf)[SettingsT::Z][SettingsT::P][SettingsT::Q],
+    uint64_t (*gather_idx_buf) [GeometryT::D][GeometryT::H][GeometryT::W],
+    uint64_t (*scatter_idx_buf)[GeometryT::Z][GeometryT::P][GeometryT::Q],
     const std::size_t blockCount,
-    const ValueType (*filter)[SettingsT::R][SettingsT::S][Do][Di],
+    const ValueType (*filter)[GeometryT::R][GeometryT::S][Do][Di],
     const ValueType (*inputArray)[Di],
     ValueType (*outputArray)[Do])
 {
@@ -150,15 +210,15 @@ void SparseConvolveScatterGatherMapsReference(
         auto scatterIndices = scatter_idx_buf[blockID];
         int out = threadIdx.x;
 
-        for ( int i = 0; i < SettingsT::Z; ++i )
-        for ( int j = 0; j < SettingsT::P; ++j )
-        for ( int k = 0; k < SettingsT::Q; ++k ) {
+        for ( int i = 0; i < GeometryT::Z; ++i )
+        for ( int j = 0; j < GeometryT::P; ++j )
+        for ( int k = 0; k < GeometryT::Q; ++k ) {
             const auto dstIndex = scatterIndices[i][j][k];
             if (dstIndex) {
                 outputArray[dstIndex][out] = 0.f;
-                for ( int di = 0; di < SettingsT::T; ++di )
-                for ( int dj = 0; dj < SettingsT::R; ++dj )
-                for ( int dk = 0; dk < SettingsT::S; ++dk ) {
+                for ( int di = 0; di < GeometryT::T; ++di )
+                for ( int dj = 0; dj < GeometryT::R; ++dj )
+                for ( int dk = 0; dk < GeometryT::S; ++dk ) {
                     const auto srcIndex = gatherIndices[i+di][j+dj][k+dk];
                     if (srcIndex)
                         for ( int in = 0; in < Di; ++in )
@@ -305,24 +365,24 @@ void mainSparseConvolutionIGEMM(
     gpuTimer.start("Initializing scatter indices");
     auto outputLeafCount = outputGrid->tree().nodeCount(0);
     auto blockCount = outputLeafCount
-        * IGEMM_Settings::Bx * IGEMM_Settings::By * IGEMM_Settings::Bz;
+        * IGEMM_Geometry::Bx * IGEMM_Geometry::By * IGEMM_Geometry::Bz;
 
-    auto outputVoxelsPerBlock = IGEMM_Settings::Z * IGEMM_Settings::P * IGEMM_Settings::Q;
-    using ScatterIndexT = uint64_t [IGEMM_Settings::Z][IGEMM_Settings::P][IGEMM_Settings::Q];
-    using ScatterIndexArrayT = ScatterIndexT [IGEMM_Settings::Bx][IGEMM_Settings::By][IGEMM_Settings::Bz];
+    auto outputVoxelsPerBlock = IGEMM_Geometry::Z * IGEMM_Geometry::P * IGEMM_Geometry::Q;
+    using ScatterIndexT = uint64_t [IGEMM_Geometry::Z][IGEMM_Geometry::P][IGEMM_Geometry::Q];
+    using ScatterIndexArrayT = ScatterIndexT [IGEMM_Geometry::Bx][IGEMM_Geometry::By][IGEMM_Geometry::Bz];
     auto scatterIndexData = thrust::universal_vector<uint64_t>(blockCount*outputVoxelsPerBlock);
     auto scatterIndexArray = reinterpret_cast<ScatterIndexArrayT*>(scatterIndexData.data().get());
     
 #pragma omp parallel for
     for (int l = 0; l < outputLeafCount; l++) {
         auto &leaf = outputGrid->tree().getFirstLeaf()[l];
-        for (int bi = 0; bi < IGEMM_Settings::Bx; bi++)
-        for (int bj = 0; bj < IGEMM_Settings::By; bj++)
-        for (int bk = 0; bk < IGEMM_Settings::Bz; bk++) {
-            nanovdb::Coord blockOffset(bi*IGEMM_Settings::Z, bj*IGEMM_Settings::P, bk*IGEMM_Settings::Q);
-            for (int i = 0; i < IGEMM_Settings::Z; i++)
-            for (int j = 0; j < IGEMM_Settings::P; j++)
-            for (int k = 0; k < IGEMM_Settings::Q; k++) {
+        for (int bi = 0; bi < IGEMM_Geometry::Bx; bi++)
+        for (int bj = 0; bj < IGEMM_Geometry::By; bj++)
+        for (int bk = 0; bk < IGEMM_Geometry::Bz; bk++) {
+            nanovdb::Coord blockOffset(bi*IGEMM_Geometry::Z, bj*IGEMM_Geometry::P, bk*IGEMM_Geometry::Q);
+            for (int i = 0; i < IGEMM_Geometry::Z; i++)
+            for (int j = 0; j < IGEMM_Geometry::P; j++)
+            for (int k = 0; k < IGEMM_Geometry::Q; k++) {
                 auto localCoord = blockOffset.offsetBy(i,j,k);
                 scatterIndexArray[l][bi][bj][bk][i][j][k] = leaf.getValue(localCoord);
             }
@@ -331,23 +391,23 @@ void mainSparseConvolutionIGEMM(
     gpuTimer.stop();
 
     gpuTimer.start("Initializing gather indices");
-    auto inputVoxelsPerBlock = IGEMM_Settings::D * IGEMM_Settings::H * IGEMM_Settings::W;
-    using GatherIndexT = uint64_t [IGEMM_Settings::D][IGEMM_Settings::H][IGEMM_Settings::W];
-    using GatherIndexArrayT = GatherIndexT [IGEMM_Settings::Bx][IGEMM_Settings::By][IGEMM_Settings::Bz];
+    auto inputVoxelsPerBlock = IGEMM_Geometry::D * IGEMM_Geometry::H * IGEMM_Geometry::W;
+    using GatherIndexT = uint64_t [IGEMM_Geometry::D][IGEMM_Geometry::H][IGEMM_Geometry::W];
+    using GatherIndexArrayT = GatherIndexT [IGEMM_Geometry::Bx][IGEMM_Geometry::By][IGEMM_Geometry::Bz];
     auto gatherIndexData = thrust::universal_vector<uint64_t>(blockCount*inputVoxelsPerBlock);
     auto gatherIndexArray = reinterpret_cast<GatherIndexArrayT*>(gatherIndexData.data().get());
 #pragma omp parallel for
     for (int l = 0; l < outputLeafCount; l++) {
         auto &outputLeaf = outputGrid->tree().getFirstLeaf()[l];
         const auto origin = outputLeaf.origin();
-        for (int bi = 0; bi < IGEMM_Settings::Bx; bi++)
-        for (int bj = 0; bj < IGEMM_Settings::By; bj++)
-        for (int bk = 0; bk < IGEMM_Settings::Bz; bk++) {
-            nanovdb::Coord blockOffset(bi*IGEMM_Settings::Z, bj*IGEMM_Settings::P, bk*IGEMM_Settings::Q);
-            for (int i = 0; i < IGEMM_Settings::D; i++)
-            for (int j = 0; j < IGEMM_Settings::H; j++)
-            for (int k = 0; k < IGEMM_Settings::W; k++) {
-                auto localCoord = blockOffset.offsetBy(i+IGEMM_Settings::Dx,j+IGEMM_Settings::Dy,k+IGEMM_Settings::Dz);
+        for (int bi = 0; bi < IGEMM_Geometry::Bx; bi++)
+        for (int bj = 0; bj < IGEMM_Geometry::By; bj++)
+        for (int bk = 0; bk < IGEMM_Geometry::Bz; bk++) {
+            nanovdb::Coord blockOffset(bi*IGEMM_Geometry::Z, bj*IGEMM_Geometry::P, bk*IGEMM_Geometry::Q);
+            for (int i = 0; i < IGEMM_Geometry::D; i++)
+            for (int j = 0; j < IGEMM_Geometry::H; j++)
+            for (int k = 0; k < IGEMM_Geometry::W; k++) {
+                auto localCoord = blockOffset.offsetBy(i+IGEMM_Geometry::Dx,j+IGEMM_Geometry::Dy,k+IGEMM_Geometry::Dz);
                 auto globalCoord = origin+localCoord;
                 gatherIndexArray[l][bi][bj][bk][i][j][k] = inputGrid->tree().getValue(globalCoord);
             }
@@ -356,7 +416,7 @@ void mainSparseConvolutionIGEMM(
     gpuTimer.stop();
     
     gpuTimer.start("Reference (GPU) execution");
-    SparseConvolveCudaReference<IGEMM_Settings, Di, Do>(
+    SparseConvolveCudaReference<IGEMM_Geometry, Di, Do>(
         inputGrid,
         outputGrid,
         filter,
@@ -369,7 +429,7 @@ void mainSparseConvolutionIGEMM(
 #if 0
     // CPU version; may be extremely slow for all but the smallest resolutions
     gpuTimer.start("Reference (CPU) execution");
-    SparseConvolveCPUReference<IGEMM_Settings, Di, Do>(
+    SparseConvolveCPUReference<IGEMM_Geometry, Di, Do>(
         inputGrid,
         outputGrid,
         filter,
@@ -380,7 +440,7 @@ void mainSparseConvolutionIGEMM(
 #endif
 
     gpuTimer.start("Reference (Gather-Scatter) execution");
-    SparseConvolveScatterGatherMapsReference<IGEMM_Settings, Di, Do>(
+    SparseConvolveScatterGatherMapsReference<IGEMM_Geometry, Di, Do>(
         reinterpret_cast<GatherIndexT*>(gatherIndexArray),
         reinterpret_cast<ScatterIndexT*>(scatterIndexArray),
         blockCount,
@@ -394,6 +454,23 @@ void mainSparseConvolutionIGEMM(
         outputValueCount,
         outputArray,
         outputReferenceArray
+    );
+
+    IGEMM_Layouts<IGEMM_Geometry> layouts;
+
+    Tensor tXformedActGather = make_tensor(
+        make_gmem_ptr(inputData.data().get()),
+        layouts.xformedActivationComposedLayout(blockCount, gatherIndexData.data().get())
+    );
+
+    Tensor tGatherIndex = make_tensor(
+        make_gmem_ptr(gatherIndexData.data().get()),
+        layouts.gatherIndexLayout(blockCount)
+    );
+
+    Tensor tFilter = make_tensor(
+        make_gmem_ptr(filterData.data().get()),
+        layouts.filterLayout()
     );
 
     gpuTimer.stop();

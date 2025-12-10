@@ -513,20 +513,20 @@ void mainSparseConvolutionIGEMM(
     );
 
     // ((BLK_M, BLK_N), (m', n'))
-    Tensor gOutput_mn = zipped_divide(tXformedOutScatter, typename AmpereUnpredicatedFprop::TilerOut{});
+    Tensor gOutput_mn = zipped_divide(tXformedOutScatter, typename AmperePredicatedFprop<IGEMM_Geometry>::TilerOut{});
     dim3 launch_grid {static_cast<uint32_t>(size<1,1>(gOutput_mn)), static_cast<uint32_t>(size<1,0>(gOutput_mn)), 1};
-    constexpr size_t smem_size = sizeof(typename AmpereUnpredicatedFprop::SharedStorage);
+    constexpr size_t smem_size = sizeof(typename AmperePredicatedFprop<IGEMM_Geometry>::SharedStorage);
 
     cudaCheck(cudaFuncSetAttribute(
-            kernel_entrypoint_custom<AmpereUnpredicatedFprop, decltype(tFilter), decltype(tXformedActGather), decltype(tGatherIndex), decltype(tXformedOutScatter)>,
+            kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, decltype(tFilter), decltype(tXformedActGather), decltype(tGatherIndex), decltype(tXformedOutScatter)>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             smem_size));
 
-    int num_iterations = 1;
+    int num_iterations = 10;
     for (int i = 0; i < num_iterations; ++i) {
         gpuTimer.start("Scatter-Gather Cutlass IGEMM (GPU) execution");
-        kernel_entrypoint_custom<AmpereUnpredicatedFprop, decltype(tFilter), decltype(tXformedActGather), decltype(tGatherIndex), decltype(tXformedOutScatter)>
-            <<<launch_grid, AmpereUnpredicatedFprop::MaxThreadsPerBlock, smem_size>>>(
+        kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, decltype(tFilter), decltype(tXformedActGather), decltype(tGatherIndex), decltype(tXformedOutScatter)>
+            <<<launch_grid, AmperePredicatedFprop<IGEMM_Geometry>::MaxThreadsPerBlock, smem_size>>>(
                 tFilter, tXformedActGather, tGatherIndex, tXformedOutScatter);
         gpuTimer.stop();
     }

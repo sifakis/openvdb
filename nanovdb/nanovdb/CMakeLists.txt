@@ -78,7 +78,7 @@ if(NANOVDB_BUILD_UNITTESTS)
 endif()
 
 if(NANOVDB_USE_CUDA)
-  set(CMAKE_CUDA_STANDARD 17)
+  set(CMAKE_CUDA_STANDARD 20)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
   # Allow the user to provide CMAKE_CUDA_ARCHITECTURES
@@ -93,7 +93,7 @@ if(NANOVDB_USE_CUDA)
     set(NANOVDB_CUDA_EXTENDED_LAMBDA "--extended-lambda")
   endif()
 
-  set(CMAKE_CUDA_FLAGS "${NANOVDB_CUDA_EXTENDED_LAMBDA} -use_fast_math -lineinfo ${CMAKE_CUDA_FLAGS}")
+  set(CMAKE_CUDA_FLAGS "${NANOVDB_CUDA_EXTENDED_LAMBDA} -use_fast_math --expt-relaxed-constexpr -lineinfo ${CMAKE_CUDA_FLAGS}")
 
   # workaround for win32 bug when nvcc "--keep" is used.
   if(WIN32)

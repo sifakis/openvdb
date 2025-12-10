@@ -45,21 +45,23 @@
 
 using namespace cute;
 
-struct AmpereUnpredicatedFprop {
+
+template<class SettingsT>
+struct AmperePredicatedFprop {
   //
   // Static config for conv problem shape
   //
-  using D = _6;
-  using H = _4;
-  using W = _4;
+  using D = Int<SettingsT::D>;
+  using H = Int<SettingsT::H>;
+  using W = Int<SettingsT::W>;
 
-  using T = _3;
-  using R = _3;
-  using S = _3;
+  using T = Int<SettingsT::T>;
+  using R = Int<SettingsT::R>;
+  using S = Int<SettingsT::S>;
 
-  using Z = _4;
-  using P = _2;
-  using Q = _2;
+  using Z = Int<SettingsT::Z>;
+  using P = Int<SettingsT::P>;
+  using Q = Int<SettingsT::Q>;
 
   using C = _64;
   using K = _128;
@@ -434,39 +436,3 @@ struct AmpereUnpredicatedFprop {
     #endif
   }
 };
-
-template <class TensorFlt, class TensorAct, class TensorOut>
-inline int
-fprop_reference(
-    TensorFlt mStencil,    // Logical MK: ( K,        (C,T,R,S))
-    TensorAct mActivation, // Logical NK: ((N,Z,P,Q), (C,T,R,S))
-    TensorOut mOutput,     // Logical MN: ( K,        (N,Z,P,Q))
-    TensorOut mOutputRef) {
-  int32_t N = size<1,0>(mOutputRef); 
-  int32_t Z = size<1,1>(mOutputRef);
-  int32_t P = size<1,2>(mOutputRef);
-  int32_t Q = size<1,3>(mOutputRef);
-  int32_t T = size<1,3>(mStencil);
-  int32_t R = size<1,2>(mStencil);
-  int32_t S = size<1,1>(mStencil);
-  int32_t C = size<1,0>(mStencil);
-
-  size_t K    = static_cast<size_t>(size<0>(mOutputRef));
-  size_t NZPQ = static_cast<size_t>(size<1>(mOutputRef));
-  size_t CTRS = static_cast<size_t>(size<1>(mStencil));
-
-#if defined(_OPENMP)
-  #pragma omp parallel for
-#endif
-  for (size_t logical_m = 0; logical_m < K; ++logical_m) {
-    for (size_t logical_n = 0; logical_n < NZPQ; ++logical_n) {
-      auto accumulator = float(0);
-      for (size_t logical_k = 0; logical_k < CTRS; ++logical_k) {
-        accumulator += mStencil(logical_m, logical_k) * mActivation(logical_n, logical_k);
-      }
-      mOutputRef(logical_m, logical_n) = accumulator;
-    }
-  }
-
-  return print_relative_error(mOutput, mOutputRef,  /*print_verbose*/ false,  /*print_error*/ true, /*error_margin*/ 0.01);
-}

@@ -38,7 +38,7 @@
 #include "cutlass/util/print_error.hpp"
 
 #include "cutlass/gemm/dispatch_policy.hpp"
-#include "cutlass/gemm/collective/collective_mma.hpp"
+#include "cutlass/gemm/collective/collective_mma_decl.hpp"
 
 #include "dispatch_policy_custom.hpp"
 #include "sm80_mma_multistage_custom.hpp"
@@ -63,8 +63,8 @@ struct AmperePredicatedFprop {
   using P = Int<SettingsT::P>;
   using Q = Int<SettingsT::Q>;
 
-  using C = _64;
-  using K = _128;
+  using C = Int<SettingsT::C>;
+  using K = Int<SettingsT::K>;
 
   // Tiler config
   using Tiler_K = decltype(cute::min(K{}, _32{}));

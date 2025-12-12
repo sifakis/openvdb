@@ -502,6 +502,44 @@ void mainSparseConvolutionIGEMM(
         layouts.gatherIndexLayout(blockCount)
     );
 
+#if 0
+    for (int n = 0; n < blockCount; ++n)
+        for (int z = 0; z < IGEMM_Geometry::Z; ++z)
+        for (int p = 0; p < IGEMM_Geometry::P; ++p)
+        for (int q = 0; q < IGEMM_Geometry::Q; ++q) 
+            for (int t = 0; t < IGEMM_Geometry::T; ++t)
+            for (int r = 0; r < IGEMM_Geometry::R; ++r)
+            for (int s = 0; s < IGEMM_Geometry::S; ++s)
+                for (int c = 0; c < IGEMM_Geometry::C; ++c) {
+                    if (&tXformedActGather(make_tuple(n,z,p,q),make_tuple(c,t,r,s)) !=
+                        inputData.data().get()+IGEMM_Geometry::C*tGatherIndex(make_tuple(n,z+t,p+r,q+s),make_tuple(c,0,0,0))+c)
+                    {
+                        std::cout << "tXformedActGather("
+                                  << "(" << std::setw(6) << n << "," << z << "," << p << "," << q << "),"
+                                  << "(" << std::setw(2) << c << "," << t << "," << r << "," << s << ")) = "
+                                  << tXformedActGather(make_tuple(n,z,p,q),make_tuple(c,t,r,s))
+                                  << ", tGatherIndex(" 
+                                  << "(" << std::setw(6) << n << "," << z+t << "," << p+r << "," << q+s << "),"
+                                  << "(" << std::setw(2) << c << ",0,0,0)) = "
+                                  << tGatherIndex(make_tuple(n,z+t,p+r,q+s),make_tuple(c,0,0,0))
+                                  << std::endl;
+                    }
+                    if (tGatherIndex(make_tuple(n,z+t,p+r,q+s),make_tuple(c,0,0,0))==0)
+                        if (tXformedActGather(make_tuple(n,z,p,q),make_tuple(c,t,r,s)) != 0.f)
+                        {
+                            std::cout << "tXformedActGather("
+                                      << "(" << std::setw(6) << n << "," << z << "," << p << "," << q << "),"
+                                      << "(" << std::setw(2) << c << "," << t << "," << r << "," << s << ")) = "
+                                      << tXformedActGather(make_tuple(n,z,p,q),make_tuple(c,t,r,s))
+                                      << ", tGatherIndex(" 
+                                      << "(" << std::setw(6) << n << "," << z+t << "," << p+r << "," << q+s << "),"
+                                      << "(" << std::setw(2) << c << ",0,0,0)) = "
+                                      << tGatherIndex(make_tuple(n,z+t,p+r,q+s),make_tuple(c,0,0,0))
+                                      << std::endl;
+                        }   
+                }
+#endif
+
     Tensor tFilter = make_tensor(
         make_gmem_ptr(filterData.data().get()),
         layouts.filterLayout()

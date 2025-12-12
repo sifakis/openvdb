@@ -182,122 +182,13 @@ struct AmperePredicatedFprop {
   using SmemLayoutOut = Layout<Shape<TileSizeM, TileSizeN>>;
 
   //
-  // Conv functor (unpredicated IGEMM)
-  //
-  template <class EngineFlt, class TensorActivation, class TensorOutput>
-  void __device__
-  operator()(cute::Tensor<EngineFlt, GmemLayoutFlt> mFlt, // ( K,        (C,T,R,S))
-             TensorActivation                       mAct, // ((N,Z,P,Q), (C,T,R,S))
-             TensorOutput                           mOut, // ( K,        (N,Z,P,Q))
-             char* smem_buf) const {
-    using namespace cute;
-    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveMma<
-        cutlass::gemm::MainloopSm80CpAsyncUnpredicated<PIPE::value>,
-        Shape<TileM,TileN,TileK>,
-        ElementFlt,
-        Underscore, // Ignore the stride, we are passing full cute::Tensor to operator()
-        ElementAct,
-        Underscore, // Ignore the stride, we are passing full cute::Tensor to operator()
-        TiledMma,
-        GmemTiledCopyFlt,
-        SmemLayoutAtomFlt,
-        SmemCopyAtomFlt,
-        cute::identity,
-        GmemTiledCopyAct,
-        SmemLayoutAtomAct,
-        SmemCopyAtomAct,
-        cute::identity>;
-
-    TiledMma tiled_mma;
-    Tensor accum = partition_fragment_C(tiled_mma, TilerOut{});
-    clear(accum);
-
-    // Set up tensors
-    // NOTE: blockIdx.x projects onto act-NDHW mode, y along the flt-K mode for the sake of higher dynamic range in NDHW
-    Tensor gA_mk = local_tile(mFlt, TilerFlt{}, make_coord(_,_));                              // (BLK_M,BLK_K,m',k')
-    Tensor gB_nk = local_tile(mAct, TilerAct{}, make_coord(_,_));                              // (BLK_N,BLK_K,n',_1)
-    Tensor gC_mn = local_tile(mOut, TilerOut{}, make_coord(_,_));                              // (BLK_M,BLK_N,m',n')
-
-    // Compute m_coord and n_coord with their post-tiled shapes
-    auto m_coord = idx2crd(int(blockIdx.y), shape<2>(gA_mk));
-    auto n_coord = idx2crd(int(blockIdx.x), shape<2>(gB_nk));
-    Tensor gA = gA_mk(_,_,m_coord,_);                                                          // (BLK_M,BLK_K,k')
-    Tensor gB = gB_nk(_,_,n_coord,_);                                                          // (BLK_N,BLK_K,_1)
-    Tensor gC = gC_mn(_,_,m_coord,n_coord);                                                    // (BLK_M,BLK_N)
-
-    auto k_tile_iter = cute::make_coord_iterator(size<2>(gA));
-    int k_tile_count = size<2>(gA);
-
-    CollectiveMainloop collective_mma;
-    collective_mma(
-      accum,
-      gA,
-      gB,
-      accum,
-      k_tile_iter, k_tile_count,
-      Underscore{}, // no residue since we do not support predication
-      threadIdx.x,
-      smem_buf);
-
-    //
-    // Epilogue
-    //
-    SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
-    Tensor sC = make_tensor(make_smem_ptr(&storage.epilogue.sCMatrix[0]), SmemLayoutOut{});
-
-    auto smem_tiled_copy_C = make_tiled_copy_C(SmemCopyAtomOut{}, tiled_mma);
-    auto smem_thr_copy_C = smem_tiled_copy_C.get_slice(threadIdx.x);
-    auto tCrC = smem_thr_copy_C.retile_S(accum);
-    auto tCsC = smem_thr_copy_C.partition_D(sC);
-    copy(smem_tiled_copy_C, tCrC, tCsC);
-
-    __syncthreads();
-
-    GmemTiledCopyOut gmem_tiled_copy_C;
-    auto gmem_thr_copy_C = gmem_tiled_copy_C.get_slice(threadIdx.x);
-    auto tDsC = gmem_thr_copy_C.partition_S(sC);
-    auto tDgC = gmem_thr_copy_C.partition_D(gC);
-    copy(gmem_tiled_copy_C, tDsC, tDgC);
-
-    #if 0
-      if (thread0()) {
-        print("mAct = "); print(mAct);          print('\n');
-        print("mFlt = "); print(mFlt);          print('\n');
-        print("mOut = "); print(mOut);          print('\n');
-        print("gA   = "); print(gA);            print('\n');
-        print("gB   = "); print(gB);            print('\n');
-        print("gC   = "); print(gC);            print('\n');
-        print("sA   = "); print(sA.layout());   print('\n');
-        print("sB   = "); print(sB.layout());   print('\n');
-        print("sC   = "); print(sC.layout());   print('\n');
-        print("tAgA = "); print(tAgA.layout()); print('\n');
-        print("tBgB = "); print(tBgB.layout()); print('\n');
-        print("tAsA = "); print(tAsA.layout()); print('\n');
-        print("tBsB = "); print(tBsB.layout()); print('\n');
-        print("tCsA = "); print(tCsA.layout()); print('\n');
-        print("tCsB = "); print(tCsB.layout()); print('\n');
-        print("tCrC = "); print(tCrC.layout()); print('\n');
-        print("tCsC = "); print(tCsC.layout()); print('\n');
-        print("tDsC = "); print(tDsC.layout()); print('\n');
-        print("tDgC = "); print(tDgC.layout()); print('\n');
-        print("gmem tiled copy A = "); print(gmem_tiled_copy_A); print('\n');
-        print("gmem tiled copy B = "); print(gmem_tiled_copy_B); print('\n');
-        print("gmem tiled copy C = "); print(gmem_tiled_copy_C); print('\n');
-        print("k_tile_count = "); print(size<2>(gA)); print('\n');
-        print("k_tile_iter  = "); print(*k_tile_iter); print('\n');
-        print("K_BLOCK_MAX  = "); print(K_BLOCK_MAX); print('\n');
-    }
-    #endif
-  }
-
-  //
   // Conv functor (predicated IGEMM)
   //
   template <class EngineFlt, class TensorActivation, class TensorGatherIndex, class TensorOutput>
   void __device__
   operator()(cute::Tensor<EngineFlt, GmemLayoutFlt> mFlt, // ( K,        (C,T,R,S))
              TensorActivation                       mAct, // ((N,Z,P,Q), (C,T,R,S))
-             TensorGatherIndex                      mGIx, // ((N,Z,P,Q), (C,1,1,1))
+             TensorGatherIndex                      mGIx, // ((N,D,H,W), (C,1,1,1))
              TensorOutput                           mOut, // ( K,        (N,Z,P,Q))
              char* smem_buf) const {
     using namespace cute;
@@ -341,7 +232,8 @@ struct AmperePredicatedFprop {
     auto sG_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->mainloop.sBiMatrix[0];
     auto gG_ptr = gG.data();
     for (int i = 0; i < size(TileP{}); i += MaxThreadsPerBlock) {
-      sG_ptr[i+threadIdx.x] = (gG(i+threadIdx.x) != 0xffffffff);
+        //  sG_ptr[i+threadIdx.x] = (gG(i+threadIdx.x) != 0);
+        sG_ptr[i+threadIdx.x] = (gG(i+threadIdx.x) != 0xffffffff);
     }
     __syncthreads();
 

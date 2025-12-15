@@ -226,7 +226,8 @@ struct CollectiveMma<
     CUTLASS_PRAGMA_UNROLL
     for (int k_pipe = 0; k_pipe < DispatchPolicy::Stages-1; ++k_pipe) {
       copy   (gmem_tiled_copy_A,                           tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,k_pipe));
-      copy_if(gmem_tiled_copy_B, tBsP(_,_,_,*k_tile_iter), tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,k_pipe));
+      copy   (gmem_tiled_copy_B,                           tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,k_pipe));
+      // copy_if(gmem_tiled_copy_B, tBsP(_,_,_,*k_tile_iter), tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,k_pipe));
       cp_async_fence();
       --k_tile_count;
       if (k_tile_count > 0) { ++k_tile_iter; }
@@ -321,7 +322,8 @@ struct CollectiveMma<
         if (k_block == 0)
         {
           copy   (gmem_tiled_copy_A,                           tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,smem_pipe_write));
-          copy_if(gmem_tiled_copy_B, tBsP(_,_,_,*k_tile_iter), tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,smem_pipe_write));
+          copy   (gmem_tiled_copy_B,                           tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,smem_pipe_write));
+          // copy_if(gmem_tiled_copy_B, tBsP(_,_,_,*k_tile_iter), tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,smem_pipe_write));
           cp_async_fence();
 
           // Advance the tile

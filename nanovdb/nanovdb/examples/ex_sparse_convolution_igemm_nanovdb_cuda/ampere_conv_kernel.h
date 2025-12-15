@@ -73,7 +73,7 @@ struct AmperePredicatedFprop {
   using TileM = Tiler_K;
   using TileN = Shape<Tiler_N, Z, P, Q>;
   using TileK = Shape<Tiler_C,_1,_1,_1>;
-  using TileP = Shape<Tiler_N, D, H, W>;  
+  using TileP = Shape<Tiler_N, D, H, W>; // Including halo in spatial dimensions
   using PIPE  = _3;
   using TilerFlt = Shape<TileM, TileK>;
   using TilerAct = Shape<TileN, TileK>;
@@ -101,7 +101,7 @@ struct AmperePredicatedFprop {
     struct {
       ElementFlt sAMatrix[size(TileM{}) * size(TileK{}) * size(PIPE{})];
       ElementAct sBMatrix[size(TileN{}) * size(TileK{}) * size(PIPE{})];
-      bool       sBiMatrix[size(TileP{})];
+      bool       sGpMatrix[size(TileP{})]; // Gather predicate
     } mainloop;
 
     struct {
@@ -213,6 +213,40 @@ struct AmperePredicatedFprop {
     Tensor accum = partition_fragment_C(tiled_mma, TilerOut{});
     clear(accum);
 
+#if 1
+    if ((threadIdx.x) == 0 && (blockIdx.x == 0) && (blockIdx.y == 0)) {        
+        print("mAct.shape()=");print(mAct.shape());print("\n");
+        print("mGIx.shape()=");print(mGIx.shape());print("\n");
+        for (int n = 0; n < size<0,0>(mAct); ++n)
+            for (int z = 0; z < Z::value; ++z)
+            for (int p = 0; p < P::value; ++p)
+            for (int q = 0; q < Q::value; ++q)
+                for (int c = 0; c < C::value; ++c)
+                    for (int t = 0; t < T::value; ++t)
+                    for (int r = 0; r < R::value; ++r)
+                    for (int s = 0; s < S::value; ++s)
+                    {
+                        if (&mAct(make_tuple(n,z,p,q),make_tuple(c,t,r,s)) !=
+                            mAct.data()+C::value*mGIx(make_tuple(n,z+t,p+r,q+s),make_tuple(c,0,0,0))+c)
+                        {
+                            print("Pointer discrepancy ((n,z,p,q),(c,t,r,s))=(");
+                            print("(");print(n);print(",");print(z);print(",");print(p);print(",");print(q);print("),");
+                            print("(");print(c);print(",");print(t);print(",");print(r);print(",");print(s);print(")");
+                            print(")\n");
+                        }
+                        if ((mGIx(make_tuple(n,z+t,p+r,q+s),make_tuple(c,0,0,0)) == 0) &&
+                            (mAct(make_tuple(n,z,p,q),make_tuple(c,t,r,s)) != 0.f))
+                        {
+                            print("Null value discrepancy ((n,z,p,q),(c,t,r,s))=(");
+                            print("(");print(n);print(",");print(z);print(",");print(p);print(",");print(q);print("),");
+                            print("(");print(c);print(",");print(t);print(",");print(r);print(",");print(s);print(")");
+                            print(")\n");
+                        }
+                    }
+    }
+    __syncthreads();
+#endif
+
     // Set up tensors
     // NOTE: blockIdx.x projects onto act-NDHW mode, y along the flt-K mode for the sake of higher dynamic range in NDHW
     Tensor gA_mk = local_tile(mFlt, TilerFlt{}, make_coord(_,_));                            // (BLK_M,BLK_K,m',k')
@@ -228,35 +262,134 @@ struct AmperePredicatedFprop {
     Tensor gG = gG_nk(_,_,n_coord,_);                                                        // (BLK_N,BLK_K,_1)
     Tensor gC = gC_mn(_,_,m_coord,n_coord);                                                  // (BLK_M,BLK_N)
 
-    static_assert(size(TileP{}) % MaxThreadsPerBlock == 0);
-    auto sG_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->mainloop.sBiMatrix[0];
-    auto gG_ptr = gG.data();
-    for (int i = 0; i < size(TileP{}); i += MaxThreadsPerBlock) {
-        //  sG_ptr[i+threadIdx.x] = (gG(i+threadIdx.x) != 0);
-        sG_ptr[i+threadIdx.x] = (gG(i+threadIdx.x) != 0xffffffff);
+#if 1
+    if ((threadIdx.x) == 0 && (blockIdx.x == 0) && (blockIdx.y == 0)) {        
+        print("gB.shape()=");print(gB.shape());print("\n");
+        print("gG.shape()=");print(gG.shape());print("\n");
+        print("size<0,0>(gG)=");print(size<0,0>(gG));print("\n");
+        print("size<1,0>(gG)=");print(size<1,0>(gG));print("\n");
+        print("size<2,0>(gG)=");print(size<2,0>(gG));print("\n");
+        for (int n = 0; n < size<0,0>(gG); ++n)
+            for (int z = 0; z < Z::value; ++z)
+            for (int p = 0; p < P::value; ++p)
+            for (int q = 0; q < Q::value; ++q)
+                for (int ic = 0; ic < size<1,0>(gG); ++ic)
+                for (int bc = 0; bc < size<2,0>(gG); ++bc)
+                    for (int t = 0; t < T::value; ++t)
+                    for (int r = 0; r < R::value; ++r)
+                    for (int s = 0; s < S::value; ++s)
+                    {
+                        if (&gB(make_tuple(n,z,p,q),make_tuple(ic,1,1,1),make_tuple(bc,t,r,s)) !=
+                            gB.data()+C::value*gG(make_tuple(n,z+t,p+r,q+s),make_tuple(ic,1,1,1),make_tuple(bc,0,0,0))+bc*size<1,0>(gG)+ic)
+                        {
+                            print("Pointer discrepancy ((n,z,p,q),(ic,1,1,1),(bc,t,r,s))=(");
+                            print("(");print(n);print(",");print(z);print(",");print(p);print(",");print(q);print("),");
+                            print("(");print(ic);print(",1,1,1),");
+                            print("(");print(bc);print(",");print(t);print(",");print(r);print(",");print(s);print(")");
+                            print(")\n");
+                        }
+                        if ((gG(make_tuple(n,z+t,p+r,q+s),make_tuple(ic,1,1,1),make_tuple(bc,0,0,0)) == 0) &&
+                            (gB(make_tuple(n,z,p,q),make_tuple(ic,1,1,1),make_tuple(bc,t,r,s)) != 0.f))
+                        {
+                            print("Null value discrepancy ((n,z,p,q),(ic,1,1,1),(bc,t,r,s))=(");
+                            print("(");print(n);print(",");print(z);print(",");print(p);print(",");print(q);print("),");
+                            print("(");print(ic);print(",1,1,1),");
+                            print("(");print(bc);print(",");print(t);print(",");print(r);print(",");print(s);print(")");
+                            print(")\n");
+                        }
+                    }
     }
     __syncthreads();
+#endif
 
+    static_assert(size(TileP{}) % MaxThreadsPerBlock == 0);
+    auto sG_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->mainloop.sGpMatrix[0];
+    auto gG_ptr = gG.data();
     auto gather_predicate_layout = make_layout(
       shape(gB),
       make_stride(
         make_stride(D{}*H{}*W{}, H{}*W{},  W{}, _1{}),
         make_stride(       _0{},    _0{}, _0{}, _0{}),
         make_stride(       _0{}, H{}*W{},  W{}, _1{})));
-    Tensor sP = make_tensor(make_smem_ptr(sG_ptr), gather_predicate_layout);
-    
-#if 0
+    Tensor sP = make_tensor(make_smem_ptr(sG_ptr), gather_predicate_layout);    
+    for (int i = 0; i < size(TileP{}); i += MaxThreadsPerBlock)
+        sG_ptr[i+threadIdx.x] = gG_ptr[i+threadIdx.x];
+    __syncthreads();
+
+ #if 0
+    if (thread0())
+        for (int n = 0; n < size<0,0>(gG); ++n)
+            for (int d = 0; d < D::value; ++d)
+            for (int h = 0; h < H::value; ++h)
+            for (int w = 0; w < W::value; ++w)
+                sP(make_tuple(n,d,h,w),make_tuple(0,0,0,0),make_tuple(0,0,0,0)) =
+                    gG(make_tuple(n,d,h,w),make_tuple(0,0,0,0),make_tuple(0,0,0,0));
+    __syncthreads();
+#endif
+
+#if 1
     if ((threadIdx.x) == 0 && (blockIdx.x == 0) && (blockIdx.y == 0)) {        
-        print("shape(sP)=");print(shape(sP));print("\n");
-        print("stride(sP)=");print(stride(sP));print("\n");
-        print("cosize(sP)=");print(cosize(layout(sP)));print("\n");
-        print("size(TileP{})=");print(size(TileP{}));print("\n");
-        print("shape(mGIx)=");print(shape(mGIx));print("\n");
-        print("shape(gG_nk)=");print(shape(gG_nk));print("\n");
-        print("shape(gG)=");print(shape(gG));print("\n");
-        print("stride(gG)=");print(stride(gG));print("\n");
-        Tensor dummy = gG(0,_,0);
-        printf("gG(0,_,0)=");print(gG(0,_,0));print("\n");
+        print("gG.layout()=");print(gG.layout());print("\n");
+        print("gG.stride()=");print(gG.stride());print("\n");
+        print("cosize(gG.layout())=");print(cosize(gG.layout()));print("\n");
+        print("sP.layout()=");print(sP.layout());print("\n");
+        print("sP.stride()=");print(sP.stride());print("\n");
+        print("cosize(sP.layout())=");print(cosize(sP.layout()));print("\n");
+        
+#if 1
+        for (int n = 0; n < size<0,0>(gG); ++n)
+            for (int z = 0; z < Z::value; ++z)
+            for (int p = 0; p < P::value; ++p)
+            for (int q = 0; q < Q::value; ++q)
+                for (int ic = 0; ic < size<1,0>(gG); ++ic)
+                for (int bc = 0; bc < size<2,0>(gG); ++bc)
+                    for (int t = 0; t < T::value; ++t)
+                    for (int r = 0; r < R::value; ++r)
+                    for (int s = 0; s < S::value; ++s)
+                    {
+                        if (!sP(make_tuple(n,z,p,q),make_tuple(ic,1,1,1),make_tuple(bc,t,r,s)) &&
+                            (gB(make_tuple(n,z,p,q),make_tuple(ic,1,1,1),make_tuple(bc,t,r,s)) != 0.f))
+                        {
+                            print("Null value discrepancy ((n,z,p,q),(ic,1,1,1),(bc,t,r,s))=(");
+                            print("(");print(n);print(",");print(z);print(",");print(p);print(",");print(q);print("),");
+                            print("(");print(ic);print(",1,1,1),");
+                            print("(");print(bc);print(",");print(t);print(",");print(r);print(",");print(s);print(")");
+                            print(")\n");
+                        }
+                    }
+#endif
+    }
+    __syncthreads();
+#endif
+
+#if 1
+    if ((threadIdx.x) == 0 && (blockIdx.x == 0) && (blockIdx.y == 0)) {        
+        print("gA.shape()=");print(gA.shape());print("\n");
+        print("gB.shape()=");print(gB.shape());print("\n");
+        print("sP.shape()=");print(sP.shape());print("\n");
+        print("cosize(sP.layout())=");print(cosize(sP.layout()));print("\n");
+        print("gG.shape()=");print(gG.shape());print("\n");
+        print("cosize(gG.layout())=");print(cosize(gG.layout()));print("\n");
+        for (int n = 0; n < Tiler_N::value; ++n)
+            for (int z = 0; z < Z::value; ++z)
+            for (int p = 0; p < P::value; ++p)
+            for (int q = 0; q < Q::value; ++q)
+                for (int c = 0; c < /*C::value*/1; ++c)
+                    for (int k = 0; k < /*size<2,0>(sP)*/1; ++k)
+                        for (int t = 0; t < T::value; ++t)
+                        for (int r = 0; r < R::value; ++r)
+                        for (int s = 0; s < S::value; ++s)
+                            if (!sP(make_tuple(n,z,p,q),make_tuple(c,1,1,1),make_tuple(k,t,r,s)))
+                                if (gG(make_tuple(n,z+t,p+r,q+s),make_tuple(c,1,1,1),make_tuple(k,1,1,1)))
+                        {
+#if 1
+                            print("((n,z,p,q))=(");
+                            print("(");print(n);print(",");print(z);print(",");print(p);print(",");print(q);print("),");
+                            print("(");print(c);print(",1,1,1),");
+                            print("(");print(k);print(",");print(t);print(",");print(r);print(",");print(s);print(")");
+                            print(")\n");
+#endif
+       }
     }
     __syncthreads();
 #endif

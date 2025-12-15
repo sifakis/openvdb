@@ -524,7 +524,7 @@ void mainSparseConvolutionIGEMM(
                                   << tGatherIndex(make_tuple(n,z+t,p+r,q+s),make_tuple(c,0,0,0))
                                   << std::endl;
                     }
-                    if (tGatherIndex(make_tuple(n,z+t,p+r,q+s),make_tuple(c,0,0,0))==0)
+                    if (tGatherIndex(make_tuple(n,z+t,p+r,q+s),make_tuple(c,0,0,0)) == 0)
                         if (tXformedActGather(make_tuple(n,z,p,q),make_tuple(c,t,r,s)) != 0.f)
                         {
                             std::cout << "tXformedActGather("
@@ -560,7 +560,7 @@ void mainSparseConvolutionIGEMM(
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             smem_size));
 
-    int num_iterations = 10;
+    int num_iterations = 1;
     for (int i = 0; i < num_iterations; ++i) {
         gpuTimer.start("Scatter-Gather Cutlass IGEMM (GPU) execution");
         kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, decltype(tFilter), decltype(tXformedActGather), decltype(tGatherIndex), decltype(tXformedOutScatter)>

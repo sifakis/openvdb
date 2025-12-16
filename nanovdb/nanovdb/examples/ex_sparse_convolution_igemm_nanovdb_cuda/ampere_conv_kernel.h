@@ -327,7 +327,7 @@ struct AmperePredicatedFprop {
     __syncthreads();
 #endif
 
-#if 1
+#if 0
     if ((threadIdx.x) == 0 && (blockIdx.x == 0) && (blockIdx.y == 0)) {        
         print("gG.layout()=");print(gG.layout());print("\n");
         print("gG.stride()=");print(gG.stride());print("\n");
@@ -362,7 +362,7 @@ struct AmperePredicatedFprop {
     __syncthreads();
 #endif
 
-#if 1
+#if 0
     if ((threadIdx.x) == 0 && (blockIdx.x == 0) && (blockIdx.y == 0)) {        
         print("gA.shape()=");print(gA.shape());print("\n");
         print("gB.shape()=");print(gB.shape());print("\n");

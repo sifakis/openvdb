@@ -213,40 +213,6 @@ struct AmperePredicatedFprop {
     Tensor accum = partition_fragment_C(tiled_mma, TilerOut{});
     clear(accum);
 
-#if 0
-    if ((threadIdx.x) == 0 && (blockIdx.x == 0) && (blockIdx.y == 0)) {        
-        print("mAct.shape()=");print(mAct.shape());print("\n");
-        print("mGIx.shape()=");print(mGIx.shape());print("\n");
-        for (int n = 0; n < size<0,0>(mAct); ++n)
-            for (int z = 0; z < Z::value; ++z)
-            for (int p = 0; p < P::value; ++p)
-            for (int q = 0; q < Q::value; ++q)
-                for (int c = 0; c < C::value; ++c)
-                    for (int t = 0; t < T::value; ++t)
-                    for (int r = 0; r < R::value; ++r)
-                    for (int s = 0; s < S::value; ++s)
-                    {
-                        if (&mAct(make_tuple(n,z,p,q),make_tuple(c,t,r,s)) !=
-                            mAct.data()+C::value*mGIx(make_tuple(n,z+t,p+r,q+s),make_tuple(c,0,0,0))+c)
-                        {
-                            print("Pointer discrepancy ((n,z,p,q),(c,t,r,s))=(");
-                            print("(");print(n);print(",");print(z);print(",");print(p);print(",");print(q);print("),");
-                            print("(");print(c);print(",");print(t);print(",");print(r);print(",");print(s);print(")");
-                            print(")\n");
-                        }
-                        if ((mGIx(make_tuple(n,z+t,p+r,q+s),make_tuple(c,0,0,0)) == 0) &&
-                            (mAct(make_tuple(n,z,p,q),make_tuple(c,t,r,s)) != 0.f))
-                        {
-                            print("Null value discrepancy ((n,z,p,q),(c,t,r,s))=(");
-                            print("(");print(n);print(",");print(z);print(",");print(p);print(",");print(q);print("),");
-                            print("(");print(c);print(",");print(t);print(",");print(r);print(",");print(s);print(")");
-                            print(")\n");
-                        }
-                    }
-    }
-    __syncthreads();
-#endif
-
     // Set up tensors
     // NOTE: blockIdx.x projects onto act-NDHW mode, y along the flt-K mode for the sake of higher dynamic range in NDHW
     Tensor gA_mk = local_tile(mFlt, TilerFlt{}, make_coord(_,_));                            // (BLK_M,BLK_K,m',k')
@@ -262,46 +228,6 @@ struct AmperePredicatedFprop {
     Tensor gG = gG_nk(_,_,n_coord,_);                                                        // (BLK_N,BLK_K,_1)
     Tensor gC = gC_mn(_,_,m_coord,n_coord);                                                  // (BLK_M,BLK_N)
 
-#if 0
-    if ((threadIdx.x) == 0 && (blockIdx.x == 0) && (blockIdx.y == 0)) {        
-        print("gB.shape()=");print(gB.shape());print("\n");
-        print("gG.shape()=");print(gG.shape());print("\n");
-        print("size<0,0>(gG)=");print(size<0,0>(gG));print("\n");
-        print("size<1,0>(gG)=");print(size<1,0>(gG));print("\n");
-        print("size<2,0>(gG)=");print(size<2,0>(gG));print("\n");
-        for (int n = 0; n < size<0,0>(gG); ++n)
-            for (int z = 0; z < Z::value; ++z)
-            for (int p = 0; p < P::value; ++p)
-            for (int q = 0; q < Q::value; ++q)
-                for (int ic = 0; ic < size<1,0>(gG); ++ic)
-                for (int bc = 0; bc < size<2,0>(gG); ++bc)
-                    for (int t = 0; t < T::value; ++t)
-                    for (int r = 0; r < R::value; ++r)
-                    for (int s = 0; s < S::value; ++s)
-                    {
-                        if (&gB(make_tuple(n,z,p,q),make_tuple(ic,1,1,1),make_tuple(bc,t,r,s)) !=
-                            gB.data()+C::value*gG(make_tuple(n,z+t,p+r,q+s),make_tuple(ic,1,1,1),make_tuple(bc,0,0,0))+bc*size<1,0>(gG)+ic)
-                        {
-                            print("Pointer discrepancy ((n,z,p,q),(ic,1,1,1),(bc,t,r,s))=(");
-                            print("(");print(n);print(",");print(z);print(",");print(p);print(",");print(q);print("),");
-                            print("(");print(ic);print(",1,1,1),");
-                            print("(");print(bc);print(",");print(t);print(",");print(r);print(",");print(s);print(")");
-                            print(")\n");
-                        }
-                        if ((gG(make_tuple(n,z+t,p+r,q+s),make_tuple(ic,1,1,1),make_tuple(bc,0,0,0)) == 0) &&
-                            (gB(make_tuple(n,z,p,q),make_tuple(ic,1,1,1),make_tuple(bc,t,r,s)) != 0.f))
-                        {
-                            print("Null value discrepancy ((n,z,p,q),(ic,1,1,1),(bc,t,r,s))=(");
-                            print("(");print(n);print(",");print(z);print(",");print(p);print(",");print(q);print("),");
-                            print("(");print(ic);print(",1,1,1),");
-                            print("(");print(bc);print(",");print(t);print(",");print(r);print(",");print(s);print(")");
-                            print(")\n");
-                        }
-                    }
-    }
-    __syncthreads();
-#endif
-
     static_assert(size(TileP{}) % MaxThreadsPerBlock == 0);
     auto sG_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->mainloop.sGpMatrix[0];
     auto gG_ptr = gG.data();
@@ -316,85 +242,6 @@ struct AmperePredicatedFprop {
         sG_ptr[i+threadIdx.x] = gG_ptr[i+threadIdx.x];
     __syncthreads();
 
- #if 0
-    if (thread0())
-        for (int n = 0; n < size<0,0>(gG); ++n)
-            for (int d = 0; d < D::value; ++d)
-            for (int h = 0; h < H::value; ++h)
-            for (int w = 0; w < W::value; ++w)
-                sP(make_tuple(n,d,h,w),make_tuple(0,0,0,0),make_tuple(0,0,0,0)) =
-                    gG(make_tuple(n,d,h,w),make_tuple(0,0,0,0),make_tuple(0,0,0,0));
-    __syncthreads();
-#endif
-
-#if 0
-    if ((threadIdx.x) == 0 && (blockIdx.x == 0) && (blockIdx.y == 0)) {        
-        print("gG.layout()=");print(gG.layout());print("\n");
-        print("gG.stride()=");print(gG.stride());print("\n");
-        print("cosize(gG.layout())=");print(cosize(gG.layout()));print("\n");
-        print("sP.layout()=");print(sP.layout());print("\n");
-        print("sP.stride()=");print(sP.stride());print("\n");
-        print("cosize(sP.layout())=");print(cosize(sP.layout()));print("\n");
-        
-#if 0
-        for (int n = 0; n < size<0,0>(gG); ++n)
-            for (int z = 0; z < Z::value; ++z)
-            for (int p = 0; p < P::value; ++p)
-            for (int q = 0; q < Q::value; ++q)
-                for (int ic = 0; ic < size<1,0>(gG); ++ic)
-                for (int bc = 0; bc < size<2,0>(gG); ++bc)
-                    for (int t = 0; t < T::value; ++t)
-                    for (int r = 0; r < R::value; ++r)
-                    for (int s = 0; s < S::value; ++s)
-                    {
-                        if (!sP(make_tuple(n,z,p,q),make_tuple(ic,1,1,1),make_tuple(bc,t,r,s)) &&
-                            (gB(make_tuple(n,z,p,q),make_tuple(ic,1,1,1),make_tuple(bc,t,r,s)) != 0.f))
-                        {
-                            print("Null value discrepancy ((n,z,p,q),(ic,1,1,1),(bc,t,r,s))=(");
-                            print("(");print(n);print(",");print(z);print(",");print(p);print(",");print(q);print("),");
-                            print("(");print(ic);print(",1,1,1),");
-                            print("(");print(bc);print(",");print(t);print(",");print(r);print(",");print(s);print(")");
-                            print(")\n");
-                        }
-                    }
-#endif
-    }
-    __syncthreads();
-#endif
-
-#if 0
-    if ((threadIdx.x) == 0 && (blockIdx.x == 0) && (blockIdx.y == 0)) {        
-        print("gA.shape()=");print(gA.shape());print("\n");
-        print("gB.shape()=");print(gB.shape());print("\n");
-        print("sP.shape()=");print(sP.shape());print("\n");
-        print("cosize(sP.layout())=");print(cosize(sP.layout()));print("\n");
-        print("gG.shape()=");print(gG.shape());print("\n");
-        print("cosize(gG.layout())=");print(cosize(gG.layout()));print("\n");
-        for (int n = 0; n < Tiler_N::value; ++n)
-            for (int z = 0; z < Z::value; ++z)
-            for (int p = 0; p < P::value; ++p)
-            for (int q = 0; q < Q::value; ++q)
-                for (int c = 0; c < /*C::value*/1; ++c)
-                    for (int k = 0; k < /*size<2,0>(sP)*/1; ++k)
-                        for (int t = 0; t < T::value; ++t)
-                        for (int r = 0; r < R::value; ++r)
-                        for (int s = 0; s < S::value; ++s)
-                            if (!sP(make_tuple(n,z,p,q),make_tuple(c,1,1,1),make_tuple(k,t,r,s)))
-                                if (gG(make_tuple(n,z+t,p+r,q+s),make_tuple(c,1,1,1),make_tuple(k,1,1,1)))
-                        {
-#if 1
-                            print("((n,z,p,q))=(");
-                            print("(");print(n);print(",");print(z);print(",");print(p);print(",");print(q);print("),");
-                            print("(");print(c);print(",1,1,1),");
-                            print("(");print(k);print(",");print(t);print(",");print(r);print(",");print(s);print(")");
-                            print(")\n");
-#endif
-       }
-    }
-    __syncthreads();
-#endif
-
-    
     auto k_tile_iter = cute::make_coord_iterator(size<2>(gA));
     int k_tile_count = size<2>(gA);
 
@@ -429,35 +276,5 @@ struct AmperePredicatedFprop {
     auto tDsC = gmem_thr_copy_C.partition_S(sC);
     auto tDgC = gmem_thr_copy_C.partition_D(gC);
     copy(gmem_tiled_copy_C, tDsC, tDgC);
-
-    #if 0
-      if (thread0()) {
-        print("mAct = "); print(mAct);          print('\n');
-        print("mFlt = "); print(mFlt);          print('\n');
-        print("mOut = "); print(mOut);          print('\n');
-        print("gA   = "); print(gA);            print('\n');
-        print("gB   = "); print(gB);            print('\n');
-        print("gC   = "); print(gC);            print('\n');
-        print("sA   = "); print(sA.layout());   print('\n');
-        print("sB   = "); print(sB.layout());   print('\n');
-        print("sC   = "); print(sC.layout());   print('\n');
-        print("tAgA = "); print(tAgA.layout()); print('\n');
-        print("tBgB = "); print(tBgB.layout()); print('\n');
-        print("tAsA = "); print(tAsA.layout()); print('\n');
-        print("tBsB = "); print(tBsB.layout()); print('\n');
-        print("tCsA = "); print(tCsA.layout()); print('\n');
-        print("tCsB = "); print(tCsB.layout()); print('\n');
-        print("tCrC = "); print(tCrC.layout()); print('\n');
-        print("tCsC = "); print(tCsC.layout()); print('\n');
-        print("tDsC = "); print(tDsC.layout()); print('\n');
-        print("tDgC = "); print(tDgC.layout()); print('\n');
-        print("gmem tiled copy A = "); print(gmem_tiled_copy_A); print('\n');
-        print("gmem tiled copy B = "); print(gmem_tiled_copy_B); print('\n');
-        print("gmem tiled copy C = "); print(gmem_tiled_copy_C); print('\n');
-        print("k_tile_count = "); print(size<2>(gA)); print('\n');
-        print("k_tile_iter  = "); print(*k_tile_iter); print('\n');
-        print("K_BLOCK_MAX  = "); print(K_BLOCK_MAX); print('\n');
-    }
-    #endif
   }
 };

@@ -226,37 +226,8 @@ struct CollectiveMma<
     CUTLASS_PRAGMA_UNROLL
     for (int k_pipe = 0; k_pipe < DispatchPolicy::Stages-1; ++k_pipe) {
       copy   (gmem_tiled_copy_A,                           tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,k_pipe));
-      // copy   (gmem_tiled_copy_B,                           tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,k_pipe));
       copy_if(gmem_tiled_copy_B, tBsP(_,_,_,*k_tile_iter), tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,k_pipe));
-      Tensor tBsP_slice = tBsP(_,_,_,*k_tile_iter);
-      Tensor tBgB_slice = tBgB(_,_,_,*k_tile_iter);
-      Tensor tBsB_slice = tBsB(_,_,_,k_pipe);
-      __syncthreads();
       cp_async_fence();
-#if 0
-      cp_async_wait<0>();
-      // if (thread0())
-      {
-          // print("tBsP_slice.layout() = ");print(tBsP_slice.layout());print("\n");
-          // print("tBgB_slice.layout() = ");print(tBgB_slice.layout());print("\n");
-          for (int ii = 0; ii < size<0,0>(tBsP_slice); ++ii)
-          for (int ji = 0; ji < size<1,0>(tBsP_slice); ++ji)
-          for (int jj = 0; jj < size<1,1>(tBsP_slice); ++jj)
-              if (!tBsP_slice(make_tuple(ii,0),make_tuple(ji,jj),0))
-              {
-                  if (tBgB_slice(make_tuple(ii,0),make_tuple(ji,jj),0) != 0.f)
-                      print("Found instance where tBgB is nonzero while tBsP is false\n");
-                  if (tBsB_slice(make_tuple(ii,0),ji+2*jj,0) != 0.f)
-                      print("Found instance where tBsB is nonzero while tBsP is false\n");
-              }
-              else
-              {
-                  if (tBgB_slice(make_tuple(ii,0),make_tuple(ji,jj),0) !=
-                      tBsB_slice(make_tuple(ii,0),ji+2*jj,0))
-                      print("Found instance where tBsB and tBgB are not equal, while tBsP is true\n");
-              }
-      }
-#endif
       --k_tile_count;
       if (k_tile_count > 0) { ++k_tile_iter; }
     }
@@ -350,7 +321,6 @@ struct CollectiveMma<
         if (k_block == 0)
         {
           copy   (gmem_tiled_copy_A,                           tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,smem_pipe_write));
-          // copy   (gmem_tiled_copy_B,                           tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,smem_pipe_write));
           copy_if(gmem_tiled_copy_B, tBsP(_,_,_,*k_tile_iter), tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,smem_pipe_write));
           cp_async_fence();
 

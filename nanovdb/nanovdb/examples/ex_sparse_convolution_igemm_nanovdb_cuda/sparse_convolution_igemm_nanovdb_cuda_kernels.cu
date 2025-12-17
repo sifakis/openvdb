@@ -560,6 +560,11 @@ void mainSparseConvolutionIGEMM(
         layouts.xformedOutputComposedLayout(blockCount, scatterIndexData.data().get())
     );
 
+    Tensor tScatterrIndex = make_tensor(
+        make_gmem_ptr(scatterIndexData.data().get()),
+        layouts.scatterIndexLayout(blockCount)
+    );
+
     // ((BLK_M, BLK_N), (m', n'))
     Tensor gOutput_mn = zipped_divide(tXformedOutScatter, typename AmperePredicatedFprop<IGEMM_Geometry>::TilerOut{});
     dim3 launch_grid {static_cast<uint32_t>(size<1,1>(gOutput_mn)), static_cast<uint32_t>(size<1,0>(gOutput_mn)), 1};

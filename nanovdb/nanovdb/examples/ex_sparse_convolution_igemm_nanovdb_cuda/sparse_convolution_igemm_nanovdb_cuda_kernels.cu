@@ -108,7 +108,7 @@ struct IGEMM_Layouts
     static auto gatherIndexLayout(const int N)
     {
         // Input gather index layout
-        // inner_layout_index(make_coord((nzpq), (csrt))) => idx_buffer_idx
+        // gather_layout_index(make_coord((ndhw), c)) => buffer_idx
         return make_layout(
             make_shape (make_shape (    N,   D, H,  W  ), make_shape ( C  , _1{}, _1{}, _1{})),
             make_stride(make_stride(D*H*W, H*W, W, _1{}), make_stride(_0{}, _0{}, _0{}, _0{})));
@@ -144,6 +144,16 @@ struct IGEMM_Layouts
             make_arithmetic_tuple(_0{},_0{}),
             out_basis_layout);
     }
+
+    static auto scatterIndexLayout(const int N)
+    {
+        // Output scatter index layout
+        // scatter_layout_index(k, make_coord((nzpq))) => buffer_idx
+        return make_layout(
+            make_shape (   K, make_shape (    N,   Z, P,  Q  )),
+            make_stride(_0{}, make_stride(Z*P*Q, P*Q, Q, _1{})));
+    }
+
 };
 
 template<class GeometryT, int Di, int Do, class ValueType>
@@ -560,7 +570,7 @@ void mainSparseConvolutionIGEMM(
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             smem_size));
 
-    int num_iterations = 1;
+    int num_iterations = 10;
     for (int i = 0; i < num_iterations; ++i) {
         gpuTimer.start("Scatter-Gather Cutlass IGEMM (GPU) execution");
         kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, decltype(tFilter), decltype(tXformedActGather), decltype(tGatherIndex), decltype(tXformedOutScatter)>

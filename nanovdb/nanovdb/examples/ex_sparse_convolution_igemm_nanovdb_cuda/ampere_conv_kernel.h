@@ -147,7 +147,7 @@ struct AmperePredicatedFprop {
   // Activation tensor is major in the contraction mode, so vectorize that mode first
   // Then lay out the rest of the threads along the other mode
   using GmemTiledCopyAct = decltype(make_tiled_copy(
-    Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, ElementAct>{},
+    Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS_ZFILL<uint128_t>, ElementAct>{},
     Layout<Shape <_16, _8>,
            Stride< _8, _1>>{},
     Layout<Shape < _1, _4>>{}));
@@ -213,7 +213,7 @@ struct AmperePredicatedFprop {
     Tensor accum = partition_fragment_C(tiled_mma, TilerOut{});
     clear(accum);
 
-#if 1
+#if 0
     if ((threadIdx.x) == 0 && (blockIdx.x == 0) && (blockIdx.y == 0)) {        
         print("mAct.shape()=");print(mAct.shape());print("\n");
         print("mGIx.shape()=");print(mGIx.shape());print("\n");
@@ -262,7 +262,7 @@ struct AmperePredicatedFprop {
     Tensor gG = gG_nk(_,_,n_coord,_);                                                        // (BLK_N,BLK_K,_1)
     Tensor gC = gC_mn(_,_,m_coord,n_coord);                                                  // (BLK_M,BLK_N)
 
-#if 1
+#if 0
     if ((threadIdx.x) == 0 && (blockIdx.x == 0) && (blockIdx.y == 0)) {        
         print("gB.shape()=");print(gB.shape());print("\n");
         print("gG.shape()=");print(gG.shape());print("\n");
@@ -336,7 +336,7 @@ struct AmperePredicatedFprop {
         print("sP.stride()=");print(sP.stride());print("\n");
         print("cosize(sP.layout())=");print(cosize(sP.layout()));print("\n");
         
-#if 1
+#if 0
         for (int n = 0; n < size<0,0>(gG); ++n)
             for (int z = 0; z < Z::value; ++z)
             for (int p = 0; p < P::value; ++p)

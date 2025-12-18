@@ -273,7 +273,7 @@ void ResultCompare(
 {
     ValueType result = 0.f;
 #pragma omp parallel for reduction(max:result)
-    for (int i = 1; i < size; i++)
+    for (int i = 0; i < size; i++)
         for (int j = 0; j < Do; j++)
             result = std::max(result, std::abs(outputArray1[i][j]-outputArray2[i][j]));
     std::cout << "Discrepancy = " << result << std::endl;
@@ -378,7 +378,7 @@ void mainSparseConvolutionIGEMM(
     auto inputArray = reinterpret_cast<inputArrayT>(*inputData.data().get());
     for (int i = 0; i < Di; i++) inputArray[0][i] = 0.f;
 #pragma omp parallel for
-    for (int v = 1; v <= inputVoxelCount; v++)
+    for (int v = 0; v <= inputVoxelCount; v++)
         for (int i = 0; i < Di; i++)
             inputArray[v][i] = ((float)distribution(generator))/256.0f; // Use only up to 7 bits in the mantissa
     gpuTimer.stop();
@@ -391,9 +391,11 @@ void mainSparseConvolutionIGEMM(
     auto outputReferenceData = thrust::universal_vector<float>(outputValueCount*Do);
     auto outputReferenceArray = reinterpret_cast<outputArrayT>(*outputReferenceData.data().get());
 #pragma omp parallel for
-    for (int v = 0; v <= inputValueCount; v++)
+    for (int v = 1; v <= inputValueCount; v++)
         for (int i = 0; i < Di; i++)
             outputArray[v][i] = outputReferenceArray[v][i] = 0.f;
+    for (int i = 0; i < Di; i++)
+        outputArray[0][i] = outputReferenceArray[0][i] = ((float)distribution(generator))/256.0f; // Use only up to 7 bits in the mantissa   
     gpuTimer.stop();
 
     gpuTimer.start("Initializing filter data");
@@ -584,43 +586,6 @@ void mainSparseConvolutionIGEMM(
                 tFilter, tXformedActGather, tGatherIndex, tXformedOutScatter, tScatterIndex);
         gpuTimer.stop();
     }
-
-#if 1
-    for (int n = 0; n < blockCount; ++n)
-        for (int z = 0; z < IGEMM_Geometry::Z; ++z)
-        for (int p = 0; p < IGEMM_Geometry::P; ++p)
-        for (int q = 0; q < IGEMM_Geometry::Q; ++q) 
-            for (int k = 0; k < IGEMM_Geometry::K; ++k) {
-                if (&tXformedOutScatter(k, make_tuple(n,z,p,q)) !=
-                    outputData.data().get()+IGEMM_Geometry::K*tScatterIndex(k,make_tuple(n,z,p,q))+k)
-                    {
-                        std::cout << "tXformedOutScatter("
-                                  << std::setw(3) << k << ","
-                                  << "(" << std::setw(6) << n << "," << z << "," << p << "," << q << ") = "
-                                  << tXformedOutScatter(k, make_tuple(n,z,p,q))
-                                  << ", tScatterIndex(" 
-                                  << std::setw(3) << k << ","
-                                  << "(" << std::setw(6) << n << "," << z << "," << p << "," << q << ") = "
-                                  << tScatterIndex(k,make_tuple(n,z,p,q))
-                                  << std::endl;
-                    }
-#if 0
-                if (tScatterIndex(k,make_tuple(n,z,p,q)) == 0)
-                    if (tXformedOutScatter(k,make_tuple(n,z,p,q)) != 0.f)
-                    {
-                        std::cout << "tXformedOutScatter("
-                                  << std::setw(3) << k << ","
-                                  << "(" << std::setw(6) << n << "," << z << "," << p << "," << q << ") = "
-                                  << tXformedOutScatter(k, make_tuple(n,z,p,q))
-                                  << ", tScatterIndex(" 
-                                  << std::setw(3) << k << ","
-                                  << "(" << std::setw(6) << n << "," << z << "," << p << "," << q << ") = "
-                                  << tScatterIndex(k,make_tuple(n,z,p,q))
-                                  << std::endl;
-                    }   
-#endif
-            }
-#endif
 
     ResultCompare<Do>(
         outputValueCount,

@@ -97,18 +97,19 @@ struct AmperePredicatedFprop {
     static constexpr int MaxThreadsPerBlock = size(TiledMma{});
     static constexpr int MinBlocksPerMultiprocessor = 1;
 
-    union SharedStorage {
-        struct {
-            bool       sSpMatrix[size(TileN{})]; // Scatter predicate
-            ElementFlt sAMatrix[size(TileM{}) * size(TileK{}) * size(PIPE{})];
-            ElementAct sBMatrix[size(TileN{}) * size(TileK{}) * size(PIPE{})];
-            bool       sGpMatrix[size(TileP{})]; // Gather predicate        
-        } mainloop;
+    struct SharedStorage {
+        union {
+            struct {
+                ElementFlt sAMatrix[size(TileM{}) * size(TileK{}) * size(PIPE{})];
+                ElementAct sBMatrix[size(TileN{}) * size(TileK{}) * size(PIPE{})];
+                bool       sGpMatrix[size(TileP{})]; // Gather predicate        
+            } mainloop;
 
-        struct {
-            bool       sSpMatrix[size(TileN{})]; // Scatter predicate
-            ElementOut sCMatrix[size(TileM{}) * size(TileN{})];
-        } epilogue;
+            struct {
+                ElementOut sCMatrix[size(TileM{}) * size(TileN{})];
+            } epilogue;
+        };
+        bool sSpMatrix[size(TileN{})]; // Scatter predicate
     };
 
     //
@@ -233,55 +234,35 @@ struct AmperePredicatedFprop {
         Tensor gC = gC_mn(_,_,m_coord,n_coord);                                                  // (BLK_M,BLK_N)
         Tensor gS = gS_mn(_,_,m_coord,n_coord);                                                  // (BLK_M,BLK_N)
 
+        // Build gather predicate tensor in SMEM
         static_assert(size(TileP{}) % MaxThreadsPerBlock == 0);
-        static_assert(size(TileN{}) <= MaxThreadsPerBlock);
         auto sG_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->mainloop.sGpMatrix[0];
-        auto sS_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->mainloop.sSpMatrix[0];
         auto gG_ptr = gG.data();
-        auto gS_ptr = gS.data();
         auto gather_predicate_layout = make_layout(
             shape(gB),
             make_stride(
                 make_stride(D{}*H{}*W{}, H{}*W{},  W{}, _1{}),
                 make_stride(       _0{},    _0{}, _0{}, _0{}),
                 make_stride(       _0{}, H{}*W{},  W{}, _1{})));
+        for (int i = 0; i < size(TileP{}); i += MaxThreadsPerBlock)
+            sG_ptr[i+threadIdx.x] = gG_ptr[i+threadIdx.x];
         Tensor sG = make_tensor(make_smem_ptr(sG_ptr), gather_predicate_layout);    
+
+        // Build scatter predicate tensor in SMEM
+        static_assert(size(TileN{}) <= MaxThreadsPerBlock);
+        auto sS_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sSpMatrix[0];
+        auto gS_ptr = gS.data();
         auto scatter_predicate_layout = make_layout(
             shape(gC),
             make_stride(
                 _0{},
                 make_stride(Z{}*P{}*Q{}, P{}*Q{},  Q{}, _1{})));
         Tensor sS = make_tensor(make_smem_ptr(sS_ptr), scatter_predicate_layout);
-        for (int i = 0; i < size(TileP{}); i += MaxThreadsPerBlock)
-            sG_ptr[i+threadIdx.x] = gG_ptr[i+threadIdx.x];
         if (threadIdx.x < size(TileN{}))
-            sS_ptr[threadIdx.x] = true;
-            // sS_ptr[threadIdx.x] = gS_ptr[threadIdx.x];
+            sS_ptr[threadIdx.x] = gS_ptr[threadIdx.x];
+
         __syncthreads();
 
-        auto sS_layout = sS.layout();
-        if(thread0()) {
-            for (int i = 0; i < size<0>(sS); ++i)
-            for (int ji = 0; ji < size<1,0>(sS); ++ji)
-            for (int jj = 0; jj < size<1,1>(sS); ++jj)
-            for (int jk = 0; jk < size<1,2>(sS); ++jk)
-            for (int jl = 0; jl < size<1,3>(sS); ++jl)
-                if (sS(i,make_tuple(ji,jj,jk,jl) == false)) {
-                    print("sS(");
-                    print(i);
-                    print(",(");
-                    print(ji);print(",");
-                    print(jj);print(",");
-                    print(jk);print(",");
-                    print(jl);print(")");
-                    print(") = false, index = ");
-                    print(sS_layout(i,make_tuple(ji,jj,jk,jl)));
-                    print("\n");
-                }
-            // {
-                // }
-        }
-            
         auto k_tile_iter = cute::make_coord_iterator(size<2>(gA));
         int k_tile_count = size<2>(gA);
 
@@ -316,25 +297,7 @@ struct AmperePredicatedFprop {
         auto tDsC = gmem_thr_copy_C.partition_S(sC);
         auto tDgC = gmem_thr_copy_C.partition_D(gC);
         auto tDsS = gmem_thr_copy_C.partition_D(sS);
-        if(thread0()) {
-        
-            print("shape(gB) = ");print(shape(gB));print("\n");
-            print("shape(gC) = ");print(shape(gC));print("\n");
-            print("shape(sS) = ");print(shape(sS));print("\n");
-            print("gC.layout() = ");print(gC.layout());print("\n");
-            print("gS.layout() = ");print(gS.layout());print("\n");
-            print("tDsC.layout() = ");print(tDsC.layout());print("\n");
-            print("tDgC.layout() = ");print(tDgC.layout());print("\n");
-            print("tDsS.layout() = ");print(tDsS.layout());print("\n");
-        }
-        __syncthreads();
-#if 0
-        for ( int ii = 0; ii < 4; ++ii)
-        for ( int ki = 0; ki < 2; ++ki)
-        for ( int kj = 0; kj < 2; ++kj)
-            tDsS(make_tuple(ii,0),0,make_tuple(ki,kj)) = true;
-#endif
-        copy   (gmem_tiled_copy_C,       tDsC, tDgC);
-        // copy_if(gmem_tiled_copy_C, tDsS, tDsC, tDgC);
+
+        copy_if(gmem_tiled_copy_C, tDsS, tDsC, tDgC);
     }
 };

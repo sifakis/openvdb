@@ -273,19 +273,19 @@ void ResultCompare(
 {
     ValueType result = 0.f;
 #pragma omp parallel for reduction(max:result)
-    for (int i = 0; i < size; i++)
+    for (int i = 1; i < size; i++)
         for (int j = 0; j < Do; j++)
             result = std::max(result, std::abs(outputArray1[i][j]-outputArray2[i][j]));
     std::cout << "Discrepancy = " << result << std::endl;
 }
 
-template<class Operator, class FilterTensor, class ActivationTensor, class ActivationTensorIndex, class OutputTensor>
+template<class Operator, class FilterTensor, class ActivationTensor, class ActivationTensorIndex, class OutputTensor, class OutputTensorIndex>
 __global__
 __launch_bounds__(Operator::MaxThreadsPerBlock, Operator::MinBlocksPerMultiprocessor)
-  void kernel_entrypoint_custom(FilterTensor mFlt, ActivationTensor mAct, ActivationTensorIndex mActI, OutputTensor mOut) {
+  void kernel_entrypoint_custom(FilterTensor mFlt, ActivationTensor mAct, ActivationTensorIndex mActI, OutputTensor mOut, OutputTensorIndex mOutI) {
   extern __shared__ char smem_buf[];
   Operator op;
-  op(mFlt, mAct, mActI, mOut, smem_buf);
+  op(mFlt, mAct, mActI, mOut, mOutI, smem_buf);
 }
 
 template<class BufferT>
@@ -560,7 +560,7 @@ void mainSparseConvolutionIGEMM(
         layouts.xformedOutputComposedLayout(blockCount, scatterIndexData.data().get())
     );
 
-    Tensor tScatterrIndex = make_tensor(
+    Tensor tScatterIndex = make_tensor(
         make_gmem_ptr(scatterIndexData.data().get()),
         layouts.scatterIndexLayout(blockCount)
     );
@@ -569,20 +569,58 @@ void mainSparseConvolutionIGEMM(
     Tensor gOutput_mn = zipped_divide(tXformedOutScatter, typename AmperePredicatedFprop<IGEMM_Geometry>::TilerOut{});
     dim3 launch_grid {static_cast<uint32_t>(size<1,1>(gOutput_mn)), static_cast<uint32_t>(size<1,0>(gOutput_mn)), 1};
     constexpr size_t smem_size = sizeof(typename AmperePredicatedFprop<IGEMM_Geometry>::SharedStorage);
+    std::cout << "smem_size = " << smem_size << std::endl;
 
     cudaCheck(cudaFuncSetAttribute(
-            kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, decltype(tFilter), decltype(tXformedActGather), decltype(tGatherIndex), decltype(tXformedOutScatter)>,
+            kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, decltype(tFilter), decltype(tXformedActGather), decltype(tGatherIndex), decltype(tXformedOutScatter), decltype(tScatterIndex)>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             smem_size));
 
     int num_iterations = 10;
     for (int i = 0; i < num_iterations; ++i) {
         gpuTimer.start("Scatter-Gather Cutlass IGEMM (GPU) execution");
-        kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, decltype(tFilter), decltype(tXformedActGather), decltype(tGatherIndex), decltype(tXformedOutScatter)>
+        kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, decltype(tFilter), decltype(tXformedActGather), decltype(tGatherIndex), decltype(tXformedOutScatter), decltype(tScatterIndex)>
             <<<launch_grid, AmperePredicatedFprop<IGEMM_Geometry>::MaxThreadsPerBlock, smem_size>>>(
-                tFilter, tXformedActGather, tGatherIndex, tXformedOutScatter);
+                tFilter, tXformedActGather, tGatherIndex, tXformedOutScatter, tScatterIndex);
         gpuTimer.stop();
     }
+
+#if 1
+    for (int n = 0; n < blockCount; ++n)
+        for (int z = 0; z < IGEMM_Geometry::Z; ++z)
+        for (int p = 0; p < IGEMM_Geometry::P; ++p)
+        for (int q = 0; q < IGEMM_Geometry::Q; ++q) 
+            for (int k = 0; k < IGEMM_Geometry::K; ++k) {
+                if (&tXformedOutScatter(k, make_tuple(n,z,p,q)) !=
+                    outputData.data().get()+IGEMM_Geometry::K*tScatterIndex(k,make_tuple(n,z,p,q))+k)
+                    {
+                        std::cout << "tXformedOutScatter("
+                                  << std::setw(3) << k << ","
+                                  << "(" << std::setw(6) << n << "," << z << "," << p << "," << q << ") = "
+                                  << tXformedOutScatter(k, make_tuple(n,z,p,q))
+                                  << ", tScatterIndex(" 
+                                  << std::setw(3) << k << ","
+                                  << "(" << std::setw(6) << n << "," << z << "," << p << "," << q << ") = "
+                                  << tScatterIndex(k,make_tuple(n,z,p,q))
+                                  << std::endl;
+                    }
+#if 0
+                if (tScatterIndex(k,make_tuple(n,z,p,q)) == 0)
+                    if (tXformedOutScatter(k,make_tuple(n,z,p,q)) != 0.f)
+                    {
+                        std::cout << "tXformedOutScatter("
+                                  << std::setw(3) << k << ","
+                                  << "(" << std::setw(6) << n << "," << z << "," << p << "," << q << ") = "
+                                  << tXformedOutScatter(k, make_tuple(n,z,p,q))
+                                  << ", tScatterIndex(" 
+                                  << std::setw(3) << k << ","
+                                  << "(" << std::setw(6) << n << "," << z << "," << p << "," << q << ") = "
+                                  << tScatterIndex(k,make_tuple(n,z,p,q))
+                                  << std::endl;
+                    }   
+#endif
+            }
+#endif
 
     ResultCompare<Do>(
         outputValueCount,

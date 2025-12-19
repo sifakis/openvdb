@@ -80,8 +80,11 @@ struct IGEMM_Layouts
     static constexpr auto W = Int<GeometryT::W>{};
     static constexpr auto C = Int<GeometryT::C>{};
     static constexpr auto K = Int<GeometryT::K>{};
+    static constexpr auto Bx = Int<GeometryT::Bx>{};
+    static constexpr auto By = Int<GeometryT::By>{};
+    static constexpr auto Bz = Int<GeometryT::Bz>{};
 
-    static auto xformedActivationComposedLayout(const int N, const uint64_t* gather_idx_buf)
+    static auto xformedActivationComposedLayoutLegacy(const int N, const uint64_t* gather_idx_buf)
     {
         // Input gather layout
         // inner_layout(make_coord((nzpq), (csrt))) => (idx_buffer_idx, dense_c_idx)
@@ -105,7 +108,31 @@ struct IGEMM_Layouts
             xformed_act_logical_inner);
     }
 
-    static auto gatherIndexLayout(const int N)
+    static auto xformedActivationComposedLayout(const int N, const uint64_t* gather_idx_buf)
+    {
+        // Input gather layout
+        // inner_layout(make_coord((nzpq), (csrt))) => (idx_buffer_idx, dense_c_idx)
+        auto EG = E<0>{};  // Gather basis     (1,0) (idx_buffer_idx) 
+        auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)    
+        auto xformed_act_logical_inner = make_layout(
+            make_shape (make_shape (make_shape (                N,             Bz,          By,       Bx),      Z,    P,  Q), make_shape ( C,      T,    R,  S)),
+            make_stride(make_stride(make_stride(Bz*By*Bx*D*H*W*EG, By*Bx*D*H*W*EG, Bx*D*H*W*EG, D*H*W*EG), H*W*EG, W*EG, EG), make_stride(EC, H*W*EG, W*EG, EG)));
+
+        // outer_layout(make_coord(idx_buffer_idx, dense_c_idx)) => idx
+        // IndexedGather obtains idx by applying (gmem_base_ptr + gather_idx_buf[idx_buffer_idx] + dense_offset)
+        auto xformed_act_gather_outer = make_layout(
+            make_shape(_1{},_1{}),
+            make_stride(example::CustomStride{example::IndexedGather{gather_idx_buf}, C}, _1{}));
+
+        // Compose the inner and outer layouts
+        // gather_composed(make_coord((nzpq), (csrt))) => idx
+        return composition(
+            xformed_act_gather_outer,
+            make_arithmetic_tuple(_0{}, _0{}),
+            xformed_act_logical_inner);
+    }
+
+    static auto gatherIndexLayoutLegacy(const int N)
     {
         // Input gather index layout
         // gather_layout_index(make_coord((ndhw), c)) => buffer_idx
@@ -279,13 +306,13 @@ void ResultCompare(
     std::cout << "Discrepancy = " << result << std::endl;
 }
 
-template<class Operator, class FilterTensor, class ActivationTensor, class ActivationTensorIndex, class OutputTensor, class OutputTensorIndex>
+template<class Operator, class FilterTensor, class ActivationTensorLegacy, class ActivationTensorIndexLegacy, class OutputTensor, class OutputTensorIndex>
 __global__
 __launch_bounds__(Operator::MaxThreadsPerBlock, Operator::MinBlocksPerMultiprocessor)
-  void kernel_entrypoint_custom(FilterTensor mFlt, ActivationTensor mAct, ActivationTensorIndex mActI, OutputTensor mOut, OutputTensorIndex mOutI) {
+  void kernel_entrypoint_custom(FilterTensor mFlt, ActivationTensorLegacy mActLegacy, ActivationTensorIndexLegacy mActILegacy, OutputTensor mOut, OutputTensorIndex mOutI) {
   extern __shared__ char smem_buf[];
   Operator op;
-  op(mFlt, mAct, mActI, mOut, mOutI, smem_buf);
+  op(mFlt, mActLegacy, mActILegacy, mOut, mOutI, smem_buf);
 }
 
 template<class BufferT>
@@ -504,14 +531,14 @@ void mainSparseConvolutionIGEMM(
 
     IGEMM_Layouts<IGEMM_Geometry> layouts;
 
-    Tensor tXformedActGather = make_tensor(
+    Tensor tXformedActGatherLegacy = make_tensor(
         make_gmem_ptr(inputData.data().get()),
-        layouts.xformedActivationComposedLayout(blockCount, gatherIndexData.data().get())
+        layouts.xformedActivationComposedLayoutLegacy(blockCount, gatherIndexData.data().get())
     );
 
-    Tensor tGatherIndex = make_tensor(
+    Tensor tGatherIndexLegacy = make_tensor(
         make_gmem_ptr(gatherIndexData.data().get()),
-        layouts.gatherIndexLayout(blockCount)
+        layouts.gatherIndexLayoutLegacy(blockCount)
     );
 
 #if 0
@@ -523,30 +550,30 @@ void mainSparseConvolutionIGEMM(
             for (int r = 0; r < IGEMM_Geometry::R; ++r)
             for (int s = 0; s < IGEMM_Geometry::S; ++s)
                 for (int c = 0; c < IGEMM_Geometry::C; ++c) {
-                    if (&tXformedActGather(make_tuple(n,z,p,q),make_tuple(c,t,r,s)) !=
-                        inputData.data().get()+IGEMM_Geometry::C*tGatherIndex(make_tuple(n,z+t,p+r,q+s),make_tuple(c,0,0,0))+c)
+                    if (&tXformedActGatherLegacy(make_tuple(n,z,p,q),make_tuple(c,t,r,s)) !=
+                        inputData.data().get()+IGEMM_Geometry::C*tGatherIndexLegacy(make_tuple(n,z+t,p+r,q+s),make_tuple(c,0,0,0))+c)
                     {
-                        std::cout << "tXformedActGather("
+                        std::cout << "tXformedActGatherLegacy("
                                   << "(" << std::setw(6) << n << "," << z << "," << p << "," << q << "),"
                                   << "(" << std::setw(2) << c << "," << t << "," << r << "," << s << ")) = "
-                                  << tXformedActGather(make_tuple(n,z,p,q),make_tuple(c,t,r,s))
-                                  << ", tGatherIndex(" 
+                                  << tXformedActGatherLegacy(make_tuple(n,z,p,q),make_tuple(c,t,r,s))
+                                  << ", tGatherIndexLegacy(" 
                                   << "(" << std::setw(6) << n << "," << z+t << "," << p+r << "," << q+s << "),"
                                   << "(" << std::setw(2) << c << ",0,0,0)) = "
-                                  << tGatherIndex(make_tuple(n,z+t,p+r,q+s),make_tuple(c,0,0,0))
+                                  << tGatherIndexLegacy(make_tuple(n,z+t,p+r,q+s),make_tuple(c,0,0,0))
                                   << std::endl;
                     }
-                    if (tGatherIndex(make_tuple(n,z+t,p+r,q+s),make_tuple(c,0,0,0)) == 0)
-                        if (tXformedActGather(make_tuple(n,z,p,q),make_tuple(c,t,r,s)) != 0.f)
+                    if (tGatherIndexLegacy(make_tuple(n,z+t,p+r,q+s),make_tuple(c,0,0,0)) == 0)
+                        if (tXformedActGatherLegacy(make_tuple(n,z,p,q),make_tuple(c,t,r,s)) != 0.f)
                         {
-                            std::cout << "tXformedActGather("
+                            std::cout << "tXformedActGatherLegacy("
                                       << "(" << std::setw(6) << n << "," << z << "," << p << "," << q << "),"
                                       << "(" << std::setw(2) << c << "," << t << "," << r << "," << s << ")) = "
-                                      << tXformedActGather(make_tuple(n,z,p,q),make_tuple(c,t,r,s))
-                                      << ", tGatherIndex(" 
+                                      << tXformedActGatherLegacy(make_tuple(n,z,p,q),make_tuple(c,t,r,s))
+                                      << ", tGatherIndexLegacy(" 
                                       << "(" << std::setw(6) << n << "," << z+t << "," << p+r << "," << q+s << "),"
                                       << "(" << std::setw(2) << c << ",0,0,0)) = "
-                                      << tGatherIndex(make_tuple(n,z+t,p+r,q+s),make_tuple(c,0,0,0))
+                                      << tGatherIndexLegacy(make_tuple(n,z+t,p+r,q+s),make_tuple(c,0,0,0))
                                       << std::endl;
                         }   
                 }
@@ -574,16 +601,16 @@ void mainSparseConvolutionIGEMM(
     std::cout << "smem_size = " << smem_size << std::endl;
 
     cudaCheck(cudaFuncSetAttribute(
-            kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, decltype(tFilter), decltype(tXformedActGather), decltype(tGatherIndex), decltype(tXformedOutScatter), decltype(tScatterIndex)>,
+            kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, decltype(tFilter), decltype(tXformedActGatherLegacy), decltype(tGatherIndexLegacy), decltype(tXformedOutScatter), decltype(tScatterIndex)>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             smem_size));
 
     int num_iterations = 10;
     for (int i = 0; i < num_iterations; ++i) {
         gpuTimer.start("Scatter-Gather Cutlass IGEMM (GPU) execution");
-        kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, decltype(tFilter), decltype(tXformedActGather), decltype(tGatherIndex), decltype(tXformedOutScatter), decltype(tScatterIndex)>
+        kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, decltype(tFilter), decltype(tXformedActGatherLegacy), decltype(tGatherIndexLegacy), decltype(tXformedOutScatter), decltype(tScatterIndex)>
             <<<launch_grid, AmperePredicatedFprop<IGEMM_Geometry>::MaxThreadsPerBlock, smem_size>>>(
-                tFilter, tXformedActGather, tGatherIndex, tXformedOutScatter, tScatterIndex);
+                tFilter, tXformedActGatherLegacy, tGatherIndexLegacy, tXformedOutScatter, tScatterIndex);
         gpuTimer.stop();
     }
 

@@ -187,13 +187,13 @@ struct AmperePredicatedFprop {
     //
     // Conv functor (predicated IGEMM)
     //
-    template <class EngineFlt, class TensorActivation, class TensorGatherIndex, class TensorOutput, class TensorScatterIndex>
+    template <class EngineFlt, class TensorActivationLegacy, class TensorGatherIndexLegacy, class TensorOutput, class TensorScatterIndex>
     void __device__
-    operator()(cute::Tensor<EngineFlt, GmemLayoutFlt> mFlt, // ( K,        (C,T,R,S))
-        TensorActivation                              mAct, // ((N,Z,P,Q), (C,T,R,S))
-        TensorGatherIndex                             mGIx, // ((N,D,H,W), (C,1,1,1))
-        TensorOutput                                  mOut, // ( K,        (N,Z,P,Q))
-        TensorScatterIndex                            mSIx, // ( K,        (N,Z,P,Q))      
+    operator()(cute::Tensor<EngineFlt, GmemLayoutFlt> mFlt,       // ( K,        (C,T,R,S))
+        TensorActivationLegacy                        mActLegacy, // ((N,Z,P,Q), (C,T,R,S))
+        TensorGatherIndexLegacy                       mGIxLegacy, // ((N,D,H,W), (C,1,1,1))
+        TensorOutput                                  mOut,       // ( K,        (N,Z,P,Q))
+        TensorScatterIndex                            mSIx,       // ( K,        (N,Z,P,Q))      
         char* smem_buf) const {
         using namespace cute;
         using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveMma<
@@ -220,8 +220,8 @@ struct AmperePredicatedFprop {
         // Set up tensors
         // NOTE: blockIdx.x projects onto act-NDHW mode, y along the flt-K mode for the sake of higher dynamic range in NDHW
         Tensor gA_mk = local_tile(mFlt, TilerFlt{}, make_coord(_,_));                            // (BLK_M,BLK_K,m',k')
-        Tensor gB_nk = local_tile(mAct, TilerAct{}, make_coord(_,_));                            // (BLK_N,BLK_K,n',_1)
-        Tensor gG_nk = local_tile(mGIx, TilerGIx{}, make_coord(_,_));                            // (BLK_N,BLK_K,n',_1)
+        Tensor gB_nk = local_tile(mActLegacy, TilerAct{}, make_coord(_,_));                            // (BLK_N,BLK_K,n',_1)
+        Tensor gG_nk = local_tile(mGIxLegacy, TilerGIx{}, make_coord(_,_));                            // (BLK_N,BLK_K,n',_1)
         Tensor gC_mn = local_tile(mOut, TilerOut{}, make_coord(_,_));                            // (BLK_M,BLK_N,m',n')
         Tensor gS_mn = local_tile(mSIx, TilerOut{}, make_coord(_,_));                            // (BLK_M,BLK_N,m',n')
 

@@ -76,7 +76,8 @@ struct AmperePredicatedFprop {
     using TileP = Shape<Tiler_N, D, H, W>; // Including halo in spatial dimensions
     using PIPE  = _3;
     using TilerFlt = Shape<TileM, TileK>;
-    using TilerAct = Shape<TileN, TileK>;
+    using TilerAct = Shape<Shape<Shape<_1,_1,_2,_2>, Z, P, Q>, TileK>;
+    using TilerActLegacy = Shape<TileN, TileK>;
     using TilerGIx = Shape<TileP, TileK>;
     using TilerOut = Shape<TileM, TileN>;
 
@@ -187,9 +188,10 @@ struct AmperePredicatedFprop {
     //
     // Conv functor (predicated IGEMM)
     //
-    template <class EngineFlt, class TensorActivationLegacy, class TensorGatherIndexLegacy, class TensorOutput, class TensorScatterIndex>
+    template <class EngineFlt, class TensorActivation, class TensorActivationLegacy, class TensorGatherIndexLegacy, class TensorOutput, class TensorScatterIndex>
     void __device__
     operator()(cute::Tensor<EngineFlt, GmemLayoutFlt> mFlt,       // ( K,        (C,T,R,S))
+        TensorActivation                              mAct,       // ((N,Z,P,Q), (C,T,R,S))
         TensorActivationLegacy                        mActLegacy, // ((N,Z,P,Q), (C,T,R,S))
         TensorGatherIndexLegacy                       mGIxLegacy, // ((N,D,H,W), (C,1,1,1))
         TensorOutput                                  mOut,       // ( K,        (N,Z,P,Q))
@@ -220,16 +222,25 @@ struct AmperePredicatedFprop {
         // Set up tensors
         // NOTE: blockIdx.x projects onto act-NDHW mode, y along the flt-K mode for the sake of higher dynamic range in NDHW
         Tensor gA_mk = local_tile(mFlt, TilerFlt{}, make_coord(_,_));                            // (BLK_M,BLK_K,m',k')
-        Tensor gB_nk = local_tile(mActLegacy, TilerAct{}, make_coord(_,_));                            // (BLK_N,BLK_K,n',_1)
-        Tensor gG_nk = local_tile(mGIxLegacy, TilerGIx{}, make_coord(_,_));                            // (BLK_N,BLK_K,n',_1)
+        Tensor gBLegacy_nk = local_tile(mActLegacy, TilerActLegacy{}, make_coord(_,_));                      // (BLK_N,BLK_K,n',_1)
+        Tensor gB_nk = local_tile(mAct, TilerAct{}, make_coord(_,_));                      // (BLK_N,BLK_K,n',_1)
+        Tensor gG_nk = local_tile(mGIxLegacy, TilerGIx{}, make_coord(_,_));                      // (BLK_N,BLK_K,n',_1)
         Tensor gC_mn = local_tile(mOut, TilerOut{}, make_coord(_,_));                            // (BLK_M,BLK_N,m',n')
         Tensor gS_mn = local_tile(mSIx, TilerOut{}, make_coord(_,_));                            // (BLK_M,BLK_N,m',n')
 
+        if (thread0() && block0()) {
+            print("shape(mActLegacy)=");print(shape(mActLegacy));print("\n");
+            print("shape(TilerActLegacy{})=");print(shape(TilerActLegacy{}));print("\n");
+            print("shape(gBLegacy_nk)=");print(shape(gBLegacy_nk));print("\n");            
+            print("shape(mAct)=");print(shape(mAct));print("\n");
+            print("shape(TilerAct{})=");print(shape(TilerAct{}));print("\n");
+            print("shape(gB_nk)=");print(shape(gB_nk));print("\n");            
+        }
         // Compute m_coord and n_coord with their post-tiled shapes
         auto m_coord = idx2crd(int(blockIdx.y), shape<2>(gA_mk));
-        auto n_coord = idx2crd(int(blockIdx.x), shape<2>(gB_nk));
+        auto n_coord = idx2crd(int(blockIdx.x), shape<2>(gBLegacy_nk));
         Tensor gA = gA_mk(_,_,m_coord,_);                                                        // (BLK_M,BLK_K,k')
-        Tensor gB = gB_nk(_,_,n_coord,_);                                                        // (BLK_N,BLK_K,_1)
+        Tensor gB = gBLegacy_nk(_,_,n_coord,_);                                                        // (BLK_N,BLK_K,_1)
         Tensor gG = gG_nk(_,_,n_coord,_);                                                        // (BLK_N,BLK_K,_1)
         Tensor gC = gC_mn(_,_,m_coord,n_coord);                                                  // (BLK_M,BLK_N)
         Tensor gS = gS_mn(_,_,m_coord,n_coord);                                                  // (BLK_M,BLK_N)

@@ -115,7 +115,7 @@ struct IGEMM_Layouts
         auto EG = E<0>{};  // Gather basis     (1,0) (idx_buffer_idx) 
         auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)    
         auto xformed_act_logical_inner = make_layout(
-            make_shape (make_shape (make_shape (                N,             Bz,          By,       Bx),      Z,    P,  Q), make_shape ( C,      T,    R,  S)),
+            make_shape (make_shape (make_shape (                N,             Bx,          By,       Bz),      Z,    P,  Q), make_shape ( C,      T,    R,  S)),
             make_stride(make_stride(make_stride(Bz*By*Bx*D*H*W*EG, By*Bx*D*H*W*EG, Bx*D*H*W*EG, D*H*W*EG), H*W*EG, W*EG, EG), make_stride(EC, H*W*EG, W*EG, EG)));
 
         // outer_layout(make_coord(idx_buffer_idx, dense_c_idx)) => idx
@@ -306,13 +306,13 @@ void ResultCompare(
     std::cout << "Discrepancy = " << result << std::endl;
 }
 
-template<class Operator, class FilterTensor, class ActivationTensorLegacy, class ActivationTensorIndexLegacy, class OutputTensor, class OutputTensorIndex>
+template<class Operator, class FilterTensor, class ActivationTensor, class ActivationTensorLegacy, class ActivationTensorIndexLegacy, class OutputTensor, class OutputTensorIndex>
 __global__
 __launch_bounds__(Operator::MaxThreadsPerBlock, Operator::MinBlocksPerMultiprocessor)
-  void kernel_entrypoint_custom(FilterTensor mFlt, ActivationTensorLegacy mActLegacy, ActivationTensorIndexLegacy mActILegacy, OutputTensor mOut, OutputTensorIndex mOutI) {
+  void kernel_entrypoint_custom(FilterTensor mFlt, ActivationTensor mAct, ActivationTensorLegacy mActLegacy, ActivationTensorIndexLegacy mActILegacy, OutputTensor mOut, OutputTensorIndex mOutI) {
   extern __shared__ char smem_buf[];
   Operator op;
-  op(mFlt, mActLegacy, mActILegacy, mOut, mOutI, smem_buf);
+  op(mFlt, mAct, mActLegacy, mActILegacy, mOut, mOutI, smem_buf);
 }
 
 template<class BufferT>
@@ -536,6 +536,11 @@ void mainSparseConvolutionIGEMM(
         layouts.xformedActivationComposedLayoutLegacy(blockCount, gatherIndexData.data().get())
     );
 
+    Tensor tXformedActGather = make_tensor(
+        make_gmem_ptr(inputData.data().get()),
+        layouts.xformedActivationComposedLayout(outputLeafCount, gatherIndexData.data().get())
+    );
+
     Tensor tGatherIndexLegacy = make_tensor(
         make_gmem_ptr(gatherIndexData.data().get()),
         layouts.gatherIndexLayoutLegacy(blockCount)
@@ -601,16 +606,16 @@ void mainSparseConvolutionIGEMM(
     std::cout << "smem_size = " << smem_size << std::endl;
 
     cudaCheck(cudaFuncSetAttribute(
-            kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, decltype(tFilter), decltype(tXformedActGatherLegacy), decltype(tGatherIndexLegacy), decltype(tXformedOutScatter), decltype(tScatterIndex)>,
+            kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, decltype(tFilter), decltype(tXformedActGather), decltype(tXformedActGatherLegacy), decltype(tGatherIndexLegacy), decltype(tXformedOutScatter), decltype(tScatterIndex)>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             smem_size));
 
-    int num_iterations = 10;
+    int num_iterations = 1;
     for (int i = 0; i < num_iterations; ++i) {
         gpuTimer.start("Scatter-Gather Cutlass IGEMM (GPU) execution");
-        kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, decltype(tFilter), decltype(tXformedActGatherLegacy), decltype(tGatherIndexLegacy), decltype(tXformedOutScatter), decltype(tScatterIndex)>
+        kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, decltype(tFilter), decltype(tXformedActGather), decltype(tXformedActGatherLegacy), decltype(tGatherIndexLegacy), decltype(tXformedOutScatter), decltype(tScatterIndex)>
             <<<launch_grid, AmperePredicatedFprop<IGEMM_Geometry>::MaxThreadsPerBlock, smem_size>>>(
-                tFilter, tXformedActGatherLegacy, tGatherIndexLegacy, tXformedOutScatter, tScatterIndex);
+                tFilter, tXformedActGather, tXformedActGatherLegacy, tGatherIndexLegacy, tXformedOutScatter, tScatterIndex);
         gpuTimer.stop();
     }
 

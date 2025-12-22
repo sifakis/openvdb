@@ -395,7 +395,8 @@ void mainSparseConvolutionIGEMM(
     // Allocate and initialize benchmark data
 
     std::random_device rd;
-    std::mt19937 generator(rd());
+    // std::mt19937 generator(rd());
+    std::mt19937 generator(23456);
     std::uniform_int_distribution<int> distribution(-256, 256);
 
     gpuTimer.start("Initializing input (activation) data");

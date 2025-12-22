@@ -76,7 +76,7 @@ struct AmperePredicatedFprop {
     using TileP = Shape<Tiler_N, D, H, W>; // Including halo in spatial dimensions
     using PIPE  = _3;
     using TilerFlt = Shape<TileM, TileK>;
-    using TilerAct = Shape<Shape<Shape<_1,_1,_2,_2>, Z, P, Q>, TileK>;
+    using TilerAct = Shape<Shape<Shape<_1,_1,_1,_4>, Z, P, Q>, TileK>;
     using TilerActLegacy = Shape<TileN, TileK>;
     using TilerGIx = Shape<TileP, TileK>;
     using TilerOut = Shape<TileM, TileN>;
@@ -228,6 +228,7 @@ struct AmperePredicatedFprop {
         Tensor gC_mn = local_tile(mOut, TilerOut{}, make_coord(_,_));                            // (BLK_M,BLK_N,m',n')
         Tensor gS_mn = local_tile(mSIx, TilerOut{}, make_coord(_,_));                            // (BLK_M,BLK_N,m',n')
 
+#if 0
         if (thread0() && block0()) {
             print("shape(mActLegacy)=");print(shape(mActLegacy));print("\n");
             print("shape(TilerActLegacy{})=");print(shape(TilerActLegacy{}));print("\n");
@@ -236,21 +237,72 @@ struct AmperePredicatedFprop {
             print("shape(TilerAct{})=");print(shape(TilerAct{}));print("\n");
             print("shape(gB_nk)=");print(shape(gB_nk));print("\n");            
         }
+#endif
+        // __syncthreads();
         // Compute m_coord and n_coord with their post-tiled shapes
         auto m_coord = idx2crd(int(blockIdx.y), shape<2>(gA_mk));
         auto n_coord = idx2crd(int(blockIdx.x), shape<2>(gBLegacy_nk));
+        // auto N_coord = idx2crd(int(blockIdx.x), make_layout(shape<2>(gB_nk), GenRowMajor{}));
+        auto N_coord = idx2crd(int(blockIdx.x), shape<2>(gB_nk));
+        auto NN_coord = idx2crd(int(blockIdx.x), reverse(shape<2,0>(gB_nk)));
+
+#if 0
+        if ((threadIdx.x == 0) && (blockIdx.x == 1) && (blockIdx.y == 0))
+        {
+            print("blockIdx.x = ");print(blockIdx.x);
+            print(", n_coord = ");print(n_coord);
+            print(", N_coord = ");print(N_coord);
+            print("\n");
+        }
+        __syncthreads();
+#endif
+
         Tensor gA = gA_mk(_,_,m_coord,_);                                                        // (BLK_M,BLK_K,k')
-        Tensor gB = gBLegacy_nk(_,_,n_coord,_);                                                        // (BLK_N,BLK_K,_1)
+        Tensor gBLegacy = gBLegacy_nk(_,_,n_coord,_);                                                        // (BLK_N,BLK_K,_1)
+        Tensor gB = gB_nk(_,_,N_coord,_);
         Tensor gG = gG_nk(_,_,n_coord,_);                                                        // (BLK_N,BLK_K,_1)
         Tensor gC = gC_mn(_,_,m_coord,n_coord);                                                  // (BLK_M,BLK_N)
         Tensor gS = gS_mn(_,_,m_coord,n_coord);                                                  // (BLK_M,BLK_N)
 
+#if 0
+        if (thread0()) {
+            print("\n");
+            print("shape(gBLegacy)");print(shape(gBLegacy));print("\n");
+            print("shape(gB)");print(shape(gB));print("\n");
+        }
+        __syncthreads();
+#endif
+        
+        if ((threadIdx.x == 0) && (threadIdx.y == 0) & (threadIdx.z == 0))
+        if ((blockIdx.x  == 7) && (blockIdx.y  == 0) & (blockIdx.z  == 0))
+        {
+            if (gB(0) != gBLegacy(0))
+                printf("Mismatch at blockIdx = (%d,%d,%d)\n", blockIdx.x, blockIdx.y, blockIdx.z);
+
+            print("shape(mActLegacy)=");print(shape(mActLegacy));print("\n");
+            print("shape(TilerActLegacy{})=");print(shape(TilerActLegacy{}));print("\n");
+            print("shape(gBLegacy_nk)=");print(shape(gBLegacy_nk));print("\n");            
+            print("shape(mAct)=");print(shape(mAct));print("\n");
+            print("shape(TilerAct{})=");print(shape(TilerAct{}));print("\n");
+            print("shape(gB_nk)=");print(shape(gB_nk));print("\n");            
+
+            print("shape(gBLegacy)=");print(shape(gBLegacy));print("\n");
+            print("shape(gB)=");print(shape(gB));print("\n");
+            print("shape<2,0>(gB_nk)=");print(shape<2,0>(gB_nk));print("\n");
+            print("reverse(shape<2,0>(gB_nk))=");print(reverse(shape<2,0>(gB_nk)));print("\n");
+
+            print("n_coord = ");print(n_coord);print("\n");
+            print("N_coord = ");print(N_coord);print("\n");
+            print("NN_coord = ");print(NN_coord);print("\n");
+        }
+        __syncthreads();
+        
         // Build gather predicate tensor in SMEM
         static_assert(size(TileP{}) % MaxThreadsPerBlock == 0);
         auto sG_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->mainloop.sGpMatrix[0];
         auto gG_ptr = gG.data();
         auto gather_predicate_layout = make_layout(
-            shape(gB),
+            shape(gBLegacy),
             make_stride(
                 make_stride(D{}*H{}*W{}, H{}*W{},  W{}, _1{}),
                 make_stride(       _0{},    _0{}, _0{}, _0{}),
@@ -281,7 +333,7 @@ struct AmperePredicatedFprop {
         collective_mma(
             accum,
             gA,
-            gB,
+            gBLegacy,
             sG,
             accum,
             k_tile_iter, k_tile_count,

@@ -74,9 +74,11 @@ struct AmperePredicatedFprop {
     using TileN = Shape<Tiler_N, Z, P, Q>;
     using TileK = Shape<Tiler_C,_1,_1,_1>;
     using TileP = Shape<Tiler_N, D, H, W>; // Including halo in spatial dimensions
+    using Tiler_NN = Shape<_1,_1,_2,_2>;
+    using TileNN = Shape<Tiler_NN, Z, P, Q>;
     using PIPE  = _3;
     using TilerFlt = Shape<TileM, TileK>;
-    using TilerAct = Shape<Shape<Shape<_1,_1,_1,_4>, Z, P, Q>, TileK>;
+    using TilerAct = Shape<TileNN, TileK>;
     using TilerActLegacy = Shape<TileN, TileK>;
     using TilerGIx = Shape<TileP, TileK>;
     using TilerOut = Shape<TileM, TileN>;
@@ -244,7 +246,8 @@ struct AmperePredicatedFprop {
         auto n_coord = idx2crd(int(blockIdx.x), shape<2>(gBLegacy_nk));
         // auto N_coord = idx2crd(int(blockIdx.x), make_layout(shape<2>(gB_nk), GenRowMajor{}));
         auto N_coord = idx2crd(int(blockIdx.x), shape<2>(gB_nk));
-        auto NN_coord = idx2crd(int(blockIdx.x), reverse(shape<2,0>(gB_nk)));
+        auto test_stride = stride(make_layout(shape<2>(gB_nk), GenRowMajor{}));
+        auto NN_coord = idx2crd(int(blockIdx.x), shape<2>(gB_nk), test_stride);
 
 #if 0
         if ((threadIdx.x == 0) && (blockIdx.x == 1) && (blockIdx.y == 0))
@@ -259,7 +262,7 @@ struct AmperePredicatedFprop {
 
         Tensor gA = gA_mk(_,_,m_coord,_);                                                        // (BLK_M,BLK_K,k')
         Tensor gBLegacy = gBLegacy_nk(_,_,n_coord,_);                                                        // (BLK_N,BLK_K,_1)
-        Tensor gB = gB_nk(_,_,N_coord,_);
+        Tensor gB = gB_nk(_,_,NN_coord,_);
         Tensor gG = gG_nk(_,_,n_coord,_);                                                        // (BLK_N,BLK_K,_1)
         Tensor gC = gC_mn(_,_,m_coord,n_coord);                                                  // (BLK_M,BLK_N)
         Tensor gS = gS_mn(_,_,m_coord,n_coord);                                                  // (BLK_M,BLK_N)
@@ -273,10 +276,14 @@ struct AmperePredicatedFprop {
         __syncthreads();
 #endif
         
+#if 0
         if ((threadIdx.x == 0) && (threadIdx.y == 0) & (threadIdx.z == 0))
         if ((blockIdx.x  == 7) && (blockIdx.y  == 0) & (blockIdx.z  == 0))
         {
-            if (gB(0) != gBLegacy(0))
+            //for (auto [it,count] = std::tuple{cute::make_coord_iterator(shape(gB)), (int)size(shape(gB))}; count; ++it, --count)
+            //    if(gB(*it) != gB(*it))
+            //        printf("Mismatch at blockIdx = (%d,%d,%d)\n", blockIdx.x, blockIdx.y, blockIdx.z);
+            if(gB(0) != gBLegacy(0))
                 printf("Mismatch at blockIdx = (%d,%d,%d)\n", blockIdx.x, blockIdx.y, blockIdx.z);
 
             print("shape(mActLegacy)=");print(shape(mActLegacy));print("\n");
@@ -296,7 +303,8 @@ struct AmperePredicatedFprop {
             print("NN_coord = ");print(NN_coord);print("\n");
         }
         __syncthreads();
-        
+#endif        
+
         // Build gather predicate tensor in SMEM
         static_assert(size(TileP{}) % MaxThreadsPerBlock == 0);
         auto sG_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->mainloop.sGpMatrix[0];

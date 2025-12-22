@@ -12,6 +12,8 @@
 #include "ampere_conv_kernel.h"
 #include "gather_tensor.hpp"
 
+#define USE_HIERARCHICAL_BLOCK_TRAVERSAL
+
 template<typename T>
 bool bufferCheck(const T* deviceBuffer, const T* hostBuffer, size_t elem_count) {
     T* tmpBuffer = new T[elem_count];
@@ -439,24 +441,78 @@ void mainSparseConvolutionIGEMM(
     auto blockCount = outputLeafCount
         * IGEMM_Geometry::Bx * IGEMM_Geometry::By * IGEMM_Geometry::Bz;
 
+#ifdef USE_HIERARCHICAL_BLOCK_TRAVERSAL
+    using ConvOp = AmperePredicatedFprop<IGEMM_Geometry>;
+    auto leafShape = make_shape(Int<IGEMM_Geometry::Bx>{},  Int<IGEMM_Geometry::By>{},  Int<IGEMM_Geometry::Bz>{});
+    auto blockedLeafShape = shape(zipped_divide(make_layout(leafShape), take<1,4>(ConvOp::Tiler_NN{})));
+    auto blockedLeafLayout = make_ordered_layout(
+        blockedLeafShape,
+        make_tuple(make_tuple(_2{},_1{},_0{}),make_tuple(_5{},_4{},_3{})));
+
+#if 0
+    print("\n");
+    print("leafShape=");print(leafShape);print("\n");
+    print("blockedLeafShape=");print(blockedLeafShape);print("\n");
+    print("blockedLeafLayout=");print(blockedLeafLayout);print("\n");
+    for (int bbi = 0; bbi < shape<1,0>(blockedLeafLayout); ++bbi)
+    for (int bbj = 0; bbj < shape<1,1>(blockedLeafLayout); ++bbj)
+    for (int bbk = 0; bbk < shape<1,2>(blockedLeafLayout); ++bbk)
+    for (int bii = 0; bii < shape<0,0>(blockedLeafLayout); ++bii)
+    for (int bjj = 0; bjj < shape<0,1>(blockedLeafLayout); ++bjj)
+    for (int bkk = 0; bkk < shape<0,2>(blockedLeafLayout); ++bkk)
+    {
+        int bi = bbi * shape<0,0>(blockedLeafLayout) + bii;
+        int bj = bbj * shape<0,1>(blockedLeafLayout) + bjj;
+        int bk = bbk * shape<0,2>(blockedLeafLayout) + bkk;
+        printf("((%d,%d,%d),(%d,%d,%d)) -> %d (%d,%d,%d)\n", bii, bjj, bkk, bbi, bbj, bbk,
+            blockedLeafLayout(make_tuple(bii, bjj, bkk), make_tuple(bbi, bbj, bbk)),
+            bi, bj, bk
+        );
+    }
+#endif        
+#endif
+
     auto outputVoxelsPerBlock = IGEMM_Geometry::Z * IGEMM_Geometry::P * IGEMM_Geometry::Q;
     using ScatterIndexT = uint64_t [IGEMM_Geometry::Z][IGEMM_Geometry::P][IGEMM_Geometry::Q];
+#ifndef USE_HIERARCHICAL_BLOCK_TRAVERSAL
     using ScatterIndexArrayT = ScatterIndexT [IGEMM_Geometry::Bx][IGEMM_Geometry::By][IGEMM_Geometry::Bz];
+#else
+    using ScatterIndexArrayT = ScatterIndexT [IGEMM_Geometry::Bx*IGEMM_Geometry::By*IGEMM_Geometry::Bz];
+#endif
     auto scatterIndexData = thrust::universal_vector<uint64_t>(blockCount*outputVoxelsPerBlock);
     auto scatterIndexArray = reinterpret_cast<ScatterIndexArrayT*>(scatterIndexData.data().get());
     
 #pragma omp parallel for
     for (int l = 0; l < outputLeafCount; l++) {
         auto &leaf = outputGrid->tree().getFirstLeaf()[l];
+#ifndef USE_HIERARCHICAL_BLOCK_TRAVERSAL
         for (int bi = 0; bi < IGEMM_Geometry::Bx; bi++)
         for (int bj = 0; bj < IGEMM_Geometry::By; bj++)
         for (int bk = 0; bk < IGEMM_Geometry::Bz; bk++) {
+#else
+    for (int bbi = 0; bbi < shape<1,0>(blockedLeafLayout); ++bbi)
+    for (int bbj = 0; bbj < shape<1,1>(blockedLeafLayout); ++bbj)
+    for (int bbk = 0; bbk < shape<1,2>(blockedLeafLayout); ++bbk)
+    for (int bii = 0; bii < shape<0,0>(blockedLeafLayout); ++bii)
+    for (int bjj = 0; bjj < shape<0,1>(blockedLeafLayout); ++bjj)
+    for (int bkk = 0; bkk < shape<0,2>(blockedLeafLayout); ++bkk)
+    {
+        int bi = bbi * shape<0,0>(blockedLeafLayout) + bii;
+        int bj = bbj * shape<0,1>(blockedLeafLayout) + bjj;
+        int bk = bbk * shape<0,2>(blockedLeafLayout) + bkk;
+#endif
             nanovdb::Coord blockOffset(bi*IGEMM_Geometry::Z, bj*IGEMM_Geometry::P, bk*IGEMM_Geometry::Q);
             for (int i = 0; i < IGEMM_Geometry::Z; i++)
             for (int j = 0; j < IGEMM_Geometry::P; j++)
             for (int k = 0; k < IGEMM_Geometry::Q; k++) {
                 auto localCoord = blockOffset.offsetBy(i,j,k);
+#ifndef USE_HIERARCHICAL_BLOCK_TRAVERSAL
                 scatterIndexArray[l][bi][bj][bk][i][j][k] = leaf.getValue(localCoord);
+#else
+                scatterIndexArray[l]
+                    [blockedLeafLayout(make_tuple(bii, bjj, bkk), make_tuple(bbi, bbj, bbk))]
+                    [i][j][k] = leaf.getValue(localCoord);
+#endif
             }
         }
     }
@@ -465,23 +521,46 @@ void mainSparseConvolutionIGEMM(
     gpuTimer.start("Initializing gather indices");
     auto inputVoxelsPerBlock = IGEMM_Geometry::D * IGEMM_Geometry::H * IGEMM_Geometry::W;
     using GatherIndexT = uint64_t [IGEMM_Geometry::D][IGEMM_Geometry::H][IGEMM_Geometry::W];
+#ifndef USE_HIERARCHICAL_BLOCK_TRAVERSAL
     using GatherIndexArrayT = GatherIndexT [IGEMM_Geometry::Bx][IGEMM_Geometry::By][IGEMM_Geometry::Bz];
+#else
+    using GatherIndexArrayT = GatherIndexT [IGEMM_Geometry::Bx*IGEMM_Geometry::By*IGEMM_Geometry::Bz];
+#endif
     auto gatherIndexData = thrust::universal_vector<uint64_t>(blockCount*inputVoxelsPerBlock);
     auto gatherIndexArray = reinterpret_cast<GatherIndexArrayT*>(gatherIndexData.data().get());
 #pragma omp parallel for
     for (int l = 0; l < outputLeafCount; l++) {
         auto &outputLeaf = outputGrid->tree().getFirstLeaf()[l];
         const auto origin = outputLeaf.origin();
+#ifndef USE_HIERARCHICAL_BLOCK_TRAVERSAL
         for (int bi = 0; bi < IGEMM_Geometry::Bx; bi++)
         for (int bj = 0; bj < IGEMM_Geometry::By; bj++)
         for (int bk = 0; bk < IGEMM_Geometry::Bz; bk++) {
+#else
+    for (int bbi = 0; bbi < shape<1,0>(blockedLeafLayout); ++bbi)
+    for (int bbj = 0; bbj < shape<1,1>(blockedLeafLayout); ++bbj)
+    for (int bbk = 0; bbk < shape<1,2>(blockedLeafLayout); ++bbk)
+    for (int bii = 0; bii < shape<0,0>(blockedLeafLayout); ++bii)
+    for (int bjj = 0; bjj < shape<0,1>(blockedLeafLayout); ++bjj)
+    for (int bkk = 0; bkk < shape<0,2>(blockedLeafLayout); ++bkk)
+    {
+        int bi = bbi * shape<0,0>(blockedLeafLayout) + bii;
+        int bj = bbj * shape<0,1>(blockedLeafLayout) + bjj;
+        int bk = bbk * shape<0,2>(blockedLeafLayout) + bkk;
+#endif
             nanovdb::Coord blockOffset(bi*IGEMM_Geometry::Z, bj*IGEMM_Geometry::P, bk*IGEMM_Geometry::Q);
             for (int i = 0; i < IGEMM_Geometry::D; i++)
             for (int j = 0; j < IGEMM_Geometry::H; j++)
             for (int k = 0; k < IGEMM_Geometry::W; k++) {
                 auto localCoord = blockOffset.offsetBy(i+IGEMM_Geometry::Dx,j+IGEMM_Geometry::Dy,k+IGEMM_Geometry::Dz);
                 auto globalCoord = origin+localCoord;
+#ifndef USE_HIERARCHICAL_BLOCK_TRAVERSAL
                 gatherIndexArray[l][bi][bj][bk][i][j][k] = inputGrid->tree().getValue(globalCoord);
+#else
+                gatherIndexArray[l]
+                    [blockedLeafLayout(make_tuple(bii, bjj, bkk), make_tuple(bbi, bbj, bbk))]
+                    [i][j][k] = inputGrid->tree().getValue(globalCoord);
+#endif
             }
         }
     }
@@ -611,7 +690,7 @@ void mainSparseConvolutionIGEMM(
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             smem_size));
 
-    int num_iterations = 1;
+    int num_iterations = 10;
     for (int i = 0; i < num_iterations; ++i) {
         gpuTimer.start("Scatter-Gather Cutlass IGEMM (GPU) execution");
         kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, decltype(tFilter), decltype(tXformedActGather), decltype(tXformedActGatherLegacy), decltype(tGatherIndexLegacy), decltype(tXformedOutScatter), decltype(tScatterIndex)>

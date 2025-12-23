@@ -39,8 +39,8 @@ int main(int argc, char *argv[])
     // std::mt19937 generator(rd());
     std::mt19937 generator(12345);
 
-    // static const int ambient_voxels = 4*1024;
-    static const int ambient_voxels = 1024*1024*2;
+    static const int ambient_voxels = 16*1024;
+    // static const int ambient_voxels = 1024*1024*2;
     static const float input_occupancy = .5f;
     static const float output_occupancy = .5f;
     static const float overlap = .45f;

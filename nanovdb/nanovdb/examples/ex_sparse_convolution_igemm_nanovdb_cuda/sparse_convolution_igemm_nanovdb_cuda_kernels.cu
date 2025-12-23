@@ -118,7 +118,8 @@ struct IGEMM_Layouts
         auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)    
         auto xformed_act_logical_inner = make_layout(
             make_shape (make_shape (make_shape (                N,             Bx,          By,       Bz),      Z,    P,  Q), make_shape ( C,      T,    R,  S)),
-            make_stride(make_stride(make_stride(Bz*By*Bx*D*H*W*EG, By*Bx*D*H*W*EG, Bx*D*H*W*EG, D*H*W*EG), H*W*EG, W*EG, EG), make_stride(EC, H*W*EG, W*EG, EG)));
+            // make_stride(make_stride(make_stride(Bz*By*Bx*D*H*W*EG, By*Bx*D*H*W*EG, Bx*D*H*W*EG, D*H*W*EG), H*W*EG, W*EG, EG), make_stride(EC, H*W*EG, W*EG, EG)));
+            make_stride(make_stride(make_stride(Bx*By*Bz*D*H*W*EG, By*Bz*D*H*W*EG, Bz*D*H*W*EG, D*H*W*EG), H*W*EG, W*EG, EG), make_stride(EC, H*W*EG, W*EG, EG)));
 
         // outer_layout(make_coord(idx_buffer_idx, dense_c_idx)) => idx
         // IndexedGather obtains idx by applying (gmem_base_ptr + gather_idx_buf[idx_buffer_idx] + dense_offset)
@@ -160,6 +161,24 @@ struct IGEMM_Layouts
         auto xformed_out_logical_inner = make_layout(
             make_shape ( K, make_shape(        N,      Z,    P,  Q)),
             make_stride(EC, make_stride(Z*P*Q*ES, P*Q*ES, Q*ES, ES)));
+        auto xformed_out_scatter_outer = make_layout(
+            make_shape(_1{},_1{}),
+            make_stride(example::CustomStride{example::IndexedGather{scatter_idx_buf}, K}, _1{}));
+        return composition(
+            xformed_out_scatter_outer,
+            make_arithmetic_tuple(_0{},_0{}),
+            xformed_out_logical_inner);
+    }
+
+    static auto xformedOutputComposedLayout(const int N, const uint64_t* scatter_idx_buf)
+    {
+        // Output scatter layout
+        // scatter_layout_index(k, make_coord((nzpq))) => buffer_idx
+        auto ES = E<0>{};  // Scatter basis    (1,0) (idx_buffer_idx)
+        auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)
+        auto xformed_out_logical_inner = make_layout(
+            make_shape ( K, make_shape (make_shape (        N,         Bx,        By,   Bz),      Z,    P,  Q)),
+            make_stride(EC, make_stride(make_stride(_512{}*ES, _64{}*Z*ES, _8()*P*ES, Q*ES), P*Q*ES, Q*ES, ES)));
         auto xformed_out_scatter_outer = make_layout(
             make_shape(_1{},_1{}),
             make_stride(example::CustomStride{example::IndexedGather{scatter_idx_buf}, K}, _1{}));
@@ -484,15 +503,20 @@ void mainSparseConvolutionIGEMM(
 #endif
 
     auto outputVoxelsPerBlock = IGEMM_Geometry::Z * IGEMM_Geometry::P * IGEMM_Geometry::Q;
-    using ScatterIndexT = uint64_t [IGEMM_Geometry::Z][IGEMM_Geometry::P][IGEMM_Geometry::Q];
+    using ScatterIndexLegacyT = uint64_t [IGEMM_Geometry::Z][IGEMM_Geometry::P][IGEMM_Geometry::Q];
 #ifndef USE_HIERARCHICAL_BLOCK_TRAVERSAL
-    using ScatterIndexArrayT = ScatterIndexT [IGEMM_Geometry::Bx][IGEMM_Geometry::By][IGEMM_Geometry::Bz];
+    using ScatterIndexArrayLegacyT = ScatterIndexLegacyT [IGEMM_Geometry::Bx][IGEMM_Geometry::By][IGEMM_Geometry::Bz];
 #else
-    using ScatterIndexArrayT = ScatterIndexT [IGEMM_Geometry::Bx*IGEMM_Geometry::By*IGEMM_Geometry::Bz];
+    using ScatterIndexArrayLegacyT = ScatterIndexLegacyT [IGEMM_Geometry::Bx*IGEMM_Geometry::By*IGEMM_Geometry::Bz];
 #endif
-    auto scatterIndexData = thrust::universal_vector<uint64_t>(blockCount*outputVoxelsPerBlock);
+    auto scatterIndexDataLegacy = thrust::universal_vector<uint64_t>(blockCount*outputVoxelsPerBlock);
+    auto scatterIndexArrayLegacy = reinterpret_cast<ScatterIndexArrayLegacyT*>(scatterIndexDataLegacy.data().get());
+
+    // Per-leaf non-halo index map
+    using ScatterIndexArrayT = uint64_t [8][8][8];
+    auto scatterIndexData = thrust::universal_vector<uint64_t>(outputLeafCount*512);
     auto scatterIndexArray = reinterpret_cast<ScatterIndexArrayT*>(scatterIndexData.data().get());
-    
+
 #pragma omp parallel for
     for (int l = 0; l < outputLeafCount; l++) {
         auto &leaf = outputGrid->tree().getFirstLeaf()[l];
@@ -518,9 +542,9 @@ void mainSparseConvolutionIGEMM(
             for (int k = 0; k < IGEMM_Geometry::Q; k++) {
                 auto localCoord = blockOffset.offsetBy(i,j,k);
 #ifndef USE_HIERARCHICAL_BLOCK_TRAVERSAL
-                scatterIndexArray[l][bi][bj][bk][i][j][k] = leaf.getValue(localCoord);
+                scatterIndexArrayLegacy[l][bi][bj][bk][i][j][k] = leaf.getValue(localCoord);
 #else
-                scatterIndexArray[l]
+                scatterIndexArrayLegacy[l]
                     [blockedLeafLayout(make_tuple(bii, bjj, bkk), make_tuple(bbi, bbj, bbk))]
                     [i][j][k] = leaf.getValue(localCoord);
 #endif
@@ -605,7 +629,7 @@ void mainSparseConvolutionIGEMM(
     gpuTimer.start("Reference (Gather-Scatter) execution");
     SparseConvolveScatterGatherMapsReference<IGEMM_Geometry, Di, Do>(
         reinterpret_cast<GatherIndexT*>(gatherIndexArray),
-        reinterpret_cast<ScatterIndexT*>(scatterIndexArray),
+        reinterpret_cast<ScatterIndexLegacyT*>(scatterIndexArrayLegacy),
         blockCount,
         filter,
         inputArray,
@@ -682,11 +706,11 @@ void mainSparseConvolutionIGEMM(
 
     Tensor tXformedOutScatterLegacy = make_tensor(
         make_gmem_ptr(outputData.data().get()),
-        layouts.xformedOutputComposedLayoutLegacy(blockCount, scatterIndexData.data().get())
+        layouts.xformedOutputComposedLayoutLegacy(blockCount, scatterIndexDataLegacy.data().get())
     );
 
     Tensor tScatterIndexLegacy = make_tensor(
-        make_gmem_ptr(scatterIndexData.data().get()),
+        make_gmem_ptr(scatterIndexDataLegacy.data().get()),
         layouts.scatterIndexLayoutLegacy(blockCount)
     );
 

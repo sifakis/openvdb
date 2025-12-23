@@ -285,7 +285,7 @@ struct AmperePredicatedFprop {
         
 #if 0
         if ((threadIdx.x == 0) && (threadIdx.y == 0) & (threadIdx.z == 0))
-        if ((blockIdx.x  == 7) && (blockIdx.y  == 0) & (blockIdx.z  == 0))
+        // if ((blockIdx.x  == 7) && (blockIdx.y  == 0) & (blockIdx.z  == 0))
         {
             //for (auto [it,count] = std::tuple{cute::make_coord_iterator(shape(gB)), (int)size(shape(gB))}; count; ++it, --count)
             //    if(gB(*it) != gB(*it))
@@ -293,6 +293,7 @@ struct AmperePredicatedFprop {
             if(gB(0) != gBLegacy(0))
                 printf("Mismatch at blockIdx = (%d,%d,%d)\n", blockIdx.x, blockIdx.y, blockIdx.z);
 
+#if 0
             print("shape(mActLegacy)=");print(shape(mActLegacy));print("\n");
             print("shape(TilerActLegacy{})=");print(shape(TilerActLegacy{}));print("\n");
             print("shape(gBLegacy_nk)=");print(shape(gBLegacy_nk));print("\n");            
@@ -308,6 +309,7 @@ struct AmperePredicatedFprop {
             print("n_coord = ");print(n_coord);print("\n");
             print("N_coord = ");print(N_coord);print("\n");
             print("NN_coord = ");print(NN_coord);print("\n");
+#endif
         }
         __syncthreads();
 #endif        

@@ -151,30 +151,25 @@ struct IGEMM_Layouts
         );
     }
 
-    static auto xformedOutputComposedLayout(const int N, const uint64_t* scatter_idx_buf)
+    static auto xformedOutputComposedLayoutLegacy(const int N, const uint64_t* scatter_idx_buf)
     {
-        // TODO: Simplify these, no need to create the dense strides just to replace them
-
-        // Tensor Output
-        auto output_layout = make_ordered_layout(
-            make_shape( K,   make_shape( N,   Z,   P,   Q)),
-            make_tuple(_0{}, make_tuple(_4{},_3{},_2{},_1{})));
-
         // Output scatter layout
-        auto ES = E<0>{};  // Scatter basis    (1,0) (idx_buffer_idx) 
-        auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)    
-        auto out_basis_stride = make_stride( EC, make_stride(Z*P*Q*ES, P*Q*ES, Q*ES, _1{}*ES)); // -> (crd0, crd1)
-        auto out_basis_layout = make_layout(shape(output_layout), out_basis_stride);
-        auto out_scatter_layout = make_layout(
+        // scatter_layout_index(k, make_coord((nzpq))) => buffer_idx
+        auto ES = E<0>{};  // Scatter basis    (1,0) (idx_buffer_idx)
+        auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)
+        auto xformed_out_logical_inner = make_layout(
+            make_shape ( K, make_shape(        N,      Z,    P,  Q)),
+            make_stride(EC, make_stride(Z*P*Q*ES, P*Q*ES, Q*ES, ES)));
+        auto xformed_out_scatter_outer = make_layout(
             make_shape(_1{},_1{}),
             make_stride(example::CustomStride{example::IndexedGather{scatter_idx_buf}, K}, _1{}));
         return composition(
-            out_scatter_layout,
+            xformed_out_scatter_outer,
             make_arithmetic_tuple(_0{},_0{}),
-            out_basis_layout);
+            xformed_out_logical_inner);
     }
 
-    static auto scatterIndexLayout(const int N)
+    static auto scatterIndexLayoutLegacy(const int N)
     {
         // Output scatter index layout
         // scatter_layout_index(k, make_coord((nzpq))) => buffer_idx
@@ -308,13 +303,29 @@ void ResultCompare(
     std::cout << "Discrepancy = " << result << std::endl;
 }
 
-template<class Operator, class FilterTensor, class ActivationTensor, class ActivationTensorLegacy, class ActivationTensorIndexLegacy, class OutputTensor, class OutputTensorIndex>
+template<class Operator, class FilterTensor,
+    class ActivationTensor,      class ActivationTensorLegacy,
+    class ActivationTensorIndex, class ActivationTensorIndexLegacy,
+    class OutputTensor,          class OutputTensorLegacy,
+    class OutputTensorIndex,     class OutputTensorIndexLegacy
+    >
 __global__
 __launch_bounds__(Operator::MaxThreadsPerBlock, Operator::MinBlocksPerMultiprocessor)
-  void kernel_entrypoint_custom(FilterTensor mFlt, ActivationTensor mAct, ActivationTensorLegacy mActLegacy, ActivationTensorIndexLegacy mActILegacy, OutputTensor mOut, OutputTensorIndex mOutI) {
+  void kernel_entrypoint_custom(FilterTensor mFlt,
+      ActivationTensor mAct,             ActivationTensorLegacy mActLegacy,
+      ActivationTensorIndexLegacy mActI, ActivationTensorIndexLegacy mActILegacy,
+      OutputTensor mOut,                 OutputTensor mOutLegacy,
+      OutputTensorIndex mOutI,           OutputTensorIndex mOutILegacy
+  ) {
   extern __shared__ char smem_buf[];
   Operator op;
-  op(mFlt, mAct, mActLegacy, mActILegacy, mOut, mOutI, smem_buf);
+  op(
+      mFlt,
+      mAct,  mActLegacy,
+      mActI, mActILegacy,
+      mOut,  mOutLegacy,
+      mOutI, mOutILegacy,
+      smem_buf);
 }
 
 template<class BufferT>
@@ -669,33 +680,55 @@ void mainSparseConvolutionIGEMM(
         layouts.filterLayout()
     );
 
-    Tensor tXformedOutScatter = make_tensor(
+    Tensor tXformedOutScatterLegacy = make_tensor(
         make_gmem_ptr(outputData.data().get()),
-        layouts.xformedOutputComposedLayout(blockCount, scatterIndexData.data().get())
+        layouts.xformedOutputComposedLayoutLegacy(blockCount, scatterIndexData.data().get())
     );
 
-    Tensor tScatterIndex = make_tensor(
+    Tensor tScatterIndexLegacy = make_tensor(
         make_gmem_ptr(scatterIndexData.data().get()),
-        layouts.scatterIndexLayout(blockCount)
+        layouts.scatterIndexLayoutLegacy(blockCount)
     );
+
+    Tensor tGatherIndex = tGatherIndexLegacy;
+    Tensor tXformedOutScatter = tXformedOutScatterLegacy;
+    Tensor tScatterIndex = tScatterIndexLegacy;
 
     // ((BLK_M, BLK_N), (m', n'))
-    Tensor gOutput_mn = zipped_divide(tXformedOutScatter, typename AmperePredicatedFprop<IGEMM_Geometry>::TilerOut{});
+    Tensor gOutput_mn = zipped_divide(tXformedOutScatterLegacy, typename AmperePredicatedFprop<IGEMM_Geometry>::TilerOut{});
     dim3 launch_grid {static_cast<uint32_t>(size<1,1>(gOutput_mn)), static_cast<uint32_t>(size<1,0>(gOutput_mn)), 1};
     constexpr size_t smem_size = sizeof(typename AmperePredicatedFprop<IGEMM_Geometry>::SharedStorage);
     std::cout << "smem_size = " << smem_size << std::endl;
 
     cudaCheck(cudaFuncSetAttribute(
-            kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, decltype(tFilter), decltype(tXformedActGather), decltype(tXformedActGatherLegacy), decltype(tGatherIndexLegacy), decltype(tXformedOutScatter), decltype(tScatterIndex)>,
+            kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>,
+            decltype(tFilter),
+            decltype(tXformedActGather),  decltype(tXformedActGatherLegacy),
+            decltype(tGatherIndex),       decltype(tGatherIndexLegacy),
+            decltype(tXformedOutScatter), decltype(tXformedOutScatterLegacy),
+            decltype(tScatterIndex),      decltype(tScatterIndexLegacy)
+            >,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             smem_size));
 
     int num_iterations = 10;
     for (int i = 0; i < num_iterations; ++i) {
         gpuTimer.start("Scatter-Gather Cutlass IGEMM (GPU) execution");
-        kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, decltype(tFilter), decltype(tXformedActGather), decltype(tXformedActGatherLegacy), decltype(tGatherIndexLegacy), decltype(tXformedOutScatter), decltype(tScatterIndex)>
+        kernel_entrypoint_custom<
+            AmperePredicatedFprop<IGEMM_Geometry>,
+            decltype(tFilter),
+            decltype(tXformedActGather),  decltype(tXformedActGatherLegacy),
+            decltype(tGatherIndex),       decltype(tGatherIndexLegacy),
+            decltype(tXformedOutScatter), decltype(tXformedOutScatterLegacy),
+            decltype(tScatterIndex),      decltype(tScatterIndexLegacy)
+            >
             <<<launch_grid, AmperePredicatedFprop<IGEMM_Geometry>::MaxThreadsPerBlock, smem_size>>>(
-                tFilter, tXformedActGather, tXformedActGatherLegacy, tGatherIndexLegacy, tXformedOutScatter, tScatterIndex);
+                tFilter,
+                tXformedActGather,  tXformedActGatherLegacy,
+                tGatherIndex,       tGatherIndexLegacy,
+                tXformedOutScatter, tXformedOutScatterLegacy,
+                tScatterIndex,      tScatterIndexLegacy
+            );
         gpuTimer.stop();
     }
 

@@ -197,6 +197,15 @@ struct IGEMM_Layouts
             make_stride(_0{}, make_stride(Z*P*Q, P*Q, Q, _1{})));
     }
 
+    static auto scatterIndexLayout(const int N)
+    {
+        // Output scatter index layout
+        // scatter_layout_index(k, make_coord((nzpq))) => buffer_idx
+        return make_layout(
+            make_shape (   K, make_shape (make_shape (     N,      Bx,     By, Bz),    Z, P,  Q  )),
+            make_stride(_0{}, make_stride(make_stride(_512{}, _64{}*Z, _8{}*P,  Q),  P*Q, Q, _1{})));
+    }
+
 };
 
 template<class GeometryT, int Di, int Do, class ValueType>
@@ -330,11 +339,12 @@ template<class Operator, class FilterTensor,
     >
 __global__
 __launch_bounds__(Operator::MaxThreadsPerBlock, Operator::MinBlocksPerMultiprocessor)
-  void kernel_entrypoint_custom(FilterTensor mFlt,
+  void kernel_entrypoint_custom(
+      FilterTensor mFlt,
       ActivationTensor mAct,             ActivationTensorLegacy mActLegacy,
       ActivationTensorIndexLegacy mActI, ActivationTensorIndexLegacy mActILegacy,
       OutputTensor mOut,                 OutputTensor mOutLegacy,
-      OutputTensorIndex mOutI,           OutputTensorIndex mOutILegacy
+      OutputTensorIndex mOutI,           OutputTensorIndexLegacy mOutILegacy
   ) {
   extern __shared__ char smem_buf[];
   Operator op;
@@ -550,6 +560,12 @@ void mainSparseConvolutionIGEMM(
 #endif
             }
         }
+        auto origin = leaf.origin();
+        for (int i = 0; i < 8; i++)
+        for (int j = 0; j < 8; j++)
+        for (int k = 0; k < 8; k++) {
+            scatterIndexArray[l][i][j][k] = leaf.getValue(nanovdb::Coord(i,j,k));
+        }
     }
     gpuTimer.stop();
 
@@ -713,11 +729,48 @@ void mainSparseConvolutionIGEMM(
         make_gmem_ptr(scatterIndexDataLegacy.data().get()),
         layouts.scatterIndexLayoutLegacy(blockCount)
     );
+ 
+    Tensor tScatterIndex = make_tensor(
+        make_gmem_ptr(scatterIndexData.data().get()),
+        layouts.scatterIndexLayout(blockCount)
+    );
+    
+    auto lScatterIndex = layouts.scatterIndexLayout(blockCount);
 
     Tensor tGatherIndex = tGatherIndexLegacy;
     Tensor tXformedOutScatter = tXformedOutScatterLegacy;
-    Tensor tScatterIndex = tScatterIndexLegacy;
 
+    while (1) {
+        print("\nshape(tScatterIndex)=");print(shape(tScatterIndex));print("\n");
+        int l, bx, by, bz, p, q, r;
+        std::cin >> l >> bx >> by >> bz >> p >> q >> r;
+#if 1
+        printf("lScatterIndex(%d; %d,%d,%d; %d,%d,%d) = %d\n", l, bx, by, bz, p, q, r,
+            lScatterIndex(
+                make_tuple(0,
+                    make_tuple(
+                        make_tuple(l, bx, by, bz),
+                        p,
+                        q,
+                        r
+                    )
+                )
+            )
+        );
+        printf("tScatterIndex(%d; %d,%d,%d; %d,%d,%d) = %ld\n", l, bx, by, bz, p, q, r,
+            tScatterIndex(
+                make_tuple(0,
+                    make_tuple(
+                        make_tuple(l, bx, by, bz),
+                        p,
+                        q,
+                        r
+                    )
+                )
+            )
+        );
+#endif                        
+    }
     // ((BLK_M, BLK_N), (m', n'))
     Tensor gOutput_mn = zipped_divide(tXformedOutScatterLegacy, typename AmperePredicatedFprop<IGEMM_Geometry>::TilerOut{});
     dim3 launch_grid {static_cast<uint32_t>(size<1,1>(gOutput_mn)), static_cast<uint32_t>(size<1,0>(gOutput_mn)), 1};

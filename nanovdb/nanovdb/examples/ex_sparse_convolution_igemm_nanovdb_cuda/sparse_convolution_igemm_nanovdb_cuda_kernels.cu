@@ -177,8 +177,8 @@ struct IGEMM_Layouts
         auto ES = E<0>{};  // Scatter basis    (1,0) (idx_buffer_idx)
         auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)
         auto xformed_out_logical_inner = make_layout(
-            make_shape ( K, make_shape (make_shape (        N,         Bx,        By,   Bz),      Z,    P,  Q)),
-            make_stride(EC, make_stride(make_stride(_512{}*ES, _64{}*Z*ES, _8()*P*ES, Q*ES), P*Q*ES, Q*ES, ES)));
+            make_shape ( K, make_shape (make_shape (        N,         Bx,        By,   Bz),        Z,       P,  Q)),
+            make_stride(EC, make_stride(make_stride(_512{}*ES, _64{}*Z*ES, _8()*P*ES, Q*ES), _64{}*ES, _8{}*ES, ES)));
         auto xformed_out_scatter_outer = make_layout(
             make_shape(_1{},_1{}),
             make_stride(example::CustomStride{example::IndexedGather{scatter_idx_buf}, K}, _1{}));
@@ -202,8 +202,8 @@ struct IGEMM_Layouts
         // Output scatter index layout
         // scatter_layout_index(k, make_coord((nzpq))) => buffer_idx
         return make_layout(
-            make_shape (   K, make_shape (make_shape (     N,      Bx,     By, Bz),    Z, P,  Q  )),
-            make_stride(_0{}, make_stride(make_stride(_512{}, _64{}*Z, _8{}*P,  Q),  P*Q, Q, _1{})));
+            make_shape (   K, make_shape (make_shape (     N,      Bx,     By, Bz),     Z,    P,    Q)),
+            make_stride(_0{}, make_stride(make_stride(_512{}, _64{}*Z, _8{}*P,  Q), _64{}, _8{}, _1{})));
     }
 
 };
@@ -341,10 +341,10 @@ __global__
 __launch_bounds__(Operator::MaxThreadsPerBlock, Operator::MinBlocksPerMultiprocessor)
   void kernel_entrypoint_custom(
       FilterTensor mFlt,
-      ActivationTensor mAct,             ActivationTensorLegacy mActLegacy,
-      ActivationTensorIndexLegacy mActI, ActivationTensorIndexLegacy mActILegacy,
-      OutputTensor mOut,                 OutputTensor mOutLegacy,
-      OutputTensorIndex mOutI,           OutputTensorIndexLegacy mOutILegacy
+      ActivationTensor mAct,       ActivationTensorLegacy mActLegacy,
+      ActivationTensorIndex mActI, ActivationTensorIndexLegacy mActILegacy,
+      OutputTensor mOut,           OutputTensorLegacy mOutLegacy,
+      OutputTensorIndex mOutI,     OutputTensorIndexLegacy mOutILegacy
   ) {
   extern __shared__ char smem_buf[];
   Operator op;
@@ -481,8 +481,8 @@ void mainSparseConvolutionIGEMM(
     auto blockCount = outputLeafCount
         * IGEMM_Geometry::Bx * IGEMM_Geometry::By * IGEMM_Geometry::Bz;
 
-#ifdef USE_HIERARCHICAL_BLOCK_TRAVERSAL
     using ConvOp = AmperePredicatedFprop<IGEMM_Geometry>;
+#ifdef USE_HIERARCHICAL_BLOCK_TRAVERSAL
     auto leafShape = make_shape(Int<IGEMM_Geometry::Bx>{},  Int<IGEMM_Geometry::By>{},  Int<IGEMM_Geometry::Bz>{});
     auto blockedLeafShape = shape(zipped_divide(make_layout(leafShape), take<1,4>(ConvOp::Tiler_NN{})));
     auto blockedLeafLayout = make_ordered_layout(
@@ -725,6 +725,11 @@ void mainSparseConvolutionIGEMM(
         layouts.xformedOutputComposedLayoutLegacy(blockCount, scatterIndexDataLegacy.data().get())
     );
 
+    Tensor tXformedOutScatter = make_tensor(
+        make_gmem_ptr(outputData.data().get()),
+        layouts.xformedOutputComposedLayout(outputLeafCount, scatterIndexData.data().get())
+    );
+
     Tensor tScatterIndexLegacy = make_tensor(
         make_gmem_ptr(scatterIndexDataLegacy.data().get()),
         layouts.scatterIndexLayoutLegacy(blockCount)
@@ -732,14 +737,79 @@ void mainSparseConvolutionIGEMM(
  
     Tensor tScatterIndex = make_tensor(
         make_gmem_ptr(scatterIndexData.data().get()),
-        layouts.scatterIndexLayout(blockCount)
+        layouts.scatterIndexLayout(outputLeafCount)
     );
     
-    auto lScatterIndex = layouts.scatterIndexLayout(blockCount);
+    auto lScatterIndex = layouts.scatterIndexLayout(outputLeafCount);
 
     Tensor tGatherIndex = tGatherIndexLegacy;
-    Tensor tXformedOutScatter = tXformedOutScatterLegacy;
+    // Tensor tXformedOutScatter = tXformedOutScatterLegacy;
 
+    auto tScatterIndexTiled = local_tile(tScatterIndex, ConvOp::TilerSIx{}, make_coord(_,_));
+    print("TilerSIx{} = ");print(ConvOp::TilerSIx{});print("\n");
+    print("tScatterIndex.layout() = ");print(tScatterIndex.layout());print("\n");
+    print("tScatterIndexTiled.layout() = ");print(tScatterIndexTiled.layout());print("\n");
+
+    print("size<3,0,1>(tScatterIndexTiled)=");print(size<3,0,1>(tScatterIndexTiled));print("\n");
+    print("size<3,0,2>(tScatterIndexTiled)=");print(size<3,0,1>(tScatterIndexTiled));print("\n");
+    print("size<3,0,3>(tScatterIndexTiled)=");print(size<3,0,1>(tScatterIndexTiled));print("\n");
+    print("size<1,0,1>(tScatterIndexTiled)=");print(size<1,0,1>(tScatterIndexTiled));print("\n");
+    print("size<1,0,2>(tScatterIndexTiled)=");print(size<1,0,2>(tScatterIndexTiled));print("\n");
+    print("size<1,0,3>(tScatterIndexTiled)=");print(size<1,0,3>(tScatterIndexTiled));print("\n");
+    print("size<1,1>(tScatterIndexTiled)=");print(size<1,1>(tScatterIndexTiled));print("\n");
+    print("size<1,2>(tScatterIndexTiled)=");print(size<1,2>(tScatterIndexTiled));print("\n");
+    print("size<1,3>(tScatterIndexTiled)=");print(size<1,3>(tScatterIndexTiled));print("\n");
+    print("size<0>(tScatterIndexTiled)=");print(size<0>(tScatterIndexTiled));print("\n");
+    print("size<2>(tScatterIndexTiled)=");print(size<2>(tScatterIndexTiled));print("\n");
+    
+    auto lScatterIndexTiled = tScatterIndexTiled.layout();
+
+#if 1
+    for (int l = 0; l < outputLeafCount; ++l)
+        for (int bbi = 0; bbi < size<3,0,1>(tScatterIndexTiled); ++bbi)
+        for (int bbj = 0; bbj < size<3,0,2>(tScatterIndexTiled); ++bbj)
+        for (int bbk = 0; bbk < size<3,0,3>(tScatterIndexTiled); ++bbk)
+            for (int bii = 0; bii < size<1,0,1>(tScatterIndexTiled); ++bii)
+            for (int bjj = 0; bjj < size<1,0,2>(tScatterIndexTiled); ++bjj)
+            for (int bkk = 0; bkk < size<1,0,3>(tScatterIndexTiled); ++bkk)
+                for (int iii = 0; iii < size<1,1>(tScatterIndexTiled); ++iii)
+                for (int jjj = 0; jjj < size<1,2>(tScatterIndexTiled); ++jjj)
+                for (int kkk = 0; kkk < size<1,3>(tScatterIndexTiled); ++kkk)
+                {
+                auto coord = 
+                    make_tuple
+                                          (0,
+                        make_tuple
+                                             (
+                            make_tuple
+                                              (0,bii,bjj,bkk),iii,jjj,kkk),0,
+                        make_tuple
+                                                                             (
+                            make_tuple
+                                                                              ( l,bbi,bbj,bbk),0,0,0));
+                    for (int bk = 0; bk < size<2>(tScatterIndexTiled); ++bk)
+                    for (int kk = 0; kk < size<0>(tScatterIndexTiled); ++kk)
+                    {
+                        int k = bk * size<0>(tScatterIndexTiled) + kk;
+                        auto component_coord = 
+                            make_tuple
+                                                 (kk,
+                                make_tuple
+                                                     (
+                                    make_tuple
+                                                      (0,bii,bjj,bkk),iii,jjj,kkk),bk,
+                                make_tuple
+                                                                                     (
+                                    make_tuple
+                                                                                      ( l,bbi,bbj,bbk),0,0,0));
+                        // tXformedOutScatter(component_coord)
+                    }
+                        
+                    // print("tScatterIndexTiled");print(coord);print(" = ");print(tScatterIndexTiled(coord));print("\n");
+                    //print("lScatterIndexTiled");print(coord);print(" = ");print(lScatterIndexTiled(coord));print("\n");
+                }
+#endif
+#if 0
     while (1) {
         print("\nshape(tScatterIndex)=");print(shape(tScatterIndex));print("\n");
         int l, bx, by, bz, p, q, r;
@@ -771,6 +841,7 @@ void mainSparseConvolutionIGEMM(
         );
 #endif                        
     }
+#endif
     // ((BLK_M, BLK_N), (m', n'))
     Tensor gOutput_mn = zipped_divide(tXformedOutScatterLegacy, typename AmperePredicatedFprop<IGEMM_Geometry>::TilerOut{});
     dim3 launch_grid {static_cast<uint32_t>(size<1,1>(gOutput_mn)), static_cast<uint32_t>(size<1,0>(gOutput_mn)), 1};

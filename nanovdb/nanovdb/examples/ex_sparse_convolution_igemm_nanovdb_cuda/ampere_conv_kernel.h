@@ -82,6 +82,7 @@ struct AmperePredicatedFprop {
     using TilerActLegacy = Shape<TileN, TileK>;
     using TilerGIx = Shape<TileP, TileK>;
     using TilerOut = Shape<TileM, TileN>;
+    using TilerSIx = Shape<TileM, TileNN>;
 
     using TileSizeM = Int<size(TileM{})>;
     using TileSizeN = Int<size(TileN{})>;

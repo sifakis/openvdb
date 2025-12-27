@@ -742,9 +742,10 @@ void mainSparseConvolutionIGEMM(
     
     Tensor tGatherIndex = tGatherIndexLegacy;
 
-    auto tXformedOutScatterTiled = local_tile(tXformedOutScatter, ConvOp::TilerSIx{}, make_coord(_,_));
-    auto tScatterIndexTiled = local_tile(tScatterIndex, ConvOp::TilerSIx{}, make_coord(_,_));
-    print("TilerSIx{} = ");print(ConvOp::TilerSIx{});print("\n");
+    auto tXformedOutScatterTiled = local_tile(tXformedOutScatter, ConvOp::TilerOut{}, make_coord(_,_));
+    auto tScatterIndexTiled = local_tile(tScatterIndex, ConvOp::TilerOut{}, make_coord(_,_));
+    print("TilerOutLegacy{} = ");print(ConvOp::TilerOutLegacy{});print("\n");
+    print("TilerOut{} = ");print(ConvOp::TilerOut{});print("\n");
     // print("tXformedOutScatter.layout() = ");print(tXformedOutScatter.layout());print("\n");
     // print("tXformedOutScatterTiled.layout() = ");print(tXformedOutScatterTiled.layout());print("\n");
     // print("tScatterIndex.layout() = ");print(tScatterIndex.layout());print("\n");
@@ -796,7 +797,7 @@ void mainSparseConvolutionIGEMM(
 #endif
 
     // ((BLK_M, BLK_N), (m', n'))
-    Tensor gOutput_mn = zipped_divide(tXformedOutScatterLegacy, typename AmperePredicatedFprop<IGEMM_Geometry>::TilerOut{});
+    Tensor gOutput_mn = zipped_divide(tXformedOutScatterLegacy, typename AmperePredicatedFprop<IGEMM_Geometry>::TilerOutLegacy{});
     dim3 launch_grid {static_cast<uint32_t>(size<1,1>(gOutput_mn)), static_cast<uint32_t>(size<1,0>(gOutput_mn)), 1};
     constexpr size_t smem_size = sizeof(typename AmperePredicatedFprop<IGEMM_Geometry>::SharedStorage);
     std::cout << "smem_size = " << smem_size << std::endl;

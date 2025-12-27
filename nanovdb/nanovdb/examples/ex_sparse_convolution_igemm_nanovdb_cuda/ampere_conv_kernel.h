@@ -78,11 +78,13 @@ struct AmperePredicatedFprop {
     using TileNN = Shape<Tiler_NN, Z, P, Q>;
     using PIPE  = _3;
     using TilerFlt = Shape<TileM, TileK>;
-    using TilerAct = Shape<TileNN, TileK>;
-    using TilerActLegacy = Shape<TileN, TileK>;
+    using TilerAct       = Shape<TileNN, TileK>;
+    using TilerActLegacy = Shape<TileN , TileK>;
+
     using TilerGIx = Shape<TileP, TileK>;
-    using TilerOut = Shape<TileM, TileN>;
-    using TilerSIx = Shape<TileM, TileNN>;
+
+    using TilerOut       = Shape<TileM, TileNN>;
+    using TilerOutLegacy = Shape<TileM, TileN >;
 
     using TileSizeM = Int<size(TileM{})>;
     using TileSizeN = Int<size(TileN{})>;
@@ -226,8 +228,8 @@ struct AmperePredicatedFprop {
             cute::identity>;
 
         TiledMma tiled_mma;
-        Tensor accum = partition_fragment_C(tiled_mma, TilerOut{});
-        clear(accum);
+        Tensor accumLegacy = partition_fragment_C(tiled_mma, TilerOutLegacy{});
+        clear(accumLegacy);
 
         // Set up tensors
         // NOTE: blockIdx.x projects onto act-NDHW mode, y along the flt-K mode for the sake of higher dynamic range in NDHW
@@ -235,8 +237,8 @@ struct AmperePredicatedFprop {
         Tensor gBLegacy_nk = local_tile(mActLegacy, TilerActLegacy{}, make_coord(_,_));                      // (BLK_N,BLK_K,n',_1)
         Tensor gB_nk = local_tile(mAct, TilerAct{}, make_coord(_,_));                      // (BLK_N,BLK_K,n',_1)
         Tensor gG_nk = local_tile(mGIxLegacy, TilerGIx{}, make_coord(_,_));                      // (BLK_N,BLK_K,n',_1)
-        Tensor gCLegacy_mn = local_tile(mOutLegacy, TilerOut{}, make_coord(_,_));                            // (BLK_M,BLK_N,m',n')
-        Tensor gSLegacy_mn = local_tile(mSIxLegacy, TilerOut{}, make_coord(_,_));                            // (BLK_M,BLK_N,m',n')
+        Tensor gCLegacy_mn = local_tile(mOutLegacy, TilerOutLegacy{}, make_coord(_,_));                            // (BLK_M,BLK_N,m',n')
+        Tensor gSLegacy_mn = local_tile(mSIxLegacy, TilerOutLegacy{}, make_coord(_,_));                            // (BLK_M,BLK_N,m',n')
 
 #if 0
         if (thread0() && block0()) {
@@ -349,11 +351,11 @@ struct AmperePredicatedFprop {
 
         CollectiveMainloop collective_mma;
         collective_mma(
-            accum,
+            accumLegacy,
             gA,
             gBLegacy,
             sG,
-            accum,
+            accumLegacy,
             k_tile_iter, k_tile_count,
             Underscore{}, // no residue since we do not support predication
             threadIdx.x,
@@ -367,7 +369,7 @@ struct AmperePredicatedFprop {
 
         auto smem_tiled_copy_C = make_tiled_copy_C(SmemCopyAtomOut{}, tiled_mma);
         auto smem_thr_copy_C = smem_tiled_copy_C.get_slice(threadIdx.x);
-        auto tCrC = smem_thr_copy_C.retile_S(accum);
+        auto tCrC = smem_thr_copy_C.retile_S(accumLegacy);
         auto tCsC = smem_thr_copy_C.partition_D(sC);
         copy(smem_tiled_copy_C, tCrC, tCsC);
 

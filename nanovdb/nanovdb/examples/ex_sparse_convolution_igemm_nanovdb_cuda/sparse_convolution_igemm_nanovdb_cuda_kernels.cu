@@ -740,29 +740,15 @@ void mainSparseConvolutionIGEMM(
         layouts.scatterIndexLayout(outputLeafCount)
     );
     
-    auto lScatterIndex = layouts.scatterIndexLayout(outputLeafCount);
-
     Tensor tGatherIndex = tGatherIndexLegacy;
-    // Tensor tXformedOutScatter = tXformedOutScatterLegacy;
 
+    auto tXformedOutScatterTiled = local_tile(tXformedOutScatter, ConvOp::TilerSIx{}, make_coord(_,_));
     auto tScatterIndexTiled = local_tile(tScatterIndex, ConvOp::TilerSIx{}, make_coord(_,_));
     print("TilerSIx{} = ");print(ConvOp::TilerSIx{});print("\n");
-    print("tScatterIndex.layout() = ");print(tScatterIndex.layout());print("\n");
-    print("tScatterIndexTiled.layout() = ");print(tScatterIndexTiled.layout());print("\n");
-
-    print("size<3,0,1>(tScatterIndexTiled)=");print(size<3,0,1>(tScatterIndexTiled));print("\n");
-    print("size<3,0,2>(tScatterIndexTiled)=");print(size<3,0,1>(tScatterIndexTiled));print("\n");
-    print("size<3,0,3>(tScatterIndexTiled)=");print(size<3,0,1>(tScatterIndexTiled));print("\n");
-    print("size<1,0,1>(tScatterIndexTiled)=");print(size<1,0,1>(tScatterIndexTiled));print("\n");
-    print("size<1,0,2>(tScatterIndexTiled)=");print(size<1,0,2>(tScatterIndexTiled));print("\n");
-    print("size<1,0,3>(tScatterIndexTiled)=");print(size<1,0,3>(tScatterIndexTiled));print("\n");
-    print("size<1,1>(tScatterIndexTiled)=");print(size<1,1>(tScatterIndexTiled));print("\n");
-    print("size<1,2>(tScatterIndexTiled)=");print(size<1,2>(tScatterIndexTiled));print("\n");
-    print("size<1,3>(tScatterIndexTiled)=");print(size<1,3>(tScatterIndexTiled));print("\n");
-    print("size<0>(tScatterIndexTiled)=");print(size<0>(tScatterIndexTiled));print("\n");
-    print("size<2>(tScatterIndexTiled)=");print(size<2>(tScatterIndexTiled));print("\n");
-    
-    auto lScatterIndexTiled = tScatterIndexTiled.layout();
+    // print("tXformedOutScatter.layout() = ");print(tXformedOutScatter.layout());print("\n");
+    // print("tXformedOutScatterTiled.layout() = ");print(tXformedOutScatterTiled.layout());print("\n");
+    // print("tScatterIndex.layout() = ");print(tScatterIndex.layout());print("\n");
+    // print("tScatterIndexTiled.layout() = ");print(tScatterIndexTiled.layout());print("\n");
 
 #if 1
     for (int l = 0; l < outputLeafCount; ++l)
@@ -802,46 +788,13 @@ void mainSparseConvolutionIGEMM(
                                                                                      (
                                     make_tuple
                                                                                       ( l,bbi,bbj,bbk),0,0,0));
-                        // tXformedOutScatter(component_coord)
+                        if(&tXformedOutScatterTiled(component_coord) !=
+                            outputData.data().get() + tScatterIndexTiled(coord) * IGEMM_Geometry::K + k)
+                            throw std::runtime_error("Inconsistent addresses");
                     }
-                        
-                    // print("tScatterIndexTiled");print(coord);print(" = ");print(tScatterIndexTiled(coord));print("\n");
-                    //print("lScatterIndexTiled");print(coord);print(" = ");print(lScatterIndexTiled(coord));print("\n");
                 }
 #endif
-#if 0
-    while (1) {
-        print("\nshape(tScatterIndex)=");print(shape(tScatterIndex));print("\n");
-        int l, bx, by, bz, p, q, r;
-        std::cin >> l >> bx >> by >> bz >> p >> q >> r;
-#if 1
-        printf("lScatterIndex(%d; %d,%d,%d; %d,%d,%d) = %d\n", l, bx, by, bz, p, q, r,
-            lScatterIndex(
-                make_tuple(0,
-                    make_tuple(
-                        make_tuple(l, bx, by, bz),
-                        p,
-                        q,
-                        r
-                    )
-                )
-            )
-        );
-        printf("tScatterIndex(%d; %d,%d,%d; %d,%d,%d) = %ld\n", l, bx, by, bz, p, q, r,
-            tScatterIndex(
-                make_tuple(0,
-                    make_tuple(
-                        make_tuple(l, bx, by, bz),
-                        p,
-                        q,
-                        r
-                    )
-                )
-            )
-        );
-#endif                        
-    }
-#endif
+
     // ((BLK_M, BLK_N), (m', n'))
     Tensor gOutput_mn = zipped_divide(tXformedOutScatterLegacy, typename AmperePredicatedFprop<IGEMM_Geometry>::TilerOut{});
     dim3 launch_grid {static_cast<uint32_t>(size<1,1>(gOutput_mn)), static_cast<uint32_t>(size<1,0>(gOutput_mn)), 1};

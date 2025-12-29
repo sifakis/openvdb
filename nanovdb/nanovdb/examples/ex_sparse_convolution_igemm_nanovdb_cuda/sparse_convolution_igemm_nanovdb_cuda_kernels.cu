@@ -57,12 +57,15 @@ struct IGEMM_Geometry
     static constexpr int By = 8/P;  // Block count along Y-dimension of leaf node
     static constexpr int Bz = 8/Q;  // Block count along Z-dimension of leaf node
 
+    static constexpr int Hx = T+7;  // X-dimension of leaf node domain, enlarged by the necessary halo for convolution
+    static constexpr int Hy = R+7;  // Y-dimension of leaf node domain, enlarged by the necessary halo for convolution
+    static constexpr int Hz = S+7;  // Z-dimension of leaf node domain, enlarged by the necessary halo for convolution
     //
     // Filter offset (coordinate offset in the input domain that the [0,0,0] filter spoke corresponds to)
     //
 
-    static constexpr int Dx = -1;  // Filter centered at (0,0,0), thus (0,0,0) spoke corresponds
-    static constexpr int Dy = -1;  // to a (-1,-1,-1) grid offset
+    static constexpr int Dx = -1;   // Filter centered at (0,0,0), thus (0,0,0) spoke corresponds
+    static constexpr int Dy = -1;   // to a (-1,-1,-1) grid offset
     static constexpr int Dz = -1;
 
 };
@@ -85,6 +88,9 @@ struct IGEMM_Layouts
     static constexpr auto Bx = Int<GeometryT::Bx>{};
     static constexpr auto By = Int<GeometryT::By>{};
     static constexpr auto Bz = Int<GeometryT::Bz>{};
+    static constexpr auto Hx = Int<GeometryT::Hx>{};
+    static constexpr auto Hy = Int<GeometryT::Hy>{};
+    static constexpr auto Hz = Int<GeometryT::Hz>{};
 
     static auto xformedActivationComposedLayoutLegacy(const int N, const uint64_t* gather_idx_buf)
     {
@@ -142,6 +148,15 @@ struct IGEMM_Layouts
         return make_layout(
             make_shape (make_shape (    N,   D, H,  W  ), make_shape ( C  , _1{}, _1{}, _1{})),
             make_stride(make_stride(D*H*W, H*W, W, _1{}), make_stride(_0{}, _0{}, _0{}, _0{})));
+    }
+
+    static auto gatherIndexLayout(const int N)
+    {
+        // Input gather index layout
+        // gather_layout_index(make_coord((ndhw), c)) => buffer_idx
+        return make_layout(
+            make_shape (make_shape (make_shape (       N,      Bx,   By, Bz),     Z,  P,    Q), make_shape (   C,     T,  R,    S)),
+            make_stride(make_stride(make_stride(Hx*Hy*Hz, Hy*Hz*Z, Hz*P,  Q), Hy*Hz, Hz, _1{}), make_stride(_0{}, Hy*Hz, Hz, _1{})));
     }
 
     static auto filterLayout()
@@ -560,7 +575,6 @@ void mainSparseConvolutionIGEMM(
 #endif
             }
         }
-        auto origin = leaf.origin();
         for (int i = 0; i < 8; i++)
         for (int j = 0; j < 8; j++)
         for (int k = 0; k < 8; k++) {
@@ -571,14 +585,20 @@ void mainSparseConvolutionIGEMM(
 
     gpuTimer.start("Initializing gather indices");
     auto inputVoxelsPerBlock = IGEMM_Geometry::D * IGEMM_Geometry::H * IGEMM_Geometry::W;
-    using GatherIndexT = uint64_t [IGEMM_Geometry::D][IGEMM_Geometry::H][IGEMM_Geometry::W];
+    using GatherIndexLegacyT = uint64_t [IGEMM_Geometry::D][IGEMM_Geometry::H][IGEMM_Geometry::W];
 #ifndef USE_HIERARCHICAL_BLOCK_TRAVERSAL
-    using GatherIndexArrayT = GatherIndexT [IGEMM_Geometry::Bx][IGEMM_Geometry::By][IGEMM_Geometry::Bz];
+    using GatherIndexArrayLegacyT = GatherIndexLegacyT [IGEMM_Geometry::Bx][IGEMM_Geometry::By][IGEMM_Geometry::Bz];
 #else
-    using GatherIndexArrayT = GatherIndexT [IGEMM_Geometry::Bx*IGEMM_Geometry::By*IGEMM_Geometry::Bz];
+    using GatherIndexArrayLegacyT = GatherIndexLegacyT [IGEMM_Geometry::Bx*IGEMM_Geometry::By*IGEMM_Geometry::Bz];
 #endif
-    auto gatherIndexData = thrust::universal_vector<uint64_t>(blockCount*inputVoxelsPerBlock);
+    auto gatherIndexDataLegacy = thrust::universal_vector<uint64_t>(blockCount*inputVoxelsPerBlock);
+    auto gatherIndexArrayLegacy = reinterpret_cast<GatherIndexArrayLegacyT*>(gatherIndexDataLegacy.data().get());
+
+    // Per-leaf halo index map
+    using GatherIndexArrayT = uint64_t [IGEMM_Geometry::Hx][IGEMM_Geometry::Hy][IGEMM_Geometry::Hz];
+    auto gatherIndexData = thrust::universal_vector<uint64_t>(outputLeafCount*IGEMM_Geometry::Hx*IGEMM_Geometry::Hy*IGEMM_Geometry::Hz);
     auto gatherIndexArray = reinterpret_cast<GatherIndexArrayT*>(gatherIndexData.data().get());
+
 #pragma omp parallel for
     for (int l = 0; l < outputLeafCount; l++) {
         auto &outputLeaf = outputGrid->tree().getFirstLeaf()[l];
@@ -606,13 +626,20 @@ void mainSparseConvolutionIGEMM(
                 auto localCoord = blockOffset.offsetBy(i+IGEMM_Geometry::Dx,j+IGEMM_Geometry::Dy,k+IGEMM_Geometry::Dz);
                 auto globalCoord = origin+localCoord;
 #ifndef USE_HIERARCHICAL_BLOCK_TRAVERSAL
-                gatherIndexArray[l][bi][bj][bk][i][j][k] = inputGrid->tree().getValue(globalCoord);
+                gatherIndexArrayLegacy[l][bi][bj][bk][i][j][k] = inputGrid->tree().getValue(globalCoord);
 #else
-                gatherIndexArray[l]
+                gatherIndexArrayLegacy[l]
                     [blockedLeafLayout(make_tuple(bii, bjj, bkk), make_tuple(bbi, bbj, bbk))]
                     [i][j][k] = inputGrid->tree().getValue(globalCoord);
 #endif
             }
+        }
+
+        auto offsetOrigin = origin.offsetBy(IGEMM_Geometry::Dx, IGEMM_Geometry::Dy, IGEMM_Geometry::Dz);
+        for (int i = 0; i < IGEMM_Geometry::Hx; ++i)
+        for (int j = 0; j < IGEMM_Geometry::Hy; ++j)
+        for (int k = 0; k < IGEMM_Geometry::Hz; ++k) {
+            gatherIndexArray[l][i][j][k] = outputGrid->tree().getValue(offsetOrigin+nanovdb::Coord(i,j,k));
         }
     }
     gpuTimer.stop();
@@ -644,7 +671,7 @@ void mainSparseConvolutionIGEMM(
 #if 0
     gpuTimer.start("Reference (Gather-Scatter) execution");
     SparseConvolveScatterGatherMapsReference<IGEMM_Geometry, Di, Do>(
-        reinterpret_cast<GatherIndexT*>(gatherIndexArray),
+        reinterpret_cast<GatherIndexLegacyT*>(gatherIndexArrayLegacy),
         reinterpret_cast<ScatterIndexLegacyT*>(scatterIndexArrayLegacy),
         blockCount,
         filter,
@@ -664,18 +691,82 @@ void mainSparseConvolutionIGEMM(
 
     Tensor tXformedActGatherLegacy = make_tensor(
         make_gmem_ptr(inputData.data().get()),
-        layouts.xformedActivationComposedLayoutLegacy(blockCount, gatherIndexData.data().get())
+        layouts.xformedActivationComposedLayoutLegacy(blockCount, gatherIndexDataLegacy.data().get())
     );
 
     Tensor tXformedActGather = make_tensor(
         make_gmem_ptr(inputData.data().get()),
-        layouts.xformedActivationComposedLayout(outputLeafCount, gatherIndexData.data().get())
+        layouts.xformedActivationComposedLayout(outputLeafCount, gatherIndexDataLegacy.data().get())
     );
 
     Tensor tGatherIndexLegacy = make_tensor(
-        make_gmem_ptr(gatherIndexData.data().get()),
+        make_gmem_ptr(gatherIndexDataLegacy.data().get()),
         layouts.gatherIndexLayoutLegacy(blockCount)
     );
+
+    Tensor tGatherIndex = make_tensor(
+        make_gmem_ptr(gatherIndexDataLegacy.data().get()),
+        layouts.gatherIndexLayout(outputLeafCount)
+    );
+
+
+    // auto tXformedOutGatherTiled = local_tile(tXformedOutGather, ConvOp::TilerOut{}, make_coord(_,_));
+    auto tGatherIndexTiled = local_tile(tGatherIndex, ConvOp::TilerAct{}, make_coord(_,_));
+    print("TilerActLegacy{} = ");print(ConvOp::TilerActLegacy{});print("\n");
+    print("TilerAct{} = ");print(ConvOp::TilerAct{});print("\n");
+    // print("tXformedOutGather.layout() = ");print(tXformedOutGather.layout());print("\n");
+    // print("tXformedOutGatherTiled.layout() = ");print(tXformedOutGatherTiled.layout());print("\n");
+    print("tGatherIndex.layout() = ");print(tGatherIndex.layout());print("\n");
+    print("tGatherIndexTiled.layout() = ");print(tGatherIndexTiled.layout());print("\n");
+
+    for (int l = 0; l < outputLeafCount; ++l)
+        for (int bbi = 0; bbi < size<2,0,1>(tGatherIndexTiled); ++bbi)
+        for (int bbj = 0; bbj < size<2,0,2>(tGatherIndexTiled); ++bbj)
+        for (int bbk = 0; bbk < size<2,0,3>(tGatherIndexTiled); ++bbk)
+            for (int bii = 0; bii < size<0,0,1>(tGatherIndexTiled); ++bii)
+            for (int bjj = 0; bjj < size<0,0,2>(tGatherIndexTiled); ++bjj)
+            for (int bkk = 0; bkk < size<0,0,3>(tGatherIndexTiled); ++bkk)
+                for (int iii = 0; iii < size<0,1>(tGatherIndexTiled); ++iii)
+                for (int jjj = 0; jjj < size<0,2>(tGatherIndexTiled); ++jjj)
+                for (int kkk = 0; kkk < size<0,3>(tGatherIndexTiled); ++kkk)
+                    for (int t = 0; t < size<3,1>(tGatherIndexTiled); ++t)
+                    for (int r = 0; r < size<3,2>(tGatherIndexTiled); ++r)
+                    for (int s = 0; s < size<3,3>(tGatherIndexTiled); ++s)
+                    {
+                        //                     (((0,bii,bjj,bkk),iii,jjj,kkk),(kk,0,0,0),(( l,bbi,bbj,bbk),0,0,0),(bk,t,r,s))
+                        auto coord = 
+                            make_tuple         (
+                                make_tuple      (
+                                    make_tuple   (0,bii,bjj,bkk),iii,jjj,kkk),
+                                make_tuple                                    ( 0,0,0,0),
+                                make_tuple                                               (
+                                    make_tuple                                            ( l,bbi,bbj,bbk),0,0,0),
+                                make_tuple                                                                        ( 0,t,r,s));
+                        print("coord=");print(coord);print("\n");
+#if 0
+                    for (int bk = 0; bk < size<2>(tGatherIndexTiled); ++bk)
+                    for (int kk = 0; kk < size<0>(tGatherIndexTiled); ++kk)
+                    {
+                        int k = bk * size<0>(tGatherIndexTiled) + kk;
+                        auto component_coord = 
+                            make_tuple
+                                                 (kk,
+                                make_tuple
+                                                     (
+                                    make_tuple
+                                                      (0,bii,bjj,bkk),iii,jjj,kkk),bk,
+                                make_tuple
+                                                                                     (
+                                    make_tuple
+                                                                                      ( l,bbi,bbj,bbk),0,0,0));
+                        if(&tXformedOutGatherTiled(component_coord) !=
+                            outputData.data().get() + tGatherIndexTiled(coord) * IGEMM_Geometry::K + k)
+                            throw std::runtime_error("Inconsistent addresses");
+                    }
+#endif
+                }
+
+
 
 #if 0
     for (int n = 0; n < blockCount; ++n)
@@ -740,16 +831,14 @@ void mainSparseConvolutionIGEMM(
         layouts.scatterIndexLayout(outputLeafCount)
     );
     
-    Tensor tGatherIndex = tGatherIndexLegacy;
-
     auto tXformedOutScatterTiled = local_tile(tXformedOutScatter, ConvOp::TilerOut{}, make_coord(_,_));
     auto tScatterIndexTiled = local_tile(tScatterIndex, ConvOp::TilerOut{}, make_coord(_,_));
     print("TilerOutLegacy{} = ");print(ConvOp::TilerOutLegacy{});print("\n");
     print("TilerOut{} = ");print(ConvOp::TilerOut{});print("\n");
     // print("tXformedOutScatter.layout() = ");print(tXformedOutScatter.layout());print("\n");
     // print("tXformedOutScatterTiled.layout() = ");print(tXformedOutScatterTiled.layout());print("\n");
-    // print("tScatterIndex.layout() = ");print(tScatterIndex.layout());print("\n");
-    // print("tScatterIndexTiled.layout() = ");print(tScatterIndexTiled.layout());print("\n");
+     print("tScatterIndex.layout() = ");print(tScatterIndex.layout());print("\n");
+    print("tScatterIndexTiled.layout() = ");print(tScatterIndexTiled.layout());print("\n");
 
 #if 1
     for (int l = 0; l < outputLeafCount; ++l)
@@ -763,7 +852,7 @@ void mainSparseConvolutionIGEMM(
                 for (int jjj = 0; jjj < size<1,2>(tScatterIndexTiled); ++jjj)
                 for (int kkk = 0; kkk < size<1,3>(tScatterIndexTiled); ++kkk)
                 {
-                auto coord = 
+                    auto coord = 
                     make_tuple
                                           (0,
                         make_tuple

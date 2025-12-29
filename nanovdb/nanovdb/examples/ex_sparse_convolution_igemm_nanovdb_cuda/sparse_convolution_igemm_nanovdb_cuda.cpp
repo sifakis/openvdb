@@ -42,7 +42,7 @@ int main(int argc, char *argv[])
     static const int ambient_voxels = 16*1024;
     // static const int ambient_voxels = 1024*1024*2;
     static const float input_occupancy = .5f;
-    static const float output_occupancy = .5f;
+    static const float output_occupancy = 1.f;
     static const float overlap = .45f;
     nanovdb::Coord offset(0,0,0);
 

@@ -123,9 +123,8 @@ struct IGEMM_Layouts
         auto EG = E<0>{};  // Gather basis     (1,0) (idx_buffer_idx) 
         auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)    
         auto xformed_act_logical_inner = make_layout(
-            make_shape (make_shape (make_shape (                N,             Bx,          By,       Bz),      Z,    P,  Q), make_shape ( C,      T,    R,  S)),
-            // make_stride(make_stride(make_stride(Bz*By*Bx*D*H*W*EG, By*Bx*D*H*W*EG, Bx*D*H*W*EG, D*H*W*EG), H*W*EG, W*EG, EG), make_stride(EC, H*W*EG, W*EG, EG)));
-            make_stride(make_stride(make_stride(Bx*By*Bz*D*H*W*EG, By*Bz*D*H*W*EG, Bz*D*H*W*EG, D*H*W*EG), H*W*EG, W*EG, EG), make_stride(EC, H*W*EG, W*EG, EG)));
+            make_shape (make_shape (make_shape (          N,         Bx,      By,   Bz),        Z,     P,  Q), make_shape ( C,        T,     R,  S)),
+            make_stride(make_stride(make_stride(Hx*Hy*Hz*EG, Hy*Hz*Z*EG, Hz*P*EG, Q*EG), Hy*Hz*EG, Hz*EG, EG), make_stride(EC, Hy*Hz*EG, Hz*EG, EG)));
 
         // outer_layout(make_coord(idx_buffer_idx, dense_c_idx)) => idx
         // IndexedGather obtains idx by applying (gmem_base_ptr + gather_idx_buf[idx_buffer_idx] + dense_offset)
@@ -639,7 +638,15 @@ void mainSparseConvolutionIGEMM(
         for (int i = 0; i < IGEMM_Geometry::Hx; ++i)
         for (int j = 0; j < IGEMM_Geometry::Hy; ++j)
         for (int k = 0; k < IGEMM_Geometry::Hz; ++k) {
-            gatherIndexArray[l][i][j][k] = outputGrid->tree().getValue(offsetOrigin+nanovdb::Coord(i,j,k));
+            gatherIndexArray[l][i][j][k] = inputGrid->tree().getValue(offsetOrigin+nanovdb::Coord(i,j,k));
+            if (make_tuple(l,i,j,k) == make_tuple(0,0,2,1)) {
+                std::cout << std::endl;
+                std::cout << "===== DEBUG BEGIN =====" << std::endl;
+                std::cout << "gatherIndexArray[0][0][2][1] = " << gatherIndexArray[0][0][2][1] << std::endl;
+                std::cout << "&gatherIndexArray[0][0][2][1] - gatherIndexData.data().get() = " << &gatherIndexArray[0][0][2][1] - gatherIndexData.data().get() << std::endl;
+                std::cout << "====== DEBUG END ======" << std::endl;
+            }
+                    
         }
     }
     gpuTimer.stop();
@@ -696,7 +703,7 @@ void mainSparseConvolutionIGEMM(
 
     Tensor tXformedActGather = make_tensor(
         make_gmem_ptr(inputData.data().get()),
-        layouts.xformedActivationComposedLayout(outputLeafCount, gatherIndexDataLegacy.data().get())
+        layouts.xformedActivationComposedLayout(outputLeafCount, gatherIndexData.data().get())
     );
 
     Tensor tGatherIndexLegacy = make_tensor(
@@ -705,19 +712,17 @@ void mainSparseConvolutionIGEMM(
     );
 
     Tensor tGatherIndex = make_tensor(
-        make_gmem_ptr(gatherIndexDataLegacy.data().get()),
+        make_gmem_ptr(gatherIndexData.data().get()),
         layouts.gatherIndexLayout(outputLeafCount)
     );
 
 
-    // auto tXformedOutGatherTiled = local_tile(tXformedOutGather, ConvOp::TilerOut{}, make_coord(_,_));
+    auto tXformedActGatherTiled = local_tile(tXformedActGather, ConvOp::TilerAct{}, make_coord(_,_));
     auto tGatherIndexTiled = local_tile(tGatherIndex, ConvOp::TilerAct{}, make_coord(_,_));
-    print("TilerActLegacy{} = ");print(ConvOp::TilerActLegacy{});print("\n");
-    print("TilerAct{} = ");print(ConvOp::TilerAct{});print("\n");
-    // print("tXformedOutGather.layout() = ");print(tXformedOutGather.layout());print("\n");
-    // print("tXformedOutGatherTiled.layout() = ");print(tXformedOutGatherTiled.layout());print("\n");
-    print("tGatherIndex.layout() = ");print(tGatherIndex.layout());print("\n");
-    print("tGatherIndexTiled.layout() = ");print(tGatherIndexTiled.layout());print("\n");
+    // print("tXformedActGather.layout() = ");print(tXformedActGather.layout());print("\n");
+    // print("tXformedActGatherTiled.layout() = ");print(tXformedActGatherTiled.layout());print("\n");
+    // print("tGatherIndex.layout() = ");print(tGatherIndex.layout());print("\n");
+    // print("tGatherIndexTiled.layout() = ");print(tGatherIndexTiled.layout());print("\n");
 
     for (int l = 0; l < outputLeafCount; ++l)
         for (int bbi = 0; bbi < size<2,0,1>(tGatherIndexTiled); ++bbi)
@@ -733,7 +738,7 @@ void mainSparseConvolutionIGEMM(
                     for (int r = 0; r < size<3,2>(tGatherIndexTiled); ++r)
                     for (int s = 0; s < size<3,3>(tGatherIndexTiled); ++s)
                     {
-                        //                     (((0,bii,bjj,bkk),iii,jjj,kkk),(kk,0,0,0),(( l,bbi,bbj,bbk),0,0,0),(bk,t,r,s))
+                        //                     (((0,bii,bjj,bkk),iii,jjj,kkk),(cc,0,0,0),(( l,bbi,bbj,bbk),0,0,0),(bc,t,r,s))
                         auto coord = 
                             make_tuple         (
                                 make_tuple      (
@@ -742,28 +747,24 @@ void mainSparseConvolutionIGEMM(
                                 make_tuple                                               (
                                     make_tuple                                            ( l,bbi,bbj,bbk),0,0,0),
                                 make_tuple                                                                        ( 0,t,r,s));
-                        print("coord=");print(coord);print("\n");
-#if 0
-                    for (int bk = 0; bk < size<2>(tGatherIndexTiled); ++bk)
-                    for (int kk = 0; kk < size<0>(tGatherIndexTiled); ++kk)
-                    {
-                        int k = bk * size<0>(tGatherIndexTiled) + kk;
-                        auto component_coord = 
-                            make_tuple
-                                                 (kk,
-                                make_tuple
-                                                     (
-                                    make_tuple
-                                                      (0,bii,bjj,bkk),iii,jjj,kkk),bk,
-                                make_tuple
-                                                                                     (
-                                    make_tuple
-                                                                                      ( l,bbi,bbj,bbk),0,0,0));
-                        if(&tXformedOutGatherTiled(component_coord) !=
-                            outputData.data().get() + tGatherIndexTiled(coord) * IGEMM_Geometry::K + k)
-                            throw std::runtime_error("Inconsistent addresses");
-                    }
-#endif
+
+                        for (int bc = 0; bc < size<3,0>(tGatherIndexTiled); ++bc)
+                        for (int cc = 0; cc < size<1,0>(tGatherIndexTiled); ++cc)
+                        {
+                            //                     (((0,bii,bjj,bkk),iii,jjj,kkk),(cc,0,0,0),(( l,bbi,bbj,bbk),0,0,0),(bc,t,r,s))
+                            auto component_coord = 
+                                make_tuple         (
+                                    make_tuple      (
+                                        make_tuple   (0,bii,bjj,bkk),iii,jjj,kkk),
+                                    make_tuple                                    (cc,0,0,0),
+                                    make_tuple                                               (
+                                        make_tuple                                            ( l,bbi,bbj,bbk),0,0,0),
+                                    make_tuple                                                                        (bc,t,r,s));
+                            int c = bc * size<1,0>(tGatherIndexTiled) + cc;
+                            if(&tXformedActGatherTiled(component_coord) !=
+                                inputData.data().get() + tGatherIndexTiled(coord) * IGEMM_Geometry::C + c)
+                                throw std::runtime_error("Inconsistency detected between input activations and gather indices");
+                        }
                 }
 
 

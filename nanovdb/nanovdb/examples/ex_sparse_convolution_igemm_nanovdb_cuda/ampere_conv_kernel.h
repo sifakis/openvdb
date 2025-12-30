@@ -200,7 +200,7 @@ struct AmperePredicatedFprop {
         class TensorScatterIndex, class TensorScatterIndexLegacy>
     void __device__
     operator()(cute::Tensor<EngineFlt, GmemLayoutFlt> mFlt,       // ( K,        (C,T,R,S))
-        TensorActivation                              mAct,       // ((N,Z,P,Q), (C,T,R,S))
+        TensorActivation                              mAct_,      // ((N,Z,P,Q), (C,T,R,S))
         TensorActivationLegacy                        mActLegacy, // ((N,Z,P,Q), (C,T,R,S))
         TensorGatherIndex                             mGIx_,      // ((N,D,H,W), (C,1,1,1))
         TensorGatherIndexLegacy                       mGIxLegacy, // ((N,D,H,W), (C,1,1,1))
@@ -237,7 +237,7 @@ struct AmperePredicatedFprop {
         // NOTE: blockIdx.x projects onto act-NDHW mode, y along the flt-K mode for the sake of higher dynamic range in NDHW
         Tensor gA_mk = local_tile(mFlt, TilerFlt{}, make_coord(_,_));                            // (BLK_M,BLK_K,m',k')
         Tensor gBLegacy_nk = local_tile(mActLegacy, TilerActLegacy{}, make_coord(_,_));                      // (BLK_N,BLK_K,n',_1)
-        Tensor gB_nk = local_tile(mAct, TilerAct{}, make_coord(_,_));                      // (BLK_N,BLK_K,n',_1)
+        // Tensor gB_nk = local_tile(mAct, TilerAct{}, make_coord(_,_));                      // (BLK_N,BLK_K,n',_1)
         Tensor gG_nk = local_tile(mGIxLegacy, TilerGIx{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
 
         Tensor gCLegacy_mn = local_tile(mOutLegacy, TilerOutLegacy{}, make_coord(_,_));    // (BLK_M,BLK_N,m',n')
@@ -251,7 +251,7 @@ struct AmperePredicatedFprop {
             // print("shape(gBLegacy_nk)=");print(shape(gBLegacy_nk));print("\n");            
             // print("shape(mAct)=");print(shape(mAct));print("\n");
             // print("shape(TilerAct{})=");print(shape(TilerAct{}));print("\n");
-            print("\nshape(gB_nk)=");print(shape(gB_nk));print("\n");            
+            // print("\nshape(gB_nk)=");print(shape(gB_nk));print("\n");            
             print("shape(gS_mn)=");print(shape(gS_mn));print("\n");            
             print("shape(gSLegacy_mn)=");print(shape(gSLegacy_mn));print("\n");
             print("layout(accum)=");print(layout(accum));print("\n");
@@ -267,9 +267,9 @@ struct AmperePredicatedFprop {
 
         auto n_coord = idx2crd(int(blockIdx.x), shape<2>(gBLegacy_nk));
         // auto N_coord = idx2crd(int(blockIdx.x), make_layout(shape<2>(gB_nk), GenRowMajor{}));
-        auto N_coord = idx2crd(int(blockIdx.x), shape<2>(gB_nk));
-        auto test_stride = stride(make_layout(shape<2>(gB_nk), GenRowMajor{}));
-        auto NN_coord = idx2crd(int(blockIdx.x), shape<2>(gB_nk), test_stride);
+        // auto N_coord = idx2crd(int(blockIdx.x), shape<2>(gB_nk));
+        // auto test_stride = stride(make_layout(shape<2>(gB_nk), GenRowMajor{}));
+        // auto NN_coord = idx2crd(int(blockIdx.x), shape<2>(gB_nk), test_stride);
 
 #if 0
         if ((threadIdx.x == 0) && (blockIdx.x == 1) && (blockIdx.y == 0))
@@ -284,15 +284,15 @@ struct AmperePredicatedFprop {
 
         Tensor gA = gA_mk(_,_,m_coord,_);                                                        // (BLK_M,BLK_K,k')
         Tensor gBLegacy = gBLegacy_nk(_,_,n_coord,_);                                                        // (BLK_N,BLK_K,_1)
-        Tensor gB = gB_nk(_,_,NN_coord,_);
+        // Tensor gB = gB_nk(_,_,NN_coord,_);
         Tensor gG = gG_nk(_,_,n_coord,_);                                                        // (BLK_N,BLK_K,_1)
 
         Tensor gCLegacy = gCLegacy_mn(_,_,m_coord, n_coord);                                                  // (BLK_M,BLK_N)
-        Tensor gC       = gC_mn      (_,_,m_coord,NN_coord);                                                  // (BLK_M,BLK_N)
+        // Tensor gC       = gC_mn      (_,_,m_coord,NN_coord);                                                  // (BLK_M,BLK_N)
         Tensor gSLegacy = gSLegacy_mn(_,_,m_coord, n_coord);                                                  // (BLK_M,BLK_N)
-        Tensor gS       = gS_mn      (_,_,m_coord,NN_coord);                                                  // (BLK_M,BLK_N)
+        // Tensor gS       = gS_mn      (_,_,m_coord,NN_coord);                                                  // (BLK_M,BLK_N)
 
-#if 1
+#if 0
         auto blockLayout = make_layout(shape<1,0>(gS), GenRowMajor{});
         if ((threadIdx.x == 0) && (threadIdx.y == 0) & (threadIdx.z == 0))
         {
@@ -424,7 +424,7 @@ struct AmperePredicatedFprop {
         auto gmem_thr_copy_C = gmem_tiled_copy_C.get_slice(threadIdx.x);
         auto tDsC = gmem_thr_copy_C.partition_S(sC);
         auto tDgCLegacy = gmem_thr_copy_C.partition_D(gCLegacy);
-        auto tDgC = gmem_thr_copy_C.partition_D(gC);
+        // auto tDgC = gmem_thr_copy_C.partition_D(gC);
         auto tDsS = gmem_thr_copy_C.partition_D(sS);
 
         // copy   (gmem_tiled_copy_C,       tDsC, tDgCLegacy);

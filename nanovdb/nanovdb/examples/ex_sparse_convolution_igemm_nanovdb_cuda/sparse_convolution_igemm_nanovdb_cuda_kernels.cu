@@ -498,7 +498,7 @@ void mainSparseConvolutionIGEMM(
     using ConvOp = AmperePredicatedFprop<IGEMM_Geometry>;
 #ifdef USE_HIERARCHICAL_BLOCK_TRAVERSAL
     auto leafShape = make_shape(Int<IGEMM_Geometry::Bx>{},  Int<IGEMM_Geometry::By>{},  Int<IGEMM_Geometry::Bz>{});
-    auto blockedLeafShape = shape(zipped_divide(make_layout(leafShape), take<1,4>(ConvOp::Tiler_NN{})));
+    auto blockedLeafShape = shape(zipped_divide(make_layout(leafShape), take<1,4>(ConvOp::Tiler_N{})));
     auto blockedLeafLayout = make_ordered_layout(
         blockedLeafShape,
         make_tuple(make_tuple(_2{},_1{},_0{}),make_tuple(_5{},_4{},_3{})));
@@ -637,17 +637,8 @@ void mainSparseConvolutionIGEMM(
         auto offsetOrigin = origin.offsetBy(IGEMM_Geometry::Dx, IGEMM_Geometry::Dy, IGEMM_Geometry::Dz);
         for (int i = 0; i < IGEMM_Geometry::Hx; ++i)
         for (int j = 0; j < IGEMM_Geometry::Hy; ++j)
-        for (int k = 0; k < IGEMM_Geometry::Hz; ++k) {
+        for (int k = 0; k < IGEMM_Geometry::Hz; ++k)
             gatherIndexArray[l][i][j][k] = inputGrid->tree().getValue(offsetOrigin+nanovdb::Coord(i,j,k));
-            if (make_tuple(l,i,j,k) == make_tuple(0,0,2,1)) {
-                std::cout << std::endl;
-                std::cout << "===== DEBUG BEGIN =====" << std::endl;
-                std::cout << "gatherIndexArray[0][0][2][1] = " << gatherIndexArray[0][0][2][1] << std::endl;
-                std::cout << "&gatherIndexArray[0][0][2][1] - gatherIndexData.data().get() = " << &gatherIndexArray[0][0][2][1] - gatherIndexData.data().get() << std::endl;
-                std::cout << "====== DEBUG END ======" << std::endl;
-            }
-                    
-        }
     }
     gpuTimer.stop();
     
@@ -717,6 +708,7 @@ void mainSparseConvolutionIGEMM(
     );
 
 
+#if 0
     auto tXformedActGatherTiled = local_tile(tXformedActGather, ConvOp::TilerAct{}, make_coord(_,_));
     auto tGatherIndexTiled = local_tile(tGatherIndex, ConvOp::TilerAct{}, make_coord(_,_));
     // print("tXformedActGather.layout() = ");print(tXformedActGather.layout());print("\n");
@@ -766,8 +758,7 @@ void mainSparseConvolutionIGEMM(
                                 throw std::runtime_error("Inconsistency detected between input activations and gather indices");
                         }
                 }
-
-
+#endif
 
 #if 0
     for (int n = 0; n < blockCount; ++n)
@@ -832,16 +823,14 @@ void mainSparseConvolutionIGEMM(
         layouts.scatterIndexLayout(outputLeafCount)
     );
     
+#if 0
     auto tXformedOutScatterTiled = local_tile(tXformedOutScatter, ConvOp::TilerOut{}, make_coord(_,_));
     auto tScatterIndexTiled = local_tile(tScatterIndex, ConvOp::TilerOut{}, make_coord(_,_));
-    print("TilerOutLegacy{} = ");print(ConvOp::TilerOutLegacy{});print("\n");
-    print("TilerOut{} = ");print(ConvOp::TilerOut{});print("\n");
     // print("tXformedOutScatter.layout() = ");print(tXformedOutScatter.layout());print("\n");
     // print("tXformedOutScatterTiled.layout() = ");print(tXformedOutScatterTiled.layout());print("\n");
-     print("tScatterIndex.layout() = ");print(tScatterIndex.layout());print("\n");
-    print("tScatterIndexTiled.layout() = ");print(tScatterIndexTiled.layout());print("\n");
+    // print("tScatterIndex.layout() = ");print(tScatterIndex.layout());print("\n");
+    // print("tScatterIndexTiled.layout() = ");print(tScatterIndexTiled.layout());print("\n");
 
-#if 1
     for (int l = 0; l < outputLeafCount; ++l)
         for (int bbi = 0; bbi < size<3,0,1>(tScatterIndexTiled); ++bbi)
         for (int bbj = 0; bbj < size<3,0,2>(tScatterIndexTiled); ++bbj)
@@ -853,17 +842,18 @@ void mainSparseConvolutionIGEMM(
                 for (int jjj = 0; jjj < size<1,2>(tScatterIndexTiled); ++jjj)
                 for (int kkk = 0; kkk < size<1,3>(tScatterIndexTiled); ++kkk)
                 {
-                    auto coord = 
-                    make_tuple
-                                          (0,
+                    auto coord =
                         make_tuple
-                                             (
+                                           (0,
                             make_tuple
-                                              (0,bii,bjj,bkk),iii,jjj,kkk),0,
-                        make_tuple
-                                                                             (
+                                              (
+                                make_tuple
+                                               (0,bii,bjj,bkk),iii,jjj,kkk),0,
                             make_tuple
-                                                                              ( l,bbi,bbj,bbk),0,0,0));
+                                                                              (
+                                make_tuple
+                                                                               ( l,bbi,bbj,bbk),0,0,0));
+
                     for (int bk = 0; bk < size<2>(tScatterIndexTiled); ++bk)
                     for (int kk = 0; kk < size<0>(tScatterIndexTiled); ++kk)
                     {

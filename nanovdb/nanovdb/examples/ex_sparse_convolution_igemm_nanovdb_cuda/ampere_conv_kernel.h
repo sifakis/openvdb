@@ -202,7 +202,7 @@ struct AmperePredicatedFprop {
     operator()(cute::Tensor<EngineFlt, GmemLayoutFlt> mFlt,       // ( K,        (C,T,R,S))
         TensorActivation                              mAct,       // ((N,Z,P,Q), (C,T,R,S))
         TensorActivationLegacy                        mActLegacy, // ((N,Z,P,Q), (C,T,R,S))
-        TensorGatherIndex                             mGIx_,      // ((N,D,H,W), (C,1,1,1))
+        TensorGatherIndex                             mGIx,       // ((N,D,H,W), (C,1,1,1))
         TensorGatherIndexLegacy                       mGIxLegacy, // ((N,D,H,W), (C,1,1,1))
         TensorOutput                                  mOut,       // ( K,        (N,Z,P,Q))
         TensorOutputLegacy                            mOutLegacy, // ( K,        (N,Z,P,Q))
@@ -256,8 +256,9 @@ struct AmperePredicatedFprop {
         Tensor gA_mk = local_tile(mFlt, TilerFlt{}, make_coord(_,_));                      // (BLK_M,BLK_K,m',k')
         Tensor gBLegacy_nk = local_tile(mActLegacy, TilerActLegacy{}, make_coord(_,_));    // (BLK_N,BLK_K,n',_1)
         Tensor gB_nk = local_tile(mAct, TilerAct{}, make_coord(_,_));                      // (BLK_N,BLK_K,n',_1)
-
         Tensor gBIdxLegacy_nk = local_tile(mGIxLegacy, TilerGatherIdxLegacy{}, make_coord(_,_));    // (BLK_N,BLK_K,n',_1)
+        Tensor gBIdx_nk = local_tile(mGIx, TilerAct{}, make_coord(_,_));    // (BLK_N,BLK_K,n',_1)
+
         Tensor gCLegacy_mn = local_tile(mOutLegacy, TilerOutLegacy{}, make_coord(_,_));    // (BLK_M,BLK_N,m',n')
         Tensor gC_mn       = local_tile(      mOut,       TilerOut{}, make_coord(_,_));    // (BLK_M,BLK_N,m',n')
         Tensor gSLegacy_mn = local_tile(mSIxLegacy, TilerOutLegacy{}, make_coord(_,_));    // (BLK_M,BLK_N,m',n')
@@ -306,6 +307,7 @@ struct AmperePredicatedFprop {
         Tensor gBLegacy = gBLegacy_nk(_,_,nl_coord,_);                                           // (BLK_N,BLK_K,_1)
         Tensor gB = gB_nk(_,_,n_coord,_);                                                       // (BLK_N,BLK_K,_1)
         Tensor gBIdxLegacy = gBIdxLegacy_nk(_,_,nl_coord,_);                                                        // (BLK_N,BLK_K,_1)
+        Tensor gBIdx = gBIdx_nk(_,_,n_coord,_);                                                        // (BLK_N,BLK_K,_1)
 
         Tensor gCLegacy = gCLegacy_mn(_,_,m_coord, nl_coord);                                                  // (BLK_M,BLK_N)
         // Tensor gC       = gC_mn      (_,_,m_coord,NN_coord);                                                  // (BLK_M,BLK_N)
@@ -343,6 +345,10 @@ struct AmperePredicatedFprop {
                                         make_tuple                                               (bc,t,r,s));
                                 if (gB(coord) != gBLegacy(coordLegacy))
                                     printf("Inconsistency between gB and gBLegacy!\n");
+                                // int c = bc * size<1,0>(gB) + cc;
+                                // if (&gB(coord) - &gB(0) !=
+                                //     gBIdx(coord) - gBIdx(0))
+                                //     printf("Inconsistency between gB and gBIdx!\n");
                         }
                 }
         }

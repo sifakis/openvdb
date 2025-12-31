@@ -108,7 +108,7 @@ struct AmperePredicatedFprop {
             struct {
                 ElementFlt sAMatrix[size(TileM{}) * size(TileK{}) * size(PIPE{})];
                 ElementAct sBMatrix[size(TileNL{}) * size(TileK{}) * size(PIPE{})];
-                bool       sGpMatrix[size(TilePL{})]; // Gather predicate        
+                bool       sBPredMatrix[size(TilePL{})]; // Gather predicate        
             } mainloopLegacy;
 
             struct {
@@ -257,7 +257,7 @@ struct AmperePredicatedFprop {
         Tensor gBLegacy_nk = local_tile(mActLegacy, TilerActLegacy{}, make_coord(_,_));    // (BLK_N,BLK_K,n',_1)
         Tensor gB_nk = local_tile(mAct, TilerAct{}, make_coord(_,_));                      // (BLK_N,BLK_K,n',_1)
 
-        Tensor gG_nk = local_tile(mGIxLegacy, TilerGatherIdxLegacy{}, make_coord(_,_));    // (BLK_N,BLK_K,n',_1)
+        Tensor gBIdxLegacy_nk = local_tile(mGIxLegacy, TilerGatherIdxLegacy{}, make_coord(_,_));    // (BLK_N,BLK_K,n',_1)
         Tensor gCLegacy_mn = local_tile(mOutLegacy, TilerOutLegacy{}, make_coord(_,_));    // (BLK_M,BLK_N,m',n')
         Tensor gC_mn       = local_tile(      mOut,       TilerOut{}, make_coord(_,_));    // (BLK_M,BLK_N,m',n')
         Tensor gSLegacy_mn = local_tile(mSIxLegacy, TilerOutLegacy{}, make_coord(_,_));    // (BLK_M,BLK_N,m',n')
@@ -287,8 +287,9 @@ struct AmperePredicatedFprop {
         auto nl_coord = idx2crd(int(blockIdx.x), shape<2>(gBLegacy_nk));
         // auto N_coord = idx2crd(int(blockIdx.x), make_layout(shape<2>(gB_nk), GenRowMajor{}));
         // auto N_coord = idx2crd(int(blockIdx.x), shape<2>(gB_nk));
+        auto n_layout = make_layout(shape<2>(gB_nk), GenRowMajor{});
         // auto test_stride = stride(make_layout(shape<2>(gB_nk), GenRowMajor{}));
-        // auto NN_coord = idx2crd(int(blockIdx.x), shape<2>(gB_nk), test_stride);
+        auto n_coord = idx2crd(int(blockIdx.x), shape(n_layout), stride(n_layout));
 
 #if 0
         if ((threadIdx.x == 0) && (blockIdx.x == 1) && (blockIdx.y == 0))
@@ -302,15 +303,52 @@ struct AmperePredicatedFprop {
 #endif
 
         Tensor gA = gA_mk(_,_,m_coord,_);                                                        // (BLK_M,BLK_K,k')
-        Tensor gBLegacy = gBLegacy_nk(_,_,nl_coord,_);                                                        // (BLK_N,BLK_K,_1)
-        // Tensor gB = gB_nk(_,_,NN_coord,_);
-        Tensor gG = gG_nk(_,_,nl_coord,_);                                                        // (BLK_N,BLK_K,_1)
+        Tensor gBLegacy = gBLegacy_nk(_,_,nl_coord,_);                                           // (BLK_N,BLK_K,_1)
+        Tensor gB = gB_nk(_,_,n_coord,_);                                                       // (BLK_N,BLK_K,_1)
+        Tensor gBIdxLegacy = gBIdxLegacy_nk(_,_,nl_coord,_);                                                        // (BLK_N,BLK_K,_1)
 
         Tensor gCLegacy = gCLegacy_mn(_,_,m_coord, nl_coord);                                                  // (BLK_M,BLK_N)
         // Tensor gC       = gC_mn      (_,_,m_coord,NN_coord);                                                  // (BLK_M,BLK_N)
         Tensor gSLegacy = gSLegacy_mn(_,_,m_coord, nl_coord);                                                  // (BLK_M,BLK_N)
         // Tensor gS       = gS_mn      (_,_,m_coord,NN_coord);                                                  // (BLK_M,BLK_N)
 
+#if 1
+        if((threadIdx.x == 0) && (threadIdx.y == 0) & (threadIdx.z == 0)) {
+                for (int bii = 0; bii < size<0,0,1>(gB); ++bii)
+                for (int bjj = 0; bjj < size<0,0,2>(gB); ++bjj)
+                for (int bkk = 0; bkk < size<0,0,3>(gB); ++bkk) {
+                    auto blockLayout = make_layout(shape<0,0>(gB), GenRowMajor{});
+                    int n = blockLayout(make_tuple(0,bii,bjj,bkk));
+                    for (int iii = 0; iii < size<0,1>(gB); ++iii)
+                    for (int jjj = 0; jjj < size<0,2>(gB); ++jjj)
+                    for (int kkk = 0; kkk < size<0,3>(gB); ++kkk)
+                        for (int t = 0; t < size<2,1>(gB); ++t)
+                        for (int r = 0; r < size<2,2>(gB); ++r)
+                        for (int s = 0; s < size<2,3>(gB); ++s)
+                            for (int bc = 0; bc < size<2,0>(gB); ++bc)
+                            for (int cc = 0; cc < size<1,0>(gB); ++cc) {
+                                //                     (((0,bii,bjj,bkk),iii,jjj,kkk),(cc,0,0,0),(bc,t,r,s))
+                                auto coord =
+                                    make_tuple         (
+                                        make_tuple      (
+                                            make_tuple
+                                                         (0,bii,bjj,bkk),iii,jjj,kkk),
+                                        make_tuple                                    (cc,0,0,0),
+                                        make_tuple                                               (bc,t,r,s));
+                                //                     ((              n,iii,jjj,kkk),(cc,0,0,0),(bc,t,r,s))
+                                auto coordLegacy =
+                                    make_tuple         (
+                                        make_tuple      (              n,iii,jjj,kkk),
+                                        make_tuple                                    (cc,0,0,0),
+                                        make_tuple                                               (bc,t,r,s));
+                                if (gB(coord) != gBLegacy(coordLegacy))
+                                    printf("Inconsistency between gB and gBLegacy!\n");
+                        }
+                }
+        }
+        __syncthreads();
+#endif
+        
 #if 0
         auto blockLayout = make_layout(shape<1,0>(gS), GenRowMajor{});
         if ((threadIdx.x == 0) && (threadIdx.y == 0) & (threadIdx.z == 0))
@@ -380,8 +418,8 @@ struct AmperePredicatedFprop {
 
         // Build gather predicate tensor in SMEM
         static_assert(size(TilePL{}) % MaxThreadsPerBlock == 0);
-        auto sG_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->mainloopLegacy.sGpMatrix[0];
-        auto gG_ptr = gG.data();
+        auto sBIdxLegacy_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->mainloopLegacy.sBPredMatrix[0];
+        auto gBIdxLegacy_ptr = gBIdxLegacy.data();
         auto gather_predicate_layout = make_layout(
             shape(gBLegacy),
             make_stride(
@@ -389,8 +427,8 @@ struct AmperePredicatedFprop {
                 make_stride(       _0{},    _0{}, _0{}, _0{}),
                 make_stride(       _0{}, H{}*W{},  W{}, _1{})));
         for (int i = 0; i < size(TilePL{}); i += MaxThreadsPerBlock)
-            sG_ptr[i+threadIdx.x] = gG_ptr[i+threadIdx.x];
-        Tensor sG = make_tensor(make_smem_ptr(sG_ptr), gather_predicate_layout);    
+            sBIdxLegacy_ptr[i+threadIdx.x] = gBIdxLegacy_ptr[i+threadIdx.x];
+        Tensor sBIdxLegacy = make_tensor(make_smem_ptr(sBIdxLegacy_ptr), gather_predicate_layout);    
 
         // Build scatter predicate tensor in SMEM
         static_assert(size(TileNL{}) <= MaxThreadsPerBlock);
@@ -416,7 +454,7 @@ struct AmperePredicatedFprop {
             // accum,
             gA,
             gBLegacy,
-            sG,
+            sBIdxLegacy,
             accumLegacy,
             // accum,
             k_tile_iter, k_tile_count,

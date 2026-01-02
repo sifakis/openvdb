@@ -87,6 +87,7 @@ struct AmperePredicatedFprop {
     using TilerOutLegacy = Shape<TileM, TileNL>;
 
     using TileSizeM = Int<size(TileM{})>;
+    using TileSizeN = Int<size(TileN{})>;
     using TileSizeNL = Int<size(TileNL{})>;
     using TileSizeK = Int<size(TileK{})>;
     static constexpr int Stages = PIPE::value;
@@ -113,7 +114,8 @@ struct AmperePredicatedFprop {
 
             struct {
                 ElementOut sCMatrix[size(TileM{}) * size(TileNL{})];
-            } epilogueLegacy;
+                ElementOut sCMatrixLegacy[size(TileM{}) * size(TileNL{})];
+            } epilogue;
         };
 
         bool sBPredMatrix[SettingsT::Hx*SettingsT::Hy*SettingsT::Hz];
@@ -190,7 +192,8 @@ struct AmperePredicatedFprop {
     using SmemCopyAtomOut = Copy_Atom<UniversalCopy<uint32_t>, ElementOut>;
 
     // This can be optimized to make accesses BCF, but we use a col-major layout here to show off composability
-    using SmemLayoutOut = Layout<Shape<TileSizeM, TileSizeNL>>;
+    using SmemLayoutOut       = Layout<Shape<TileSizeM, TileSizeN>>;
+    using SmemLayoutOutLegacy = Layout<Shape<TileSizeM, TileSizeNL>>;
 
     //
     // Conv functor (predicated IGEMM)
@@ -266,7 +269,7 @@ struct AmperePredicatedFprop {
         Tensor gCLegacy_mn = local_tile(mOutLegacy, TilerOutLegacy{}, make_coord(_,_));    // (BLK_M,BLK_N,m',n')
         Tensor gC_mn       = local_tile(      mOut,       TilerOut{}, make_coord(_,_));    // (BLK_M,BLK_N,m',n')
         Tensor gSLegacy_mn = local_tile(mSIxLegacy, TilerOutLegacy{}, make_coord(_,_));    // (BLK_M,BLK_N,m',n')
-        Tensor gS_mn       = local_tile(      mSIx,       TilerOut{}, make_coord(_,_));    // (BLK_M,BLK_N,m',n')
+        // Tensor gS_mn       = local_tile(      mSIx,       TilerOut{}, make_coord(_,_));    // (BLK_M,BLK_N,m',n')
 
 #if 0
         if (thread0() && block0()) {
@@ -314,7 +317,7 @@ struct AmperePredicatedFprop {
         Tensor gBIdx = gBIdx_nk(_,_,n_coord,_);                                                        // (BLK_N,BLK_K,_1)
 
         Tensor gCLegacy = gCLegacy_mn(_,_,m_coord, nl_coord);                                                  // (BLK_M,BLK_N)
-        // Tensor gC       = gC_mn      (_,_,m_coord,NN_coord);                                                  // (BLK_M,BLK_N)
+        Tensor gC       = gC_mn      (_,_,m_coord,  n_coord);                                                  // (BLK_M,BLK_N)
         Tensor gSLegacy = gSLegacy_mn(_,_,m_coord, nl_coord);                                                  // (BLK_M,BLK_N)
         // Tensor gS       = gS_mn      (_,_,m_coord,NN_coord);                                                  // (BLK_M,BLK_N)
 
@@ -342,7 +345,7 @@ struct AmperePredicatedFprop {
         
         __syncthreads();
 
-#if 1
+#if 0
         if(thread0()) {
             print("\n");
             print("sBPredLegacy.layout()=");print(sBPredLegacy.layout());print("\n");
@@ -405,11 +408,13 @@ struct AmperePredicatedFprop {
 
         __syncthreads();
 
+#if 0
         if (thread0())
         {
             print("accumLegacy.layout()=");print(accumLegacy.layout());print("\n");
             print("accum.layout()=");print(accum.layout());print("\n");
         }
+#endif
 
         auto k_tile_iter = cute::make_coord_iterator(size<2>(gA));
         auto k_tile_iterLegacy = cute::make_coord_iterator(size<2>(gA));
@@ -429,7 +434,7 @@ struct AmperePredicatedFprop {
             threadIdx.x,
             smem_buf);
 
- #if 1
+ #if 0
         // ++k_tile_iterLegacy;
         CollectiveMainloopLegacy collective_mmaLegacy;
         collective_mmaLegacy(
@@ -446,6 +451,7 @@ struct AmperePredicatedFprop {
             smem_buf);
 #endif
 
+#if 0
         if (thread0()) {
             auto debug_iter = cute::make_coord_iterator(shape(accum));
             for (int i = 0; i < size(accum); ++i, ++debug_iter)
@@ -455,32 +461,54 @@ struct AmperePredicatedFprop {
                     printf("Inconsistency between accum (%f) and accumLegacy (%f)\n", accum(*debug_iter), accumLegacy(*debug_iter));
             }
         }
-        
+#endif
+
         //
         // Epilogue
         //
         SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
-        Tensor sC = make_tensor(make_smem_ptr(&storage.epilogueLegacy.sCMatrix[0]), SmemLayoutOut{});
+        Tensor sCLegacy = make_tensor(make_smem_ptr(&storage.epilogue.sCMatrixLegacy[0]), SmemLayoutOutLegacy{});
+        Tensor sC = make_tensor(make_smem_ptr(&storage.epilogue.sCMatrix[0]), SmemLayoutOut{});
 
         auto smem_tiled_copy_C = make_tiled_copy_C(SmemCopyAtomOut{}, tiled_mma);
         auto smem_thr_copy_C = smem_tiled_copy_C.get_slice(threadIdx.x);
-        auto tCrC = smem_thr_copy_C.retile_S(accumLegacy);
-        // auto tCrC = smem_thr_copy_C.retile_S(accum);
+        auto tCrCLegacy = smem_thr_copy_C.retile_S(accumLegacy);
+        auto tCrC = smem_thr_copy_C.retile_S(accum);
+        auto tCsCLegacy = smem_thr_copy_C.partition_D(sCLegacy);
         auto tCsC = smem_thr_copy_C.partition_D(sC);
+        copy(smem_tiled_copy_C, tCrCLegacy, tCsCLegacy);
         copy(smem_tiled_copy_C, tCrC, tCsC);
 
         __syncthreads();
 
+ #if 0
+        if (thread0()) {
+            print("\n");
+            print("shape(sCLegacy) = ");print(shape(sCLegacy));print("\n");
+            print("shape(sC) = ");print(shape(sC));print("\n");
+            print("sCLegacy=\n");
+            print_tensor(sCLegacy);
+            print("sC=\n");
+            print_tensor(sC);
+        }
+#endif
+
         GmemTiledCopyOut gmem_tiled_copy_C;
         auto gmem_thr_copy_C = gmem_tiled_copy_C.get_slice(threadIdx.x);
+        auto tDsCLegacy = gmem_thr_copy_C.partition_S(sCLegacy);
         auto tDsC = gmem_thr_copy_C.partition_S(sC);
         auto tDgCLegacy = gmem_thr_copy_C.partition_D(gCLegacy);
+        auto tDgC = gmem_thr_copy_C.partition_D(gC);
         // auto tDgC = gmem_thr_copy_C.partition_D(gC);
-        auto tDsS = gmem_thr_copy_C.partition_D(sS);
+        // auto tDsS = gmem_thr_copy_C.partition_D(sS);
 
         // copy   (gmem_tiled_copy_C,       tDsC, tDgCLegacy);
         // copy   (gmem_tiled_copy_C,       tDsC, tDgC);
-        copy_if(gmem_tiled_copy_C, tDsS, tDsC, tDgCLegacy);
+
+        // copy   (gmem_tiled_copy_C,       tDsCLegacy, tDgCLegacy);
+        copy   (gmem_tiled_copy_C,       tDsC, tDgC);
+
+        // copy_if(gmem_tiled_copy_C, tDsS, tDsCLegacy, tDgCLegacy);
         // copy_if(gmem_tiled_copy_C, tDsS, tDsC, tDgC);
     }
 };

@@ -109,8 +109,8 @@ struct AmperePredicatedFprop {
             struct {
                 ElementFlt sAMatrix[size(TileM{}) * size(TileK{}) * size(PIPE{})];
                 ElementAct sBMatrix[size(TileNL{}) * size(TileK{}) * size(PIPE{})];
-                bool       sBPredMatrix[size(TilePL{})]; // Gather predicate        
-            } mainloopLegacy;
+                bool       sBPredMatrixLegacy[size(TilePL{})]; // Gather predicate        
+            } mainloop;
 
             struct {
                 ElementOut sCMatrix[size(TileM{}) * size(TileNL{})];
@@ -118,8 +118,9 @@ struct AmperePredicatedFprop {
             } epilogue;
         };
 
-        bool sBPredMatrix[SettingsT::Hx*SettingsT::Hy*SettingsT::Hz];
-        bool sSpMatrix[size(TileNL{})]; // Scatter predicate
+        bool sBPredMatrix[SettingsT::VoxelsPerLeafnodeWithHalo()];
+        bool sCPredMatrix[SettingsT::VoxelsPerLeafnodeNoHalo()];
+        bool sCPredMatrixLegacy[size(TileNL{})]; // Scatter predicate
     };
 
     //
@@ -269,46 +270,13 @@ struct AmperePredicatedFprop {
         Tensor gCLegacy_mn = local_tile(mOutLegacy, TilerOutLegacy{}, make_coord(_,_));    // (BLK_M,BLK_N,m',n')
         Tensor gC_mn       = local_tile(      mOut,       TilerOut{}, make_coord(_,_));    // (BLK_M,BLK_N,m',n')
         Tensor gSLegacy_mn = local_tile(mSIxLegacy, TilerOutLegacy{}, make_coord(_,_));    // (BLK_M,BLK_N,m',n')
-        // Tensor gS_mn       = local_tile(      mSIx,       TilerOut{}, make_coord(_,_));    // (BLK_M,BLK_N,m',n')
+        Tensor gCIdx_mn    = local_tile(      mSIx,       TilerOut{}, make_coord(_,_));    // (BLK_M,BLK_N,m',n')        
 
-#if 0
-        if (thread0() && block0()) {
-            // print("shape(mActLegacy)=");print(shape(mActLegacy));print("\n");
-            // print("shape(TilerActLegacy{})=");print(shape(TilerActLegacy{}));print("\n");
-            // print("shape(gBLegacy_nk)=");print(shape(gBLegacy_nk));print("\n");            
-            // print("shape(mAct)=");print(shape(mAct));print("\n");
-            // print("shape(TilerAct{})=");print(shape(TilerAct{}));print("\n");
-            // print("\nshape(gB_nk)=");print(shape(gB_nk));print("\n");            
-            print("shape(gS_mn)=");print(shape(gS_mn));print("\n");            
-            print("shape(gSLegacy_mn)=");print(shape(gSLegacy_mn));print("\n");
-            print("layout(accum)=");print(layout(accum));print("\n");
-            print("layout(accumLegacy)=");print(layout(accum));print("\n");
-            
-        }
-        // __syncthreads();
-#endif
         // Compute m_coord and n_coord with their post-tiled shapes
         auto m_coord = idx2crd(int(blockIdx.y), shape<2>(gA_mk));
-
-
-
         auto nl_coord = idx2crd(int(blockIdx.x), shape<2>(gBLegacy_nk));
-        // auto N_coord = idx2crd(int(blockIdx.x), make_layout(shape<2>(gB_nk), GenRowMajor{}));
-        // auto N_coord = idx2crd(int(blockIdx.x), shape<2>(gB_nk));
         auto n_layout = make_layout(shape<2>(gB_nk), GenRowMajor{});
-        // auto test_stride = stride(make_layout(shape<2>(gB_nk), GenRowMajor{}));
         auto n_coord = idx2crd(int(blockIdx.x), shape(n_layout), stride(n_layout));
-
-#if 0
-        if ((threadIdx.x == 0) && (blockIdx.x == 1) && (blockIdx.y == 0))
-        {
-            print("blockIdx.x = ");print(blockIdx.x);
-            print(", nl_coord = ");print(nl_coord);
-            print(", N_coord = ");print(N_coord);
-            print("\n");
-        }
-        __syncthreads();
-#endif
 
         Tensor gA = gA_mk(_,_,m_coord,_);                                                        // (BLK_M,BLK_K,k')
         Tensor gBLegacy = gBLegacy_nk(_,_,nl_coord,_);                                           // (BLK_N,BLK_K,_1)
@@ -319,11 +287,11 @@ struct AmperePredicatedFprop {
         Tensor gCLegacy = gCLegacy_mn(_,_,m_coord, nl_coord);                                                  // (BLK_M,BLK_N)
         Tensor gC       = gC_mn      (_,_,m_coord,  n_coord);                                                  // (BLK_M,BLK_N)
         Tensor gSLegacy = gSLegacy_mn(_,_,m_coord, nl_coord);                                                  // (BLK_M,BLK_N)
-        // Tensor gS       = gS_mn      (_,_,m_coord,NN_coord);                                                  // (BLK_M,BLK_N)
+        Tensor gCIdx    = gCIdx_mn   (_,_,m_coord,  n_coord);
 
         // Build gather predicate tensor in SMEM
         static_assert(size(TilePL{}) % MaxThreadsPerBlock == 0);
-        auto sBPredLegacy_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->mainloopLegacy.sBPredMatrix[0];
+        auto sBPredLegacy_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->mainloop.sBPredMatrixLegacy[0];
         auto gBIdxLegacy_ptr = gBIdxLegacy.data();
         auto gather_predicate_layout = make_layout(
             shape(gBLegacy),
@@ -343,59 +311,113 @@ struct AmperePredicatedFprop {
             if (i+threadIdx.x < sBPred_cosize)
                 sBPred_ptr[i+threadIdx.x] = gBIdx_ptr[i+threadIdx.x];
         
+        static_assert(SettingsT::VoxelsPerLeafnodeNoHalo() % MaxThreadsPerBlock == 0);
+        auto sCPred_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sCPredMatrix[0];
+        auto gCIdx_ptr = gCIdx.data();
+        Tensor sCPred = make_tensor(make_smem_ptr(sCPred_ptr), gCIdx.layout());
+        for (int i = 0; i < SettingsT::VoxelsPerLeafnodeNoHalo(); i += MaxThreadsPerBlock)
+            sCPred_ptr[i+threadIdx.x] = gCIdx_ptr[i+threadIdx.x];
+
         __syncthreads();
 
 #if 0
         if(thread0()) {
             print("\n");
-            print("sBPredLegacy.layout()=");print(sBPredLegacy.layout());print("\n");
-            print("sBPred.layout()=");print(sBPred.layout());print("\n");
+            // print("sBPredLegacy.layout()=");print(sBPredLegacy.layout());print("\n");
+            // print("sBPred.layout()=");print(sBPred.layout());print("\n");
+            print("gCLegacy.layout()=");print(gCLegacy.layout());print("\n");
+            print("gC.layout()=");print(gC.layout());print("\n");            
+            print("gC_mn.layout()=");print(gC_mn.layout());print("\n");            
         }
 
         if((threadIdx.x == 0) && (threadIdx.y == 0) & (threadIdx.z == 0)) {
-                for (int bii = 0; bii < size<0,0,1>(gB); ++bii)
-                for (int bjj = 0; bjj < size<0,0,2>(gB); ++bjj)
-                for (int bkk = 0; bkk < size<0,0,3>(gB); ++bkk) {
-                    auto blockLayout = make_layout(shape<0,0>(gB), GenRowMajor{});
-                    int n = blockLayout(make_tuple(0,bii,bjj,bkk));
-                    for (int iii = 0; iii < size<0,1>(gB); ++iii)
-                    for (int jjj = 0; jjj < size<0,2>(gB); ++jjj)
-                    for (int kkk = 0; kkk < size<0,3>(gB); ++kkk)
-                        for (int t = 0; t < size<2,1>(gB); ++t)
-                        for (int r = 0; r < size<2,2>(gB); ++r)
-                        for (int s = 0; s < size<2,3>(gB); ++s)
-                            for (int bc = 0; bc < size<2,0>(gB); ++bc)
-                            for (int cc = 0; cc < size<1,0>(gB); ++cc) {
-                                //                     (((0,bii,bjj,bkk),iii,jjj,kkk),(cc,0,0,0),(bc,t,r,s))
-                                auto coord =
-                                    make_tuple         (
-                                        make_tuple      (
-                                            make_tuple
-                                                         (0,bii,bjj,bkk),iii,jjj,kkk),
-                                        make_tuple                                    (cc,0,0,0),
-                                        make_tuple                                               (bc,t,r,s));
-                                //                     ((              n,iii,jjj,kkk),(cc,0,0,0),(bc,t,r,s))
-                                auto coordLegacy =
-                                    make_tuple         (
-                                        make_tuple      (              n,iii,jjj,kkk),
-                                        make_tuple                                    (cc,0,0,0),
-                                        make_tuple                                               (bc,t,r,s));
-                                if (gB(coord) != gBLegacy(coordLegacy))
-                                    printf("Inconsistency between gB and gBLegacy!\n");
-                                int c = bc * size<1,0>(gB) + cc;
-                                if (&gB(coord) != actData + gBIdx(coord) * SettingsT::C + c)
-                                    printf("Inconsistency between gB and gBIdx!\n");
-                                if (sBPred(coord) != sBPredLegacy(coordLegacy))
-                                    printf("Inconsistency between sBPred and sBPredLegacy!\n");
-                        }
+        // if(thread0()){
+            for (int bii = 0; bii < size<0,0,1>(gB); ++bii)
+            for (int bjj = 0; bjj < size<0,0,2>(gB); ++bjj)
+            for (int bkk = 0; bkk < size<0,0,3>(gB); ++bkk) {
+                auto blockLayout = make_layout(shape<0,0>(gB), GenRowMajor{});
+                int n = blockLayout(make_tuple(0,bii,bjj,bkk));
+                for (int iii = 0; iii < size<0,1>(gB); ++iii)
+                for (int jjj = 0; jjj < size<0,2>(gB); ++jjj)
+                for (int kkk = 0; kkk < size<0,3>(gB); ++kkk)
+                    for (int t = 0; t < size<2,1>(gB); ++t)
+                    for (int r = 0; r < size<2,2>(gB); ++r)
+                    for (int s = 0; s < size<2,3>(gB); ++s)
+                        for (int bc = 0; bc < size<2,0>(gB); ++bc)
+                        for (int cc = 0; cc < size<1,0>(gB); ++cc) {
+                            //                     (((0,bii,bjj,bkk),iii,jjj,kkk),(cc,0,0,0),(bc,t,r,s))
+                            auto coord =
+                                make_tuple         (
+                                    make_tuple      (
+                                        make_tuple
+                                                     (0,bii,bjj,bkk),iii,jjj,kkk),
+                                    make_tuple                                    (cc,0,0,0),
+                                    make_tuple                                               (bc,t,r,s));
+                            //                     ((              n,iii,jjj,kkk),(cc,0,0,0),(bc,t,r,s))
+                            auto coordLegacy =
+                                make_tuple         (
+                                    make_tuple      (              n,iii,jjj,kkk),
+                                    make_tuple                                    (cc,0,0,0),
+                                    make_tuple                                               (bc,t,r,s));
+                            if (gB(coord) != gBLegacy(coordLegacy))
+                                printf("Inconsistency between gB and gBLegacy!\n");
+                            int c = bc * size<1,0>(gB) + cc;
+                            if (&gB(coord) != actData + gBIdx(coord) * SettingsT::C + c)
+                                printf("Inconsistency between gB and gBIdx!\n");
+                            if (sBPred(coord) != sBPredLegacy(coordLegacy))
+                                printf("Inconsistency between sBPred and sBPredLegacy!\n");
+                    }
+            }
+        
+
+            for (int bii = 0; bii < size<1,0,1>(gC); ++bii)
+            for (int bjj = 0; bjj < size<1,0,2>(gC); ++bjj)
+            for (int bkk = 0; bkk < size<1,0,3>(gC); ++bkk) {
+                auto blockLayout = make_layout(shape<1,0>(gC), GenRowMajor{});
+                int n = blockLayout(make_tuple(0,bii,bjj,bkk));
+                for (int iii = 0; iii < size<1,1>(gC); ++iii)
+                for (int jjj = 0; jjj < size<1,2>(gC); ++jjj)
+                for (int kkk = 0; kkk < size<1,3>(gC); ++kkk)
+                    for (int kk = 0; kk < size<0>(gC); ++kk) {
+                        //                     (kk,((0,bii,bjj,bkk),iii,jjj,kkk))
+                        auto coord =
+                            make_tuple         (kk,
+                                make_tuple         (
+                                    make_tuple
+                                                    (0,bii,bjj,bkk),iii,jjj,kkk));
+                        //                     (kk,(              n,iii,jjj,kkk))
+                        auto coordLegacy =
+                            make_tuple         (kk,
+                                make_tuple         (              n,iii,jjj,kkk));
+                        if (gC(coord) != gCLegacy(coordLegacy))
+                            printf("Inconsistency between gC and gCLegacy!\n");
+                        int k = m_coord * size<0>(gC) + kk;
+                        if (&gC(coord) != outData + gCIdx(coord) * SettingsT::K + k)
+                            printf("Inconsistency between gC and gCIdx!\n");
+                        if (sCPred(coord) != (gCIdx(coord) != 0))
+                            printf("Inconsistency between sCPred and gCIdx!\n");
+#if 0
+                        auto coordLegacy =
+                            make_tuple         (
+                                make_tuple      (              n,iii,jjj,kkk),
+                                make_tuple                                    (cc,0,0,0),
+                                make_tuple                                               (bc,t,r,s));
+                        int c = bc * size<1,0>(gB) + cc;
+                        if (&gB(coord) != actData + gBIdx(coord) * SettingsT::C + c)
+                            printf("Inconsistency between gB and gBIdx!\n");
+                        if (sBPred(coord) != sBPredLegacy(coordLegacy))
+                            printf("Inconsistency between sBPred and sBPredLegacy!\n");
+#endif
                 }
+            }
+
         }
         __syncthreads();
 #endif
         
         // Build scatter predicate tensor in SMEM
         static_assert(size(TileNL{}) <= MaxThreadsPerBlock);
-        auto sS_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sSpMatrix[0];
+        auto sS_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sCPredMatrixLegacy[0];
         auto gSLegacy_ptr = gSLegacy.data();
         auto scatter_predicate_layout = make_layout(
             shape(gCLegacy),
@@ -481,7 +503,7 @@ struct AmperePredicatedFprop {
 
         __syncthreads();
 
- #if 0
+#if 0
         if (thread0()) {
             print("\n");
             print("shape(sCLegacy) = ");print(shape(sCLegacy));print("\n");
@@ -501,12 +523,14 @@ struct AmperePredicatedFprop {
         auto tDgC = gmem_thr_copy_C.partition_D(gC);
         // auto tDgC = gmem_thr_copy_C.partition_D(gC);
         // auto tDsS = gmem_thr_copy_C.partition_D(sS);
+        auto tDsCPred = gmem_thr_copy_C.partition_D(sCPred);
 
         // copy   (gmem_tiled_copy_C,       tDsC, tDgCLegacy);
         // copy   (gmem_tiled_copy_C,       tDsC, tDgC);
 
         // copy   (gmem_tiled_copy_C,       tDsCLegacy, tDgCLegacy);
-        copy   (gmem_tiled_copy_C,       tDsC, tDgC);
+        // copy   (gmem_tiled_copy_C,           tDsC, tDgC);
+        copy_if(gmem_tiled_copy_C, tDsCPred, tDsC, tDgC);
 
         // copy_if(gmem_tiled_copy_C, tDsS, tDsCLegacy, tDgCLegacy);
         // copy_if(gmem_tiled_copy_C, tDsS, tDsC, tDgC);

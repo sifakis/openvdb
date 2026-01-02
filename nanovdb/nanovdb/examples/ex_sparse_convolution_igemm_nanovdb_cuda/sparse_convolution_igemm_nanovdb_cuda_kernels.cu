@@ -60,6 +60,10 @@ struct IGEMM_Geometry
     static constexpr int Hx = T+7;  // X-dimension of leaf node domain, enlarged by the necessary halo for convolution
     static constexpr int Hy = R+7;  // Y-dimension of leaf node domain, enlarged by the necessary halo for convolution
     static constexpr int Hz = S+7;  // Z-dimension of leaf node domain, enlarged by the necessary halo for convolution
+
+    static constexpr int VoxelsPerLeafnodeNoHalo() { return 512; }
+    static constexpr int VoxelsPerLeafnodeWithHalo() { return Hx*Hy*Hz; }
+
     //
     // Filter offset (coordinate offset in the input domain that the [0,0,0] filter spoke corresponds to)
     //
@@ -897,7 +901,7 @@ void mainSparseConvolutionIGEMM(
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             smem_size));
 
-    int num_iterations = 10;
+    int num_iterations = 1;
     for (int i = 0; i < num_iterations; ++i) {
         gpuTimer.start("Scatter-Gather Cutlass IGEMM (GPU) execution");
         kernel_entrypoint_custom<

@@ -358,7 +358,9 @@ __launch_bounds__(Operator::MaxThreadsPerBlock, Operator::MinBlocksPerMultiproce
       ActivationTensor mAct,       ActivationTensorLegacy mActLegacy,
       ActivationTensorIndex mActI, ActivationTensorIndexLegacy mActILegacy,
       OutputTensor mOut,           OutputTensorLegacy mOutLegacy,
-      OutputTensorIndex mOutI,     OutputTensorIndexLegacy mOutILegacy
+      OutputTensorIndex mOutI,     OutputTensorIndexLegacy mOutILegacy,
+      const float *inputData,
+      float *outputData
   ) {
   extern __shared__ char smem_buf[];
   Operator op;
@@ -368,6 +370,8 @@ __launch_bounds__(Operator::MaxThreadsPerBlock, Operator::MinBlocksPerMultiproce
       mActI, mActILegacy,
       mOut,  mOutLegacy,
       mOutI, mOutILegacy,
+      inputData,
+      outputData,
       smem_buf);
 }
 
@@ -909,7 +913,9 @@ void mainSparseConvolutionIGEMM(
                 tXformedActGather,  tXformedActGatherLegacy,
                 tGatherIndex,       tGatherIndexLegacy,
                 tXformedOutScatter, tXformedOutScatterLegacy,
-                tScatterIndex,      tScatterIndexLegacy
+                tScatterIndex,      tScatterIndexLegacy,
+                inputData.data().get(),
+                outputData.data().get()
             );
         gpuTimer.stop();
     }

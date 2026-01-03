@@ -901,7 +901,7 @@ void mainSparseConvolutionIGEMM(
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             smem_size));
 
-    int num_iterations = 1;
+    int num_iterations = 10;
     for (int i = 0; i < num_iterations; ++i) {
         gpuTimer.start("Scatter-Gather Cutlass IGEMM (GPU) execution");
         kernel_entrypoint_custom<

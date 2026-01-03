@@ -311,12 +311,13 @@ struct AmperePredicatedFprop {
             if (i+threadIdx.x < sBPred_cosize)
                 sBPred_ptr[i+threadIdx.x] = gBIdx_ptr[i+threadIdx.x];
         
-        static_assert(SettingsT::VoxelsPerLeafnodeNoHalo() % MaxThreadsPerBlock == 0);
         auto sCPred_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sCPredMatrix[0];
         auto gCIdx_ptr = gCIdx.data();
+        auto sCPred_cosize = cosize(gCIdx.layout());
         Tensor sCPred = make_tensor(make_smem_ptr(sCPred_ptr), gCIdx.layout());
-        for (int i = 0; i < SettingsT::VoxelsPerLeafnodeNoHalo(); i += MaxThreadsPerBlock)
-            sCPred_ptr[i+threadIdx.x] = gCIdx_ptr[i+threadIdx.x];
+        for (int i = 0; i < sCPred_cosize; i += MaxThreadsPerBlock)
+            if (i+threadIdx.x < sCPred_cosize)
+                sCPred_ptr[i+threadIdx.x] = gCIdx_ptr[i+threadIdx.x];
 
         __syncthreads();
 
@@ -390,6 +391,7 @@ struct AmperePredicatedFprop {
         auto tDgCLegacy = gmem_thr_copy_C.partition_D(gCLegacy);
         auto tDgC = gmem_thr_copy_C.partition_D(gC);
         auto tDsCPredLegacy = gmem_thr_copy_C.partition_D(sCPredLegacy);
+        auto tDsCPred = gmem_thr_copy_C.partition_D(sCPred);
 
         // copy   (gmem_tiled_copy_C,           tDsC, tDgC);
         copy_if(gmem_tiled_copy_C, tDsCPred, tDsC, tDgC);

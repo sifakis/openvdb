@@ -67,28 +67,24 @@ struct AmperePredicatedFprop {
     using K = Int<SettingsT::K>;
 
     // Tiler config
-    using Tiler_K = decltype(cute::min(K{}, _32{}));
-    using Tiler_C = decltype(cute::min(C{}, _32{}));
-    using Tiler_NL = _4;
-    using Tiler_N = Shape<_1,_1,_2,_2>;
-    using TileM  = Tiler_K;
-    using TileNL = Shape<Tiler_NL, Z, P, Q>;
-    using TileN = Shape<Tiler_N, Z, P, Q>;
-    using TileK  = Shape<Tiler_C ,_1,_1,_1>;
-    using TilePL  = Shape<Tiler_NL, D, H, W>; // Including halo in spatial dimensions
-    using PIPE  = _3;
+    using Tiler_K  = decltype(cute::min(K{}, _32{}));
+    using Tiler_C  = decltype(cute::min(C{}, _32{}));
+    using Tiler_N  = Shape<_1,_1,_2,_2>;
+    using TileM    = Tiler_K;
+    using TileN    = Shape<Tiler_N, Z, P, Q>;
+    using TileK    = Shape<Tiler_C ,_1,_1,_1>;
+    using PIPE     = _3;
     using TilerFlt = Shape<TileM, TileK>;
-    using TilerAct       = Shape<TileN, TileK>;
-    using TilerActLegacy = Shape<TileNL, TileK>;
+    using TilerAct = Shape<TileN, TileK>;
+    using TilerOut = Shape<TileM, TileN>;
 
-    using TilerGatherIdxLegacy = Shape<TilePL, TileK>;
-
-    using TilerOut       = Shape<TileM, TileN>;
+    // TODO: Eliminate these
+    using Tiler_NL = _4;
+    using TileNL  = Shape<Tiler_NL, Z, P, Q>;
     using TilerOutLegacy = Shape<TileM, TileNL>;
 
     using TileSizeM = Int<size(TileM{})>;
     using TileSizeN = Int<size(TileN{})>;
-    using TileSizeNL = Int<size(TileNL{})>;
     using TileSizeK = Int<size(TileK{})>;
     static constexpr int Stages = PIPE::value;
 
@@ -108,19 +104,16 @@ struct AmperePredicatedFprop {
         union {
             struct {
                 ElementFlt sAMatrix[size(TileM{}) * size(TileK{}) * size(PIPE{})];
-                ElementAct sBMatrix[size(TileNL{}) * size(TileK{}) * size(PIPE{})];
-                bool       sBPredMatrixLegacy[size(TilePL{})]; // Gather predicate        
+                ElementAct sBMatrix[size(TileN{}) * size(TileK{}) * size(PIPE{})];
             } mainloop;
 
             struct {
-                ElementOut sCMatrix[size(TileM{}) * size(TileNL{})];
-                ElementOut sCMatrixLegacy[size(TileM{}) * size(TileNL{})];
+                ElementOut sCMatrix[size(TileM{}) * size(TileN{})];
             } epilogue;
         };
 
         bool sBPredMatrix[SettingsT::VoxelsPerLeafnodeWithHalo()];
         bool sCPredMatrix[SettingsT::VoxelsPerLeafnodeNoHalo()];
-        bool sCPredMatrixLegacy[size(TileNL{})]; // Scatter predicate
     };
 
     //
@@ -194,7 +187,6 @@ struct AmperePredicatedFprop {
 
     // This can be optimized to make accesses BCF, but we use a col-major layout here to show off composability
     using SmemLayoutOut       = Layout<Shape<TileSizeM, TileSizeN>>;
-    using SmemLayoutOutLegacy = Layout<Shape<TileSizeM, TileSizeNL>>;
 
     //
     // Conv functor (predicated IGEMM)
@@ -205,37 +197,20 @@ struct AmperePredicatedFprop {
         class TensorOutput,       class TensorOutputLegacy,
         class TensorScatterIndex, class TensorScatterIndexLegacy>
     void __device__
-    operator()(cute::Tensor<EngineFlt, GmemLayoutFlt> mFlt,       // ( K,        (C,T,R,S))
-        TensorActivation                              mAct,       // ((N,Z,P,Q), (C,T,R,S))
-        TensorActivationLegacy                        mActLegacy, // ((N,Z,P,Q), (C,T,R,S))
-        TensorGatherIndex                             mGIx,       // ((N,D,H,W), (C,1,1,1))
-        TensorGatherIndexLegacy                       mGIxLegacy, // ((N,D,H,W), (C,1,1,1))
-        TensorOutput                                  mOut,       // ( K,        (N,Z,P,Q))
-        TensorOutputLegacy                            mOutLegacy, // ( K,        (N,Z,P,Q))
-        TensorScatterIndex                            mSIx,       // ( K,        (N,Z,P,Q))      
-        TensorScatterIndexLegacy                      mSIxLegacy, // ( K,        (N,Z,P,Q))      
+    operator()(cute::Tensor<EngineFlt, GmemLayoutFlt> mFlt,        // (                   K,           (C,T,R,S))
+        TensorActivation                              mAct,        // (((N,Bx,By,Bz),Z,P,Q),           (C,T,R,S))
+        TensorActivationLegacy                        mActLegacy_,
+        TensorGatherIndex                             mGIx,        // (((N,Bx,By,Bz),Z,P,Q),           (C,T,R,S))
+        TensorGatherIndexLegacy                       mGIxLegacy_,
+        TensorOutput                                  mOut,        // ( K,                  ((N,Bx,By,Bz),Z,P,Q))
+        TensorOutputLegacy                            mOutLegacy_,
+        TensorScatterIndex                            mSIx,        // ( K,                  ((N,Bx,By,Bz),Z,P,Q))
+        TensorScatterIndexLegacy                      mSIxLegacy_,
         const float                                   *actData,
         const float                                   *outData,
-        char* smem_buf) const {
+        char* smem_buf) const
+    {
         using namespace cute;
-        // Legacy collective mainloop type
-        using CollectiveMainloopLegacy = typename cutlass::gemm::collective::CollectiveMma<
-            cutlass::gemm::MainloopSm80CpAsyncUnpredicatedCustom<PIPE::value>,
-            Shape<TileM,TileNL,TileK>,
-            ElementFlt,
-            Underscore, // Ignore the stride, we are passing full cute::Tensor to operator()
-            ElementAct,
-            Underscore, // Ignore the stride, we are passing full cute::Tensor to operator()
-            TiledMma,
-            GmemTiledCopyFlt,
-            SmemLayoutAtomFlt,
-            SmemCopyAtomFlt,
-            cute::identity,
-            GmemTiledCopyAct,
-            SmemLayoutAtomAct,
-            SmemCopyAtomAct,
-            cute::identity>;
-        // New collective mainloop type
         using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveMma<
             cutlass::gemm::MainloopSm80CpAsyncUnpredicatedCustom<PIPE::value>,
             Shape<TileM,TileN,TileK>,
@@ -254,54 +229,29 @@ struct AmperePredicatedFprop {
             cute::identity>;
 
         TiledMma tiled_mma;
-        Tensor accumLegacy = partition_fragment_C(tiled_mma, TilerOutLegacy{});
-        clear(accumLegacy);
         Tensor accum = partition_fragment_C(tiled_mma, TilerOut{});
         clear(accum);
 
         // Set up tensors
         // NOTE: blockIdx.x projects onto act-NDHW mode, y along the flt-K mode for the sake of higher dynamic range in NDHW
-        Tensor gA_mk = local_tile(mFlt, TilerFlt{}, make_coord(_,_));                      // (BLK_M,BLK_K,m',k')
-        Tensor gBLegacy_nk = local_tile(mActLegacy, TilerActLegacy{}, make_coord(_,_));    // (BLK_N,BLK_K,n',_1)
-        Tensor gB_nk = local_tile(mAct, TilerAct{}, make_coord(_,_));                      // (BLK_N,BLK_K,n',_1)
-        Tensor gBIdxLegacy_nk = local_tile(mGIxLegacy, TilerGatherIdxLegacy{}, make_coord(_,_));    // (BLK_N,BLK_K,n',_1)
-        Tensor gBIdx_nk = local_tile(mGIx, TilerAct{}, make_coord(_,_));    // (BLK_N,BLK_K,n',_1)
-
-        Tensor gCLegacy_mn = local_tile(mOutLegacy, TilerOutLegacy{}, make_coord(_,_));    // (BLK_M,BLK_N,m',n')
-        Tensor gC_mn       = local_tile(      mOut,       TilerOut{}, make_coord(_,_));    // (BLK_M,BLK_N,m',n')
-        Tensor gSLegacy_mn = local_tile(mSIxLegacy, TilerOutLegacy{}, make_coord(_,_));    // (BLK_M,BLK_N,m',n')
-        Tensor gCIdx_mn    = local_tile(      mSIx,       TilerOut{}, make_coord(_,_));    // (BLK_M,BLK_N,m',n')        
+        Tensor gA_mk    = local_tile(mFlt, TilerFlt{}, make_coord(_,_));                   // (BLK_M,BLK_K,m',k')
+        Tensor gB_nk    = local_tile(mAct, TilerAct{}, make_coord(_,_));                   // (BLK_N,BLK_K,n',_1)
+        Tensor gBIdx_nk = local_tile(mGIx, TilerAct{}, make_coord(_,_));                   // (BLK_N,BLK_K,n',_1)
+        Tensor gC_mn    = local_tile(mOut, TilerOut{}, make_coord(_,_));                   // (BLK_M,BLK_N,m',n')
+        Tensor gCIdx_mn = local_tile(mSIx, TilerOut{}, make_coord(_,_));                   // (BLK_M,BLK_N,m',n')        
 
         // Compute m_coord and n_coord with their post-tiled shapes
         auto m_coord = idx2crd(int(blockIdx.y), shape<2>(gA_mk));
-        auto nl_coord = idx2crd(int(blockIdx.x), shape<2>(gBLegacy_nk));
         auto n_layout = make_layout(shape<2>(gB_nk), GenRowMajor{});
         auto n_coord = idx2crd(int(blockIdx.x), shape(n_layout), stride(n_layout));
 
-        Tensor gA = gA_mk(_,_,m_coord,_);                                                        // (BLK_M,BLK_K,k')
-        Tensor gBLegacy = gBLegacy_nk(_,_,nl_coord,_);                                           // (BLK_N,BLK_K,_1)
-        Tensor gB = gB_nk(_,_,n_coord,_);                                                       // (BLK_N,BLK_K,_1)
-        Tensor gBIdxLegacy = gBIdxLegacy_nk(_,_,nl_coord,_);                                                        // (BLK_N,BLK_K,_1)
-        Tensor gBIdx = gBIdx_nk(_,_,n_coord,_);                                                        // (BLK_N,BLK_K,_1)
-
-        Tensor gCLegacy = gCLegacy_mn(_,_,m_coord, nl_coord);                                                  // (BLK_M,BLK_N)
-        Tensor gC       = gC_mn      (_,_,m_coord,  n_coord);                                                  // (BLK_M,BLK_N)
-        Tensor gSLegacy = gSLegacy_mn(_,_,m_coord, nl_coord);                                                  // (BLK_M,BLK_N)
-        Tensor gCIdx    = gCIdx_mn   (_,_,m_coord,  n_coord);
-
-        // Build gather predicate tensor in SMEM
-        static_assert(size(TilePL{}) % MaxThreadsPerBlock == 0);
-        auto sBPredLegacy_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->mainloop.sBPredMatrixLegacy[0];
-        auto gBIdxLegacy_ptr = gBIdxLegacy.data();
-        auto gather_predicate_layout = make_layout(
-            shape(gBLegacy),
-            make_stride(
-                make_stride(D{}*H{}*W{}, H{}*W{},  W{}, _1{}),
-                make_stride(       _0{},    _0{}, _0{}, _0{}),
-                make_stride(       _0{}, H{}*W{},  W{}, _1{})));
-        for (int i = 0; i < size(TilePL{}); i += MaxThreadsPerBlock)
-            sBPredLegacy_ptr[i+threadIdx.x] = gBIdxLegacy_ptr[i+threadIdx.x];
-        Tensor sBPredLegacy = make_tensor(make_smem_ptr(sBPredLegacy_ptr), gather_predicate_layout);    
+        Tensor gA    = gA_mk   (_,_,m_coord,_);                                            // (BLK_M,BLK_K,k')
+        Tensor gB    = gB_nk   (_,_,n_coord,_);                                            // (BLK_N,BLK_K,_1)
+        Tensor gBIdx = gBIdx_nk(_,_,n_coord,_);                                            // (BLK_N,BLK_K,_1)
+        Tensor gC    = gC_mn   (_,_,m_coord,n_coord);                                      // (BLK_M,BLK_N)
+        Tensor gCIdx = gCIdx_mn(_,_,m_coord,n_coord);                                      // (BLK_M,BLK_N)
+        
+        // Build gather predicate tensors in SMEM
 
         auto sBPred_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sBPredMatrix[0];
         auto gBIdx_ptr = gBIdx.data();
@@ -321,23 +271,7 @@ struct AmperePredicatedFprop {
 
         __syncthreads();
 
-        // Build scatter predicate tensor in SMEM
-        static_assert(size(TileNL{}) <= MaxThreadsPerBlock);
-        auto sCPredLegacy_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sCPredMatrixLegacy[0];
-        auto gSLegacy_ptr = gSLegacy.data();
-        auto scatter_predicate_layout = make_layout(
-            shape(gCLegacy),
-            make_stride(
-                _0{},
-                make_stride(Z{}*P{}*Q{}, P{}*Q{},  Q{}, _1{})));
-        Tensor sCPredLegacy = make_tensor(make_smem_ptr(sCPredLegacy_ptr), scatter_predicate_layout);
-        if (threadIdx.x < size(TileNL{}))
-            sCPredLegacy_ptr[threadIdx.x] = gSLegacy_ptr[threadIdx.x];
-
-        __syncthreads();
-
         auto k_tile_iter = cute::make_coord_iterator(size<2>(gA));
-        auto k_tile_iterLegacy = cute::make_coord_iterator(size<2>(gA));
         int k_tile_count = size<2>(gA);
 
         CollectiveMainloop collective_mma;
@@ -352,48 +286,27 @@ struct AmperePredicatedFprop {
             threadIdx.x,
             smem_buf);
 
- #if 1
-        CollectiveMainloopLegacy collective_mmaLegacy;
-        collective_mmaLegacy(
-            accumLegacy,
-            gA,
-            gBLegacy,
-            sBPredLegacy,
-            accumLegacy,
-            k_tile_iterLegacy, k_tile_count,
-            Underscore{}, // no residue since we do not support predication
-            threadIdx.x,
-            smem_buf);
-#endif
-
         //
         // Epilogue
         //
+
         SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
-        Tensor sCLegacy = make_tensor(make_smem_ptr(&storage.epilogue.sCMatrixLegacy[0]), SmemLayoutOutLegacy{});
         Tensor sC = make_tensor(make_smem_ptr(&storage.epilogue.sCMatrix[0]), SmemLayoutOut{});
 
         auto smem_tiled_copy_C = make_tiled_copy_C(SmemCopyAtomOut{}, tiled_mma);
         auto smem_thr_copy_C = smem_tiled_copy_C.get_slice(threadIdx.x);
-        auto tCrCLegacy = smem_thr_copy_C.retile_S(accumLegacy);
         auto tCrC = smem_thr_copy_C.retile_S(accum);
-        auto tCsCLegacy = smem_thr_copy_C.partition_D(sCLegacy);
         auto tCsC = smem_thr_copy_C.partition_D(sC);
-        copy(smem_tiled_copy_C, tCrCLegacy, tCsCLegacy);
         copy(smem_tiled_copy_C, tCrC, tCsC);
 
         __syncthreads();
 
         GmemTiledCopyOut gmem_tiled_copy_C;
         auto gmem_thr_copy_C = gmem_tiled_copy_C.get_slice(threadIdx.x);
-        auto tDsCLegacy = gmem_thr_copy_C.partition_S(sCLegacy);
         auto tDsC = gmem_thr_copy_C.partition_S(sC);
-        auto tDgCLegacy = gmem_thr_copy_C.partition_D(gCLegacy);
         auto tDgC = gmem_thr_copy_C.partition_D(gC);
-        auto tDsCPredLegacy = gmem_thr_copy_C.partition_D(sCPredLegacy);
         auto tDsCPred = gmem_thr_copy_C.partition_D(sCPred);
 
-        // copy   (gmem_tiled_copy_C,           tDsC, tDgC);
         copy_if(gmem_tiled_copy_C, tDsCPred, tDsC, tDgC);
     }
 };

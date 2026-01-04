@@ -78,11 +78,6 @@ struct AmperePredicatedFprop {
     using TilerAct = Shape<TileN, TileK>;
     using TilerOut = Shape<TileM, TileN>;
 
-    // TODO: Eliminate these
-    using Tiler_NL = _4;
-    using TileNL  = Shape<Tiler_NL, Z, P, Q>;
-    using TilerOutLegacy = Shape<TileM, TileNL>;
-
     using TileSizeM = Int<size(TileM{})>;
     using TileSizeN = Int<size(TileN{})>;
     using TileSizeK = Int<size(TileK{})>;
@@ -191,21 +186,13 @@ struct AmperePredicatedFprop {
     //
     // Conv functor (predicated IGEMM)
     //
-    template <class EngineFlt,
-        class TensorActivation,   class TensorActivationLegacy,
-        class TensorGatherIndex,  class TensorGatherIndexLegacy,
-        class TensorOutput,       class TensorOutputLegacy,
-        class TensorScatterIndex, class TensorScatterIndexLegacy>
+    template <class EngineFlt, class ActivationTensor, class ActivationIndexTensor, class OutputTensor, class OutputIndexTensor>
     void __device__
     operator()(cute::Tensor<EngineFlt, GmemLayoutFlt> mFlt,        // (                   K,           (C,T,R,S))
-        TensorActivation                              mAct,        // (((N,Bx,By,Bz),Z,P,Q),           (C,T,R,S))
-        TensorActivationLegacy                        mActLegacy_,
-        TensorGatherIndex                             mGIx,        // (((N,Bx,By,Bz),Z,P,Q),           (C,T,R,S))
-        TensorGatherIndexLegacy                       mGIxLegacy_,
-        TensorOutput                                  mOut,        // ( K,                  ((N,Bx,By,Bz),Z,P,Q))
-        TensorOutputLegacy                            mOutLegacy_,
-        TensorScatterIndex                            mSIx,        // ( K,                  ((N,Bx,By,Bz),Z,P,Q))
-        TensorScatterIndexLegacy                      mSIxLegacy_,
+        ActivationTensor                              mAct,        // (((N,Bx,By,Bz),Z,P,Q),           (C,T,R,S))
+        ActivationIndexTensor                         mActIdx,     // (((N,Bx,By,Bz),Z,P,Q),           (C,T,R,S))
+        OutputTensor                                  mOut,        // ( K,                  ((N,Bx,By,Bz),Z,P,Q))
+        OutputIndexTensor                             mOutIdx,     // ( K,                  ((N,Bx,By,Bz),Z,P,Q))
         const float                                   *actData,
         const float                                   *outData,
         char* smem_buf) const
@@ -234,11 +221,11 @@ struct AmperePredicatedFprop {
 
         // Set up tensors
         // NOTE: blockIdx.x projects onto act-NDHW mode, y along the flt-K mode for the sake of higher dynamic range in NDHW
-        Tensor gA_mk    = local_tile(mFlt, TilerFlt{}, make_coord(_,_));                   // (BLK_M,BLK_K,m',k')
-        Tensor gB_nk    = local_tile(mAct, TilerAct{}, make_coord(_,_));                   // (BLK_N,BLK_K,n',_1)
-        Tensor gBIdx_nk = local_tile(mGIx, TilerAct{}, make_coord(_,_));                   // (BLK_N,BLK_K,n',_1)
-        Tensor gC_mn    = local_tile(mOut, TilerOut{}, make_coord(_,_));                   // (BLK_M,BLK_N,m',n')
-        Tensor gCIdx_mn = local_tile(mSIx, TilerOut{}, make_coord(_,_));                   // (BLK_M,BLK_N,m',n')        
+        Tensor gA_mk    = local_tile(mFlt,    TilerFlt{}, make_coord(_,_));                // (BLK_M,BLK_K,m',k')
+        Tensor gB_nk    = local_tile(mAct,    TilerAct{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
+        Tensor gBIdx_nk = local_tile(mActIdx, TilerAct{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
+        Tensor gC_mn    = local_tile(mOut,    TilerOut{}, make_coord(_,_));                // (BLK_M,BLK_N,m',n')
+        Tensor gCIdx_mn = local_tile(mOutIdx, TilerOut{}, make_coord(_,_));                // (BLK_M,BLK_N,m',n')        
 
         // Compute m_coord and n_coord with their post-tiled shapes
         auto m_coord = idx2crd(int(blockIdx.y), shape<2>(gA_mk));

@@ -350,19 +350,19 @@ void ResultCompare(
 }
 
 template<class Operator, class FilterTensor,
-    class ActivationTensor,      class ActivationTensorLegacy,
-    class ActivationTensorIndex, class ActivationTensorIndexLegacy,
-    class OutputTensor,          class OutputTensorLegacy,
-    class OutputTensorIndex,     class OutputTensorIndexLegacy
+    class ActivationTensor,
+    class ActivationTensorIndex,
+    class OutputTensor,
+    class OutputTensorIndex
     >
 __global__
 __launch_bounds__(Operator::MaxThreadsPerBlock, Operator::MinBlocksPerMultiprocessor)
   void kernel_entrypoint_custom(
       FilterTensor mFlt,
-      ActivationTensor mAct,       ActivationTensorLegacy mActLegacy,
-      ActivationTensorIndex mActI, ActivationTensorIndexLegacy mActILegacy,
-      OutputTensor mOut,           OutputTensorLegacy mOutLegacy,
-      OutputTensorIndex mOutI,     OutputTensorIndexLegacy mOutILegacy,
+      ActivationTensor mAct,
+      ActivationTensorIndex mActI,
+      OutputTensor mOut,
+      OutputTensorIndex mOutI,
       const float *inputData,
       float *outputData
   ) {
@@ -370,10 +370,10 @@ __launch_bounds__(Operator::MaxThreadsPerBlock, Operator::MinBlocksPerMultiproce
   Operator op;
   op(
       mFlt,
-      mAct,  mActLegacy,
-      mActI, mActILegacy,
-      mOut,  mOutLegacy,
-      mOutI, mOutILegacy,
+      mAct,
+      mActI,
+      mOut,
+      mOutI,
       inputData,
       outputData,
       smem_buf);
@@ -885,39 +885,32 @@ void mainSparseConvolutionIGEMM(
 #endif
 
     // ((BLK_M, BLK_N), (m', n'))
-    Tensor gOutput_mn = zipped_divide(tXformedOutScatterLegacy, typename AmperePredicatedFprop<IGEMM_Geometry>::TilerOutLegacy{});
+    Tensor gOutput_mn = zipped_divide(tXformedOutScatter, typename AmperePredicatedFprop<IGEMM_Geometry>::TilerOut{});
     dim3 launch_grid {static_cast<uint32_t>(size<1,1>(gOutput_mn)), static_cast<uint32_t>(size<1,0>(gOutput_mn)), 1};
     constexpr size_t smem_size = sizeof(typename AmperePredicatedFprop<IGEMM_Geometry>::SharedStorage);
     std::cout << "smem_size = " << smem_size << std::endl;
 
-    cudaCheck(cudaFuncSetAttribute(
-            kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>,
-            decltype(tFilter),
-            decltype(tXformedActGather),  decltype(tXformedActGatherLegacy),
-            decltype(tGatherIndex),       decltype(tGatherIndexLegacy),
-            decltype(tXformedOutScatter), decltype(tXformedOutScatterLegacy),
-            decltype(tScatterIndex),      decltype(tScatterIndexLegacy)
-            >,
+    cudaCheck(
+        cudaFuncSetAttribute(
+            kernel_entrypoint_custom<
+                AmperePredicatedFprop<IGEMM_Geometry>, decltype(tFilter), decltype(tXformedActGather),
+                decltype(tGatherIndex), decltype(tXformedOutScatter), decltype(tScatterIndex)>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
-            smem_size));
+            smem_size
+        ));
 
     int num_iterations = 10;
     for (int i = 0; i < num_iterations; ++i) {
         gpuTimer.start("Scatter-Gather Cutlass IGEMM (GPU) execution");
         kernel_entrypoint_custom<
-            AmperePredicatedFprop<IGEMM_Geometry>,
-            decltype(tFilter),
-            decltype(tXformedActGather),  decltype(tXformedActGatherLegacy),
-            decltype(tGatherIndex),       decltype(tGatherIndexLegacy),
-            decltype(tXformedOutScatter), decltype(tXformedOutScatterLegacy),
-            decltype(tScatterIndex),      decltype(tScatterIndexLegacy)
-            >
+            AmperePredicatedFprop<IGEMM_Geometry>, decltype(tFilter), decltype(tXformedActGather),
+            decltype(tGatherIndex), decltype(tXformedOutScatter), decltype(tScatterIndex)>
             <<<launch_grid, AmperePredicatedFprop<IGEMM_Geometry>::MaxThreadsPerBlock, smem_size>>>(
                 tFilter,
-                tXformedActGather,  tXformedActGatherLegacy,
-                tGatherIndex,       tGatherIndexLegacy,
-                tXformedOutScatter, tXformedOutScatterLegacy,
-                tScatterIndex,      tScatterIndexLegacy,
+                tXformedActGather,
+                tGatherIndex,
+                tXformedOutScatter,
+                tScatterIndex,
                 inputData.data().get(),
                 outputData.data().get()
             );

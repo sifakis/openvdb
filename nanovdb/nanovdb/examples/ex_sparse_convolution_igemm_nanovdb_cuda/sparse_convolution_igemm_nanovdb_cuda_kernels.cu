@@ -53,13 +53,21 @@ struct IGEMM_Geometry
     // Leaf node geometry
     //
 
-    static constexpr int Bx = 8/Z;  // Block count along X-dimension of leaf node
-    static constexpr int By = 8/P;  // Block count along Y-dimension of leaf node
-    static constexpr int Bz = 8/Q;  // Block count along Z-dimension of leaf node
+    static constexpr int ZZ = 1;        // Blocks of size (Z,P,Q) are grouped into "clusters" in a (ZZ,PP,QQ) arrangement
+    static constexpr int PP = 2;        // I.e. ZZ blocks are grouped along the X-dimension, PP along the Y- and QQ along the Z-dimension
+    static constexpr int QQ = 2;        // The total voxel size of a cluster will be (ZZ*Z,PP*P,QQ*Q)
 
-    static constexpr int Hx = T+7;  // X-dimension of leaf node domain, enlarged by the necessary halo for convolution
-    static constexpr int Hy = R+7;  // Y-dimension of leaf node domain, enlarged by the necessary halo for convolution
-    static constexpr int Hz = S+7;  // Z-dimension of leaf node domain, enlarged by the necessary halo for convolution
+    static constexpr int Bx = 8/Z;      // Block count along X-dimension of leaf node
+    static constexpr int By = 8/P;      // Block count along Y-dimension of leaf node
+    static constexpr int Bz = 8/Q;      // Block count along Z-dimension of leaf node
+
+    static constexpr int Cx = 8/(ZZ*Z); // Cluster count along X-dimension of leaf node
+    static constexpr int Cy = 8/(PP*P); // Cluster count along Y-dimension of leaf node
+    static constexpr int Cz = 8/(QQ*Q); // Cluster count along Z-dimension of leaf node
+
+    static constexpr int Hx = T+7;      // X-dimension of leaf node domain, enlarged by the necessary halo for convolution
+    static constexpr int Hy = R+7;      // Y-dimension of leaf node domain, enlarged by the necessary halo for convolution
+    static constexpr int Hz = S+7;      // Z-dimension of leaf node domain, enlarged by the necessary halo for convolution
 
     static constexpr int VoxelsPerLeafnodeNoHalo() { return 512; }
     static constexpr int VoxelsPerLeafnodeWithHalo() { return Hx*Hy*Hz; }
@@ -68,9 +76,9 @@ struct IGEMM_Geometry
     // Filter offset (coordinate offset in the input domain that the [0,0,0] filter spoke corresponds to)
     //
 
-    static constexpr int Dx = -1;   // Filter centered at (0,0,0), thus (0,0,0) spoke corresponds
-    static constexpr int Dy = -1;   // to a (-1,-1,-1) grid offset
-    static constexpr int Dz = -1;
+    static constexpr int Dx = -1; // X-coordinate offset of the minimum corner of the convolution filter
+    static constexpr int Dy = -1; // Y-coordinate offset of the minimum corner of the convolution filter
+    static constexpr int Dz = -1; // Z-coordinate offset of the minimum corner of the convolution filter
 
 };
 
@@ -886,6 +894,7 @@ void mainSparseConvolutionIGEMM(
 
     // ((BLK_M, BLK_N), (m', n'))
     Tensor gOutput_mn = zipped_divide(tXformedOutScatter, typename AmperePredicatedFprop<IGEMM_Geometry>::TilerOut{});
+    print("\n");print("shape(gOutput_mn)=");print(shape(gOutput_mn));print("\n");
     dim3 launch_grid {static_cast<uint32_t>(size<1,1>(gOutput_mn)), static_cast<uint32_t>(size<1,0>(gOutput_mn)), 1};
     constexpr size_t smem_size = sizeof(typename AmperePredicatedFprop<IGEMM_Geometry>::SharedStorage);
     std::cout << "smem_size = " << smem_size << std::endl;

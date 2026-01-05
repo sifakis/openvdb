@@ -241,7 +241,7 @@ struct AmperePredicatedFprop {
         
             // Compute m_coord and n_coord with their post-tiled shapes
             auto m_coord = idx2crd(int(blockIdx.y), shape<2>(gA_mk));
-#if 1
+#if 0
             auto n_layout = make_layout(shape<2>(gB_nk), GenRowMajor{});
             auto n_coord = idx2crd(int(8*blockIdx.x+clusterID), shape(n_layout), stride(n_layout));
 #elif 0
@@ -250,6 +250,7 @@ struct AmperePredicatedFprop {
             auto clusterCoord = idx2crd(clusterID, shape(clusterLayout), stride(clusterLayout));
             auto n_coord = make_tuple(cute::prepend(clusterCoord, blockIdx.x),_0{},_0{},_0{});
 #elif 1
+            // Also correct, but clusters traversed in co-lex order
             auto clusterCoord = idx2crd(clusterID, ClusterShape{});
             auto n_coord = make_tuple(cute::prepend(clusterCoord, blockIdx.x),_0{},_0{},_0{});
 #endif
@@ -317,6 +318,8 @@ struct AmperePredicatedFprop {
             auto tDsCPred = gmem_thr_copy_C.partition_D(sCPred);
         
             copy_if(gmem_tiled_copy_C, tDsCPred, tDsC, tDgC);
+
+            __syncthreads(); // necessary while the predicate tensors are built once per iteration; TODO: revise
         }
     }
 };

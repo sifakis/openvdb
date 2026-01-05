@@ -353,10 +353,10 @@ void ResultCompare(
 #pragma omp parallel for reduction(max:result)
     for (int i = 0; i < size; i++)
         for (int j = 0; j < Do; j++) {
-            if (outputArray1[i][j] != outputArray2[i][j]) {
-                std::cout << "outputArray1[" << i << "][" << j << "] = " << outputArray1[i][j]
-                          << ", outputArray2[" << i << "][" << j << "] = " << outputArray2[i][j] << std::endl;
-            }
+            // if (outputArray1[i][j] != outputArray2[i][j]) {
+            //     std::cout << "outputArray1[" << i << "][" << j << "] = " << outputArray1[i][j]
+            //               << ", outputArray2[" << i << "][" << j << "] = " << outputArray2[i][j] << std::endl;
+            // }
             result = std::max(result, std::abs(outputArray1[i][j]-outputArray2[i][j]));
         }
     std::cout << "Discrepancy = " << result << std::endl;
@@ -502,12 +502,6 @@ void mainSparseConvolutionIGEMM(
     for (int i = 0; i < Di; i++)
         outputArray[0][i] = outputReferenceArray[0][i] = ((float)distribution(generator))/256.0f; // Use only up to 7 bits in the mantissa   
     gpuTimer.stop();
-
-    ResultCompare<Do>(
-        outputValueCount,
-        outputArray,
-        outputReferenceArray
-    );
 
     gpuTimer.start("Initializing filter data");
     auto filterData = thrust::universal_vector<float>(3*3*3*Do*Di);
@@ -937,7 +931,8 @@ void mainSparseConvolutionIGEMM(
         gpuTimer.stop();
     }
 
-    cudaDeviceSynchronize();
+    // Potentially needed due to unified memory synchronization
+    // cudaDeviceSynchronize();
 
     ResultCompare<Do>(
         outputValueCount,

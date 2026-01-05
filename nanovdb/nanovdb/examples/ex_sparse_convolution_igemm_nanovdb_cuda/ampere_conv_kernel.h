@@ -71,6 +71,10 @@ struct AmperePredicatedFprop {
     using Cy = Int<SettingsT::Cy>;
     using Cz = Int<SettingsT::Cz>;
 
+    using Hx = Int<SettingsT::Hx>;
+    using Hy = Int<SettingsT::Hy>;
+    using Hz = Int<SettingsT::Hz>;
+
     using C = Int<SettingsT::C>;
     using K = Int<SettingsT::K>;
 
@@ -96,6 +100,7 @@ struct AmperePredicatedFprop {
     using ElementOut = float;
 
     using ClusterShape = Shape<Cx,Cy,Cz>;
+    using HaloLayout = decltype(make_layout(Shape<Hx,Hy,Hz>{},GenRowMajor{}));
 
     using TiledMma = TiledMMA<
         MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>,
@@ -117,10 +122,17 @@ struct AmperePredicatedFprop {
             } epilogue;
         };
 
-        // uint64_t sBIdxMatrix[SettingsT::VoxelsPerLeafnodeWithHalo()];
+        uint64_t sBIdxMatrix[SettingsT::VoxelsPerLeafnodeWithHalo()];
         uint64_t sCIdxMatrix[SettingsT::VoxelsPerLeafnodeNoHalo()];
+#if 0
+        // Maximal sizes
         bool sBPredMatrix[SettingsT::VoxelsPerLeafnodeWithHalo()];
         bool sCPredMatrix[SettingsT::VoxelsPerLeafnodeNoHalo()];
+#else
+        // Using only the cosize of the relevant tensor
+        bool sBPredMatrix[556];
+        bool sCPredMatrix[220];
+#endif
     };
 
     //
@@ -231,19 +243,35 @@ struct AmperePredicatedFprop {
 
         int leafID = blockIdx.x;
 
-        // Populate output (scatter) indices
+        // Populate activation (gather) and output (scatter) indices
         const auto& outLeaf = mOutGrid->tree().template getFirstNode<0>()[leafID];
         auto sCIdx_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sCIdxMatrix[0];
-        for (int i = 0; i < SettingsT::VoxelsPerLeafnodeNoHalo(); i += MaxThreadsPerBlock)
-            sCIdx_ptr[i+threadIdx.x] = outLeaf.getValue(i+threadIdx.x);
+        for (int v = 0; v < SettingsT::VoxelsPerLeafnodeNoHalo(); v += MaxThreadsPerBlock)
+            sCIdx_ptr[v+threadIdx.x] = outLeaf.getValue(v+threadIdx.x);
+        auto sBIdx_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sBIdxMatrix[0];
+        for (int v = 0; v < SettingsT::VoxelsPerLeafnodeWithHalo(); v += MaxThreadsPerBlock)
+            if ((v+threadIdx.x) < SettingsT::VoxelsPerLeafnodeWithHalo())
+            {
+                int ii =  (v+threadIdx.x) / (SettingsT::Hy*SettingsT::Hz);
+                int jj = ((v+threadIdx.x) / SettingsT::Hz) % SettingsT::Hy;
+                int kk =  (v+threadIdx.x)                  % SettingsT::Hz;
+                auto [i,j,k] = idx2crd(v+threadIdx.x, shape(HaloLayout{}), stride(HaloLayout{}));
+                if (leafID==0)
+                    printf("v=%d, (i,j,k)=(%d,%d,%d)\n", v+threadIdx.x, i, j,k);
+                
+            }
 
+        // sCIdx_ptr[v+threadIdx.x] = outLeaf.getValue(v+threadIdx.x);
+        if (thread0()) {
+            print("halo_layout=");print(HaloLayout{});print("\n");
+        }
         __syncthreads();
 
-#if 0
+#if 1
         if (threadIdx.x == 0) {
             auto gCIdx_ptr = &mOutIdx(make_tuple(0,make_tuple(make_tuple(leafID,0,0,0),0,0,0)));
-            for (int i = 0; i < SettingsT::VoxelsPerLeafnodeNoHalo(); ++i)
-                if (sCIdx_ptr[i] != gCIdx_ptr[i])
+            for (int v = 0; v < SettingsT::VoxelsPerLeafnodeNoHalo(); ++v)
+               if (sCIdx_ptr[v] != gCIdx_ptr[v])
                     printf("Inconsistency between on-the-fly and precomputed gather indices\n");
         }
         __syncthreads();

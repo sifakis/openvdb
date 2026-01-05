@@ -117,6 +117,8 @@ struct AmperePredicatedFprop {
             } epilogue;
         };
 
+        // uint64_t sBIdxMatrix[SettingsT::VoxelsPerLeafnodeWithHalo()];
+        uint64_t sCIdxMatrix[SettingsT::VoxelsPerLeafnodeNoHalo()];
         bool sBPredMatrix[SettingsT::VoxelsPerLeafnodeWithHalo()];
         bool sCPredMatrix[SettingsT::VoxelsPerLeafnodeNoHalo()];
     };
@@ -196,15 +198,17 @@ struct AmperePredicatedFprop {
     //
     // Conv functor (predicated IGEMM)
     //
-    template <class EngineFlt, class ActivationTensor, class ActivationIndexTensor, class OutputTensor, class OutputIndexTensor>
+    template <class BuildT, class EngineFlt, class ActivationTensor, class ActivationIndexTensor, class OutputTensor, class OutputIndexTensor>
     void __device__
     operator()(cute::Tensor<EngineFlt, GmemLayoutFlt> mFlt,        // (                   K,           (C,T,R,S))
         ActivationTensor                              mAct,        // (((N,Bx,By,Bz),Z,P,Q),           (C,T,R,S))
         ActivationIndexTensor                         mActIdx,     // (((N,Bx,By,Bz),Z,P,Q),           (C,T,R,S))
         OutputTensor                                  mOut,        // ( K,                  ((N,Bx,By,Bz),Z,P,Q))
         OutputIndexTensor                             mOutIdx,     // ( K,                  ((N,Bx,By,Bz),Z,P,Q))
+        const nanovdb::NanoGrid<BuildT>               *mActGrid,
+        const nanovdb::NanoGrid<BuildT>               *mOutGrid,
         const float                                   *actData,
-        const float                                   *outData,
+        float                                         *outData,
         char* smem_buf) const
     {
         using namespace cute;
@@ -225,6 +229,8 @@ struct AmperePredicatedFprop {
             SmemCopyAtomAct,
             cute::identity>;
 
+        int leafID = blockIdx.x;
+
         TiledMma tiled_mma;
         Tensor accum = partition_fragment_C(tiled_mma, TilerOut{});
 
@@ -243,16 +249,16 @@ struct AmperePredicatedFprop {
             auto m_coord = idx2crd(int(blockIdx.y), shape<2>(gA_mk));
 #if 0
             auto n_layout = make_layout(shape<2>(gB_nk), GenRowMajor{});
-            auto n_coord = idx2crd(int(8*blockIdx.x+clusterID), shape(n_layout), stride(n_layout));
+            auto n_coord = idx2crd(int(8*leafID+clusterID), shape(n_layout), stride(n_layout));
 #elif 0
             // This version produces the exactly same order as above
             auto clusterLayout = make_layout(ClusterShape{}, GenRowMajor{});
             auto clusterCoord = idx2crd(clusterID, shape(clusterLayout), stride(clusterLayout));
-            auto n_coord = make_tuple(cute::prepend(clusterCoord, blockIdx.x),_0{},_0{},_0{});
+            auto n_coord = make_tuple(cute::prepend(clusterCoord, leafID),_0{},_0{},_0{});
 #elif 1
             // Also correct, but clusters traversed in co-lex order
             auto clusterCoord = idx2crd(clusterID, ClusterShape{});
-            auto n_coord = make_tuple(cute::prepend(clusterCoord, blockIdx.x),_0{},_0{},_0{});
+            auto n_coord = make_tuple(cute::prepend(clusterCoord, leafID),_0{},_0{},_0{});
 #endif
 
             Tensor gA    = gA_mk   (_,_,m_coord,_);                                            // (BLK_M,BLK_K,k')

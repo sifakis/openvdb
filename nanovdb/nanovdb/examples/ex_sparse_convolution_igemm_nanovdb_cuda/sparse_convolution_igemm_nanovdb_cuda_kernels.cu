@@ -362,7 +362,9 @@ void ResultCompare(
     std::cout << "Discrepancy = " << result << std::endl;
 }
 
-template<class Operator, class FilterTensor,
+template<class Operator,
+    class BuildT,
+    class FilterTensor,
     class ActivationTensor,
     class ActivationTensorIndex,
     class OutputTensor,
@@ -376,6 +378,8 @@ __launch_bounds__(Operator::MaxThreadsPerBlock, Operator::MinBlocksPerMultiproce
       ActivationTensorIndex mActI,
       OutputTensor mOut,
       OutputTensorIndex mOutI,
+      const nanovdb::NanoGrid<BuildT>* inputGrid,
+      const nanovdb::NanoGrid<BuildT>* outputGrid,
       const float *inputData,
       float *outputData
   ) {
@@ -387,6 +391,8 @@ __launch_bounds__(Operator::MaxThreadsPerBlock, Operator::MinBlocksPerMultiproce
       mActI,
       mOut,
       mOutI,
+      inputGrid,
+      outputGrid,
       inputData,
       outputData,
       smem_buf);
@@ -906,8 +912,8 @@ void mainSparseConvolutionIGEMM(
 
     cudaCheck(
         cudaFuncSetAttribute(
-            kernel_entrypoint_custom<
-                AmperePredicatedFprop<IGEMM_Geometry>, decltype(tFilter), decltype(tXformedActGather),
+            kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, BuildT,
+                decltype(tFilter), decltype(tXformedActGather),
                 decltype(tGatherIndex), decltype(tXformedOutScatter), decltype(tScatterIndex)>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             smem_size
@@ -916,8 +922,8 @@ void mainSparseConvolutionIGEMM(
     int num_iterations = 10;
     for (int i = 0; i < num_iterations; ++i) {
         gpuTimer.start("Scatter-Gather Cutlass IGEMM (GPU) execution");
-        kernel_entrypoint_custom<
-            AmperePredicatedFprop<IGEMM_Geometry>, decltype(tFilter), decltype(tXformedActGather),
+        kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, BuildT,
+            decltype(tFilter), decltype(tXformedActGather),
             decltype(tGatherIndex), decltype(tXformedOutScatter), decltype(tScatterIndex)>
             <<<launch_grid, AmperePredicatedFprop<IGEMM_Geometry>::MaxThreadsPerBlock, smem_size>>>(
                 tFilter,
@@ -925,6 +931,8 @@ void mainSparseConvolutionIGEMM(
                 tGatherIndex,
                 tXformedOutScatter,
                 tScatterIndex,
+                inputGrid,
+                outputGrid,
                 inputData.data().get(),
                 outputData.data().get()
             );

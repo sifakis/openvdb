@@ -906,7 +906,6 @@ void mainSparseConvolutionIGEMM(
     // ((BLK_M, BLK_N), (m', n'))
     Tensor gOutput_mn = zipped_divide(tXformedOutScatter, typename AmperePredicatedFprop<IGEMM_Geometry>::TilerOut{});
     print("\n");print("shape(gOutput_mn)=");print(shape(gOutput_mn));print("\n");
-    dim3 launch_grid {outputLeafCount, static_cast<uint32_t>(size<1,0>(gOutput_mn)), 1};
     constexpr size_t smem_size = sizeof(typename AmperePredicatedFprop<IGEMM_Geometry>::SharedStorage);
     std::cout << "smem_size = " << smem_size << std::endl;
 
@@ -925,7 +924,7 @@ void mainSparseConvolutionIGEMM(
         kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, BuildT,
             decltype(tFilter), decltype(tXformedActGather),
             decltype(tGatherIndex), decltype(tXformedOutScatter), decltype(tScatterIndex)>
-            <<<launch_grid, AmperePredicatedFprop<IGEMM_Geometry>::MaxThreadsPerBlock, smem_size>>>(
+            <<<outputLeafCount, AmperePredicatedFprop<IGEMM_Geometry>::MaxThreadsPerBlock, smem_size>>>(
                 tFilter,
                 tXformedActGather,
                 tGatherIndex,

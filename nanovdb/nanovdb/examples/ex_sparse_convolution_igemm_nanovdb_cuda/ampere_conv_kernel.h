@@ -231,22 +231,40 @@ struct AmperePredicatedFprop {
 
         int leafID = blockIdx.x;
 
+        // Populate output (scatter) indices
+        const auto& outLeaf = mOutGrid->tree().template getFirstNode<0>()[leafID];
+        auto sCIdx_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sCIdxMatrix[0];
+        for (int i = 0; i < SettingsT::VoxelsPerLeafnodeNoHalo(); i += MaxThreadsPerBlock)
+            sCIdx_ptr[i+threadIdx.x] = outLeaf.getValue(i+threadIdx.x);
+
+        __syncthreads();
+
+#if 0
+        if (threadIdx.x == 0) {
+            auto gCIdx_ptr = &mOutIdx(make_tuple(0,make_tuple(make_tuple(leafID,0,0,0),0,0,0)));
+            for (int i = 0; i < SettingsT::VoxelsPerLeafnodeNoHalo(); ++i)
+                if (sCIdx_ptr[i] != gCIdx_ptr[i])
+                    printf("Inconsistency between on-the-fly and precomputed gather indices\n");
+        }
+        __syncthreads();
+#endif
+
         TiledMma tiled_mma;
         Tensor accum = partition_fragment_C(tiled_mma, TilerOut{});
 
-        for (int clusterID = 0; clusterID < size(ClusterShape{}); ++clusterID) {
+        // Set up tensors
+        // NOTE: blockIdx.x projects onto act-NDHW mode, y along the flt-K mode for the sake of higher dynamic range in NDHW
+        Tensor gA_mk    = local_tile(mFlt,    TilerFlt{}, make_coord(_,_));                // (BLK_M,BLK_K,m',k')
+        Tensor gB_nk    = local_tile(mAct,    TilerAct{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
+        Tensor gBIdx_nk = local_tile(mActIdx, TilerAct{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
+        Tensor gC_mn    = local_tile(mOut,    TilerOut{}, make_coord(_,_));                // (BLK_M,BLK_N,m',n')
+        Tensor gCIdx_mn = local_tile(mOutIdx, TilerOut{}, make_coord(_,_));                // (BLK_M,BLK_N,m',n')        
+        
+        for (int m_coord = 0; m_coord < size<2>(gA_mk); ++m_coord)
+        for (int clusterID = 0; clusterID < size(ClusterShape{}); ++clusterID)
+        {
             clear(accum);
         
-            // Set up tensors
-            // NOTE: blockIdx.x projects onto act-NDHW mode, y along the flt-K mode for the sake of higher dynamic range in NDHW
-            Tensor gA_mk    = local_tile(mFlt,    TilerFlt{}, make_coord(_,_));                // (BLK_M,BLK_K,m',k')
-            Tensor gB_nk    = local_tile(mAct,    TilerAct{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
-            Tensor gBIdx_nk = local_tile(mActIdx, TilerAct{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
-            Tensor gC_mn    = local_tile(mOut,    TilerOut{}, make_coord(_,_));                // (BLK_M,BLK_N,m',n')
-            Tensor gCIdx_mn = local_tile(mOutIdx, TilerOut{}, make_coord(_,_));                // (BLK_M,BLK_N,m',n')        
-        
-            // Compute m_coord and n_coord with their post-tiled shapes
-            auto m_coord = idx2crd(int(blockIdx.y), shape<2>(gA_mk));
 #if 0
             auto n_layout = make_layout(shape<2>(gB_nk), GenRowMajor{});
             auto n_coord = idx2crd(int(8*leafID+clusterID), shape(n_layout), stride(n_layout));
@@ -275,7 +293,7 @@ struct AmperePredicatedFprop {
             auto sBPred_cosize = cosize(gBIdx.layout());
             for (int i = 0; i < sBPred_cosize; i += MaxThreadsPerBlock)
                 if (i+threadIdx.x < sBPred_cosize)
-                    sBPred_ptr[i+threadIdx.x] = (gBIdx_ptr[i+threadIdx.x] != 0);
+                    sBPred_ptr[i+threadIdx.x] = gBIdx_ptr[i+threadIdx.x];
             
             auto sCPred_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sCPredMatrix[0];
             auto gCIdx_ptr = gCIdx.data();
@@ -283,7 +301,7 @@ struct AmperePredicatedFprop {
             Tensor sCPred = make_tensor(make_smem_ptr(sCPred_ptr), gCIdx.layout());
             for (int i = 0; i < sCPred_cosize; i += MaxThreadsPerBlock)
                 if (i+threadIdx.x < sCPred_cosize)
-                    sCPred_ptr[i+threadIdx.x] = (gCIdx_ptr[i+threadIdx.x] != 0);
+                    sCPred_ptr[i+threadIdx.x] = gCIdx_ptr[i+threadIdx.x];
         
             __syncthreads();
         

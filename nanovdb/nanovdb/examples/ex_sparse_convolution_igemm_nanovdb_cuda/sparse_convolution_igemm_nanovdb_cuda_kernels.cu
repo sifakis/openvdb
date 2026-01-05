@@ -352,8 +352,13 @@ void ResultCompare(
     ValueType result = 0.f;
 #pragma omp parallel for reduction(max:result)
     for (int i = 0; i < size; i++)
-        for (int j = 0; j < Do; j++)
+        for (int j = 0; j < Do; j++) {
+            if (outputArray1[i][j] != outputArray2[i][j]) {
+                std::cout << "outputArray1[" << i << "][" << j << "] = " << outputArray1[i][j]
+                          << ", outputArray2[" << i << "][" << j << "] = " << outputArray2[i][j] << std::endl;
+            }
             result = std::max(result, std::abs(outputArray1[i][j]-outputArray2[i][j]));
+        }
     std::cout << "Discrepancy = " << result << std::endl;
 }
 
@@ -497,6 +502,12 @@ void mainSparseConvolutionIGEMM(
     for (int i = 0; i < Di; i++)
         outputArray[0][i] = outputReferenceArray[0][i] = ((float)distribution(generator))/256.0f; // Use only up to 7 bits in the mantissa   
     gpuTimer.stop();
+
+    ResultCompare<Do>(
+        outputValueCount,
+        outputArray,
+        outputReferenceArray
+    );
 
     gpuTimer.start("Initializing filter data");
     auto filterData = thrust::universal_vector<float>(3*3*3*Do*Di);
@@ -895,7 +906,7 @@ void mainSparseConvolutionIGEMM(
     // ((BLK_M, BLK_N), (m', n'))
     Tensor gOutput_mn = zipped_divide(tXformedOutScatter, typename AmperePredicatedFprop<IGEMM_Geometry>::TilerOut{});
     print("\n");print("shape(gOutput_mn)=");print(shape(gOutput_mn));print("\n");
-    dim3 launch_grid {static_cast<uint32_t>(size<1,1>(gOutput_mn)), static_cast<uint32_t>(size<1,0>(gOutput_mn)), 1};
+    dim3 launch_grid {outputLeafCount, static_cast<uint32_t>(size<1,0>(gOutput_mn)), 1};
     constexpr size_t smem_size = sizeof(typename AmperePredicatedFprop<IGEMM_Geometry>::SharedStorage);
     std::cout << "smem_size = " << smem_size << std::endl;
 
@@ -925,6 +936,8 @@ void mainSparseConvolutionIGEMM(
             );
         gpuTimer.stop();
     }
+
+    cudaDeviceSynchronize();
 
     ResultCompare<Do>(
         outputValueCount,

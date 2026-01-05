@@ -67,6 +67,10 @@ struct AmperePredicatedFprop {
     using PP = Int<SettingsT::PP>;
     using QQ = Int<SettingsT::QQ>;
 
+    using Cx = Int<SettingsT::Cx>;
+    using Cy = Int<SettingsT::Cy>;
+    using Cz = Int<SettingsT::Cz>;
+
     using C = Int<SettingsT::C>;
     using K = Int<SettingsT::K>;
 
@@ -90,6 +94,8 @@ struct AmperePredicatedFprop {
     using ElementFlt = tfloat32_t;
     using ElementAct = tfloat32_t;
     using ElementOut = float;
+
+    using ClusterShape = Shape<Cx,Cy,Cz>;
 
     using TiledMma = TiledMMA<
         MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>,
@@ -221,83 +227,96 @@ struct AmperePredicatedFprop {
 
         TiledMma tiled_mma;
         Tensor accum = partition_fragment_C(tiled_mma, TilerOut{});
-        clear(accum);
 
-        // Set up tensors
-        // NOTE: blockIdx.x projects onto act-NDHW mode, y along the flt-K mode for the sake of higher dynamic range in NDHW
-        Tensor gA_mk    = local_tile(mFlt,    TilerFlt{}, make_coord(_,_));                // (BLK_M,BLK_K,m',k')
-        Tensor gB_nk    = local_tile(mAct,    TilerAct{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
-        Tensor gBIdx_nk = local_tile(mActIdx, TilerAct{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
-        Tensor gC_mn    = local_tile(mOut,    TilerOut{}, make_coord(_,_));                // (BLK_M,BLK_N,m',n')
-        Tensor gCIdx_mn = local_tile(mOutIdx, TilerOut{}, make_coord(_,_));                // (BLK_M,BLK_N,m',n')        
-
-        // Compute m_coord and n_coord with their post-tiled shapes
-        auto m_coord = idx2crd(int(blockIdx.y), shape<2>(gA_mk));
-        auto n_layout = make_layout(shape<2>(gB_nk), GenRowMajor{});
-        auto n_coord = idx2crd(int(blockIdx.x), shape(n_layout), stride(n_layout));
-
-        Tensor gA    = gA_mk   (_,_,m_coord,_);                                            // (BLK_M,BLK_K,k')
-        Tensor gB    = gB_nk   (_,_,n_coord,_);                                            // (BLK_N,BLK_K,_1)
-        Tensor gBIdx = gBIdx_nk(_,_,n_coord,_);                                            // (BLK_N,BLK_K,_1)
-        Tensor gC    = gC_mn   (_,_,m_coord,n_coord);                                      // (BLK_M,BLK_N)
-        Tensor gCIdx = gCIdx_mn(_,_,m_coord,n_coord);                                      // (BLK_M,BLK_N)
+        for (int clusterID = 0; clusterID < size(ClusterShape{}); ++clusterID) {
+            clear(accum);
         
-        // Build gather predicate tensors in SMEM
-
-        auto sBPred_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sBPredMatrix[0];
-        auto gBIdx_ptr = gBIdx.data();
-        Tensor sBPred = make_tensor(make_smem_ptr(sBPred_ptr), gBIdx.layout());
-        auto sBPred_cosize = cosize(gBIdx.layout());
-        for (int i = 0; i < sBPred_cosize; i += MaxThreadsPerBlock)
-            if (i+threadIdx.x < sBPred_cosize)
-                sBPred_ptr[i+threadIdx.x] = gBIdx_ptr[i+threadIdx.x];
+            // Set up tensors
+            // NOTE: blockIdx.x projects onto act-NDHW mode, y along the flt-K mode for the sake of higher dynamic range in NDHW
+            Tensor gA_mk    = local_tile(mFlt,    TilerFlt{}, make_coord(_,_));                // (BLK_M,BLK_K,m',k')
+            Tensor gB_nk    = local_tile(mAct,    TilerAct{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
+            Tensor gBIdx_nk = local_tile(mActIdx, TilerAct{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
+            Tensor gC_mn    = local_tile(mOut,    TilerOut{}, make_coord(_,_));                // (BLK_M,BLK_N,m',n')
+            Tensor gCIdx_mn = local_tile(mOutIdx, TilerOut{}, make_coord(_,_));                // (BLK_M,BLK_N,m',n')        
         
-        auto sCPred_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sCPredMatrix[0];
-        auto gCIdx_ptr = gCIdx.data();
-        auto sCPred_cosize = cosize(gCIdx.layout());
-        Tensor sCPred = make_tensor(make_smem_ptr(sCPred_ptr), gCIdx.layout());
-        for (int i = 0; i < sCPred_cosize; i += MaxThreadsPerBlock)
-            if (i+threadIdx.x < sCPred_cosize)
-                sCPred_ptr[i+threadIdx.x] = gCIdx_ptr[i+threadIdx.x];
+            // Compute m_coord and n_coord with their post-tiled shapes
+            auto m_coord = idx2crd(int(blockIdx.y), shape<2>(gA_mk));
+#if 1
+            auto n_layout = make_layout(shape<2>(gB_nk), GenRowMajor{});
+            auto n_coord = idx2crd(int(8*blockIdx.x+clusterID), shape(n_layout), stride(n_layout));
+#elif 0
+            // This version produces the exactly same order as above
+            auto clusterLayout = make_layout(ClusterShape{}, GenRowMajor{});
+            auto clusterCoord = idx2crd(clusterID, shape(clusterLayout), stride(clusterLayout));
+            auto n_coord = make_tuple(cute::prepend(clusterCoord, blockIdx.x),_0{},_0{},_0{});
+#elif 1
+            auto clusterCoord = idx2crd(clusterID, ClusterShape{});
+            auto n_coord = make_tuple(cute::prepend(clusterCoord, blockIdx.x),_0{},_0{},_0{});
+#endif
 
-        __syncthreads();
-
-        auto k_tile_iter = cute::make_coord_iterator(size<2>(gA));
-        int k_tile_count = size<2>(gA);
-
-        CollectiveMainloop collective_mma;
-        collective_mma(
-            accum,
-            gA,
-            gB,
-            sBPred,
-            accum,
-            k_tile_iter, k_tile_count,
-            Underscore{}, // no residue since we do not support predication
-            threadIdx.x,
-            smem_buf);
-
-        //
-        // Epilogue
-        //
-
-        SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
-        Tensor sC = make_tensor(make_smem_ptr(&storage.epilogue.sCMatrix[0]), SmemLayoutOut{});
-
-        auto smem_tiled_copy_C = make_tiled_copy_C(SmemCopyAtomOut{}, tiled_mma);
-        auto smem_thr_copy_C = smem_tiled_copy_C.get_slice(threadIdx.x);
-        auto tCrC = smem_thr_copy_C.retile_S(accum);
-        auto tCsC = smem_thr_copy_C.partition_D(sC);
-        copy(smem_tiled_copy_C, tCrC, tCsC);
-
-        __syncthreads();
-
-        GmemTiledCopyOut gmem_tiled_copy_C;
-        auto gmem_thr_copy_C = gmem_tiled_copy_C.get_slice(threadIdx.x);
-        auto tDsC = gmem_thr_copy_C.partition_S(sC);
-        auto tDgC = gmem_thr_copy_C.partition_D(gC);
-        auto tDsCPred = gmem_thr_copy_C.partition_D(sCPred);
-
-        copy_if(gmem_tiled_copy_C, tDsCPred, tDsC, tDgC);
+            Tensor gA    = gA_mk   (_,_,m_coord,_);                                            // (BLK_M,BLK_K,k')
+            Tensor gB    = gB_nk   (_,_,n_coord,_);                                            // (BLK_N,BLK_K,_1)
+            Tensor gBIdx = gBIdx_nk(_,_,n_coord,_);                                            // (BLK_N,BLK_K,_1)
+            Tensor gC    = gC_mn   (_,_,m_coord,n_coord);                                      // (BLK_M,BLK_N)
+            Tensor gCIdx = gCIdx_mn(_,_,m_coord,n_coord);                                      // (BLK_M,BLK_N)
+            
+            // Build gather predicate tensors in SMEM
+        
+            auto sBPred_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sBPredMatrix[0];
+            auto gBIdx_ptr = gBIdx.data();
+            Tensor sBPred = make_tensor(make_smem_ptr(sBPred_ptr), gBIdx.layout());
+            auto sBPred_cosize = cosize(gBIdx.layout());
+            for (int i = 0; i < sBPred_cosize; i += MaxThreadsPerBlock)
+                if (i+threadIdx.x < sBPred_cosize)
+                    sBPred_ptr[i+threadIdx.x] = (gBIdx_ptr[i+threadIdx.x] != 0);
+            
+            auto sCPred_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sCPredMatrix[0];
+            auto gCIdx_ptr = gCIdx.data();
+            auto sCPred_cosize = cosize(gCIdx.layout());
+            Tensor sCPred = make_tensor(make_smem_ptr(sCPred_ptr), gCIdx.layout());
+            for (int i = 0; i < sCPred_cosize; i += MaxThreadsPerBlock)
+                if (i+threadIdx.x < sCPred_cosize)
+                    sCPred_ptr[i+threadIdx.x] = (gCIdx_ptr[i+threadIdx.x] != 0);
+        
+            __syncthreads();
+        
+            auto k_tile_iter = cute::make_coord_iterator(size<2>(gA));
+            int k_tile_count = size<2>(gA);
+        
+            CollectiveMainloop collective_mma;
+            collective_mma(
+                accum,
+                gA,
+                gB,
+                sBPred,
+                accum,
+                k_tile_iter, k_tile_count,
+                Underscore{}, // no residue since we do not support predication
+                threadIdx.x,
+                smem_buf);
+        
+            //
+            // Epilogue
+            //
+        
+            SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
+            Tensor sC = make_tensor(make_smem_ptr(&storage.epilogue.sCMatrix[0]), SmemLayoutOut{});
+        
+            auto smem_tiled_copy_C = make_tiled_copy_C(SmemCopyAtomOut{}, tiled_mma);
+            auto smem_thr_copy_C = smem_tiled_copy_C.get_slice(threadIdx.x);
+            auto tCrC = smem_thr_copy_C.retile_S(accum);
+            auto tCsC = smem_thr_copy_C.partition_D(sC);
+            copy(smem_tiled_copy_C, tCrC, tCsC);
+        
+            __syncthreads();
+        
+            GmemTiledCopyOut gmem_tiled_copy_C;
+            auto gmem_thr_copy_C = gmem_tiled_copy_C.get_slice(threadIdx.x);
+            auto tDsC = gmem_thr_copy_C.partition_S(sC);
+            auto tDgC = gmem_thr_copy_C.partition_D(gC);
+            auto tDsCPred = gmem_thr_copy_C.partition_D(sCPred);
+        
+            copy_if(gmem_tiled_copy_C, tDsCPred, tDsC, tDgC);
+        }
     }
 };

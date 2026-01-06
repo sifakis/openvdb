@@ -171,6 +171,15 @@ struct IGEMM_Layouts
             make_stride(_0{}, make_stride(make_stride(_512{}, _64{}*Z, _8{}*P,  Q), _64{}, _8{}, _1{})));
     }
 
+    static auto outputIndexLayout(const int N)
+    {
+        // Output scatter index layout
+        // scatter_layout_index(k, make_coord((nzpq))) => buffer_idx
+        return make_layout(
+            make_shape (   K, make_shape (make_shape (     Bx,     By, Bz),     Z,    P,    Q)),
+            make_stride(_0{}, make_stride(make_stride(_64{}*Z, _8{}*P,  Q), _64{}, _8{}, _1{})));
+    }
+
 };
 
 template<class SettingsT>
@@ -447,7 +456,8 @@ struct AmperePredicatedFprop {
         Tensor gA_mk    = local_tile(mFlt,    TilerFlt{}, make_coord(_,_));                // (BLK_M,BLK_K,m',k')
         Tensor mB_nk    = local_tile(mAct,    TilerAct{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
         Tensor gB_nk    = local_tile(gAct,    TilerActN{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
-        Tensor gBIdx_nk = local_tile(mActIdx, TilerAct{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
+        Tensor mBIdx_nk = local_tile(mActIdx, TilerAct{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
+        Tensor sBIdx_nk = local_tile(sActIdx, TilerActN{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
         Tensor gC_mn    = local_tile(mOut,    TilerOut{}, make_coord(_,_));                // (BLK_M,BLK_N,m',n')
         Tensor gCIdx_mn = local_tile(mOutIdx, TilerOut{}, make_coord(_,_));                // (BLK_M,BLK_N,m',n')        
         
@@ -474,7 +484,9 @@ struct AmperePredicatedFprop {
             Tensor gA    = gA_mk   (_,_,m_coord,_);                                            // (BLK_M,BLK_K,k')
             Tensor mB    = mB_nk   (_,_,n_coord,_);                                            // (BLK_N,BLK_K,_1)
             Tensor gB    = gB_nk   (_,_,N_coord,_);                                            // (BLK_N,BLK_K,_1)
-#if 1
+            Tensor mBIdx = mBIdx_nk(_,_,n_coord,_);                                            // (BLK_N,BLK_K,_1)
+            Tensor sBIdx = sBIdx_nk(_,_,N_coord,_);                                            // (BLK_N,BLK_K,_1)
+#if 0
             if(threadIdx.x == 0)
             {
                 for (int bii = 0; bii < shape<0,0,0>(gB); ++bii)
@@ -494,24 +506,25 @@ struct AmperePredicatedFprop {
                         auto mCoord = make_tuple(make_tuple(make_tuple(0,bii,bjj,bkk),z,p,q),make_tuple(cc,0,0,0),make_tuple(bc,t,r,s));
                         if(&gB(gCoord) != &mB(mCoord))
                             printf("Inconsistency between &gB and &mB\n");
+                        if(sBIdx(gCoord) != mBIdx(mCoord))
+                            printf("Inconsistency between sBIdx and mBIdx\n");
                     }
                         
                 }
             }
 #endif
-            Tensor gBIdx = gBIdx_nk(_,_,n_coord,_);                                            // (BLK_N,BLK_K,_1)
             Tensor gC    = gC_mn   (_,_,m_coord,n_coord);                                      // (BLK_M,BLK_N)
             Tensor gCIdx = gCIdx_mn(_,_,m_coord,n_coord);                                      // (BLK_M,BLK_N)
             
             // Build gather predicate tensors in SMEM
         
             auto sBPred_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sBPredMatrix[0];
-            auto gBIdx_ptr = gBIdx.data();
-            Tensor sBPred = make_tensor(make_smem_ptr(sBPred_ptr), gBIdx.layout());
-            auto sBPred_cosize = cosize(gBIdx.layout());
+            auto mBIdx_ptr = mBIdx.data();
+            Tensor sBPred = make_tensor(make_smem_ptr(sBPred_ptr), mBIdx.layout());
+            auto sBPred_cosize = cosize(mBIdx.layout());
             for (int i = 0; i < sBPred_cosize; i += MaxThreadsPerBlock)
                 if (i+threadIdx.x < sBPred_cosize)
-                    sBPred_ptr[i+threadIdx.x] = gBIdx_ptr[i+threadIdx.x];
+                    sBPred_ptr[i+threadIdx.x] = mBIdx_ptr[i+threadIdx.x];
             
             auto sCPred_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sCPredMatrix[0];
             auto gCIdx_ptr = gCIdx.data();

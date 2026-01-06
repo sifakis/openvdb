@@ -10,7 +10,6 @@
 #include <random>
 
 #include "ampere_conv_kernel.h"
-#include "gather_tensor.hpp"
 
 #define USE_HIERARCHICAL_BLOCK_TRAVERSAL
 
@@ -82,157 +81,6 @@ struct IGEMM_Geometry
 
 };
 
-
-template<class GeometryT>
-struct IGEMM_Layouts
-{
-    static constexpr auto T = Int<GeometryT::T>{};
-    static constexpr auto R = Int<GeometryT::R>{};
-    static constexpr auto S = Int<GeometryT::S>{};
-    static constexpr auto Z = Int<GeometryT::Z>{};
-    static constexpr auto P = Int<GeometryT::P>{};
-    static constexpr auto Q = Int<GeometryT::Q>{};
-    static constexpr auto D = Int<GeometryT::D>{};
-    static constexpr auto H = Int<GeometryT::H>{};
-    static constexpr auto W = Int<GeometryT::W>{};
-    static constexpr auto C = Int<GeometryT::C>{};
-    static constexpr auto K = Int<GeometryT::K>{};
-    static constexpr auto Bx = Int<GeometryT::Bx>{};
-    static constexpr auto By = Int<GeometryT::By>{};
-    static constexpr auto Bz = Int<GeometryT::Bz>{};
-    static constexpr auto Hx = Int<GeometryT::Hx>{};
-    static constexpr auto Hy = Int<GeometryT::Hy>{};
-    static constexpr auto Hz = Int<GeometryT::Hz>{};
-
-    static auto xformedActivationComposedLayoutLegacy(const int N, const uint64_t* gather_idx_buf)
-    {
-        // Input gather layout
-        // inner_layout(make_coord((nzpq), (csrt))) => (idx_buffer_idx, dense_c_idx)
-        auto EG = E<0>{};  // Gather basis     (1,0) (idx_buffer_idx) 
-        auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)    
-        auto xformed_act_logical_inner = make_layout(
-            make_shape (make_shape (       N,      Z,    P,  Q), make_shape ( C,      T,    R,  S)),
-            make_stride(make_stride(D*H*W*EG, H*W*EG, W*EG, EG), make_stride(EC, H*W*EG, W*EG, EG)));
-
-        // outer_layout(make_coord(idx_buffer_idx, dense_c_idx)) => idx
-        // IndexedGather obtains idx by applying (gmem_base_ptr + gather_idx_buf[idx_buffer_idx] + dense_offset)
-        auto xformed_act_gather_outer = make_layout(
-            make_shape(_1{},_1{}),
-            make_stride(example::CustomStride{example::IndexedGather{gather_idx_buf}, C}, _1{}));
-
-        // Compose the inner and outer layouts
-        // gather_composed(make_coord((nzpq), (csrt))) => idx
-        return composition(
-            xformed_act_gather_outer,
-            make_arithmetic_tuple(_0{}, _0{}),
-            xformed_act_logical_inner);
-    }
-
-    static auto xformedActivationComposedLayout(const int N, const uint64_t* gather_idx_buf)
-    {
-        // Input gather layout
-        // inner_layout(make_coord((nzpq), (csrt))) => (idx_buffer_idx, dense_c_idx)
-        auto EG = E<0>{};  // Gather basis     (1,0) (idx_buffer_idx) 
-        auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)    
-        auto xformed_act_logical_inner = make_layout(
-            make_shape (make_shape (make_shape (          N,         Bx,      By,   Bz),        Z,     P,  Q), make_shape ( C,        T,     R,  S)),
-            make_stride(make_stride(make_stride(Hx*Hy*Hz*EG, Hy*Hz*Z*EG, Hz*P*EG, Q*EG), Hy*Hz*EG, Hz*EG, EG), make_stride(EC, Hy*Hz*EG, Hz*EG, EG)));
-
-        // outer_layout(make_coord(idx_buffer_idx, dense_c_idx)) => idx
-        // IndexedGather obtains idx by applying (gmem_base_ptr + gather_idx_buf[idx_buffer_idx] + dense_offset)
-        auto xformed_act_gather_outer = make_layout(
-            make_shape(_1{},_1{}),
-            make_stride(example::CustomStride{example::IndexedGather{gather_idx_buf}, C}, _1{}));
-
-        // Compose the inner and outer layouts
-        // gather_composed(make_coord((nzpq), (csrt))) => idx
-        return composition(
-            xformed_act_gather_outer,
-            make_arithmetic_tuple(_0{}, _0{}),
-            xformed_act_logical_inner);
-    }
-
-    static auto gatherIndexLayoutLegacy(const int N)
-    {
-        // Input gather index layout
-        // gather_layout_index(make_coord((ndhw), c)) => buffer_idx
-        return make_layout(
-            make_shape (make_shape (    N,   D, H,  W  ), make_shape ( C  , _1{}, _1{}, _1{})),
-            make_stride(make_stride(D*H*W, H*W, W, _1{}), make_stride(_0{}, _0{}, _0{}, _0{})));
-    }
-
-    static auto gatherIndexLayout(const int N)
-    {
-        // Input gather index layout
-        // gather_layout_index(make_coord((ndhw), c)) => buffer_idx
-        return make_layout(
-            make_shape (make_shape (make_shape (       N,      Bx,   By, Bz),     Z,  P,    Q), make_shape (   C,     T,  R,    S)),
-            make_stride(make_stride(make_stride(Hx*Hy*Hz, Hy*Hz*Z, Hz*P,  Q), Hy*Hz, Hz, _1{}), make_stride(_0{}, Hy*Hz, Hz, _1{})));
-    }
-
-    static auto filterLayout()
-    {
-        return make_ordered_layout(
-            make_shape(K, make_shape(C, T, R, S)),
-            tuple<_1, tuple<_0,_4,_3,_2>>{}
-        );
-    }
-
-    static auto xformedOutputComposedLayoutLegacy(const int N, const uint64_t* scatter_idx_buf)
-    {
-        // Output scatter layout
-        // scatter_layout_index(k, make_coord((nzpq))) => buffer_idx
-        auto ES = E<0>{};  // Scatter basis    (1,0) (idx_buffer_idx)
-        auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)
-        auto xformed_out_logical_inner = make_layout(
-            make_shape ( K, make_shape(        N,      Z,    P,  Q)),
-            make_stride(EC, make_stride(Z*P*Q*ES, P*Q*ES, Q*ES, ES)));
-        auto xformed_out_scatter_outer = make_layout(
-            make_shape(_1{},_1{}),
-            make_stride(example::CustomStride{example::IndexedGather{scatter_idx_buf}, K}, _1{}));
-        return composition(
-            xformed_out_scatter_outer,
-            make_arithmetic_tuple(_0{},_0{}),
-            xformed_out_logical_inner);
-    }
-
-    static auto xformedOutputComposedLayout(const int N, const uint64_t* scatter_idx_buf)
-    {
-        // Output scatter layout
-        // scatter_layout_index(k, make_coord((nzpq))) => buffer_idx
-        auto ES = E<0>{};  // Scatter basis    (1,0) (idx_buffer_idx)
-        auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)
-        auto xformed_out_logical_inner = make_layout(
-            make_shape ( K, make_shape (make_shape (        N,         Bx,        By,   Bz),        Z,       P,  Q)),
-            make_stride(EC, make_stride(make_stride(_512{}*ES, _64{}*Z*ES, _8()*P*ES, Q*ES), _64{}*ES, _8{}*ES, ES)));
-        auto xformed_out_scatter_outer = make_layout(
-            make_shape(_1{},_1{}),
-            make_stride(example::CustomStride{example::IndexedGather{scatter_idx_buf}, K}, _1{}));
-        return composition(
-            xformed_out_scatter_outer,
-            make_arithmetic_tuple(_0{},_0{}),
-            xformed_out_logical_inner);
-    }
-
-    static auto scatterIndexLayoutLegacy(const int N)
-    {
-        // Output scatter index layout
-        // scatter_layout_index(k, make_coord((nzpq))) => buffer_idx
-        return make_layout(
-            make_shape (   K, make_shape (    N,   Z, P,  Q  )),
-            make_stride(_0{}, make_stride(Z*P*Q, P*Q, Q, _1{})));
-    }
-
-    static auto scatterIndexLayout(const int N)
-    {
-        // Output scatter index layout
-        // scatter_layout_index(k, make_coord((nzpq))) => buffer_idx
-        return make_layout(
-            make_shape (   K, make_shape (make_shape (     N,      Bx,     By, Bz),     Z,    P,    Q)),
-            make_stride(_0{}, make_stride(make_stride(_512{}, _64{}*Z, _8{}*P,  Q), _64{}, _8{}, _1{})));
-    }
-
-};
 
 template<class GeometryT, int Di, int Do, class ValueType>
 void SparseConvolveCPUReference(
@@ -529,28 +377,6 @@ void mainSparseConvolutionIGEMM(
     auto blockedLeafLayout = make_ordered_layout(
         blockedLeafShape,
         make_tuple(make_tuple(_2{},_1{},_0{}),make_tuple(_5{},_4{},_3{})));
-
-#if 0
-    print("\n");
-    print("leafShape=");print(leafShape);print("\n");
-    print("blockedLeafShape=");print(blockedLeafShape);print("\n");
-    print("blockedLeafLayout=");print(blockedLeafLayout);print("\n");
-    for (int bbi = 0; bbi < shape<1,0>(blockedLeafLayout); ++bbi)
-    for (int bbj = 0; bbj < shape<1,1>(blockedLeafLayout); ++bbj)
-    for (int bbk = 0; bbk < shape<1,2>(blockedLeafLayout); ++bbk)
-    for (int bii = 0; bii < shape<0,0>(blockedLeafLayout); ++bii)
-    for (int bjj = 0; bjj < shape<0,1>(blockedLeafLayout); ++bjj)
-    for (int bkk = 0; bkk < shape<0,2>(blockedLeafLayout); ++bkk)
-    {
-        int bi = bbi * shape<0,0>(blockedLeafLayout) + bii;
-        int bj = bbj * shape<0,1>(blockedLeafLayout) + bjj;
-        int bk = bbk * shape<0,2>(blockedLeafLayout) + bkk;
-        printf("((%d,%d,%d),(%d,%d,%d)) -> %d (%d,%d,%d)\n", bii, bjj, bkk, bbi, bbj, bbk,
-            blockedLeafLayout(make_tuple(bii, bjj, bkk), make_tuple(bbi, bbj, bbk)),
-            bi, bj, bk
-        );
-    }
-#endif        
 #endif
 
     auto outputVoxelsPerBlock = IGEMM_Geometry::Z * IGEMM_Geometry::P * IGEMM_Geometry::Q;
@@ -714,19 +540,9 @@ void mainSparseConvolutionIGEMM(
 
     IGEMM_Layouts<IGEMM_Geometry> layouts;
 
-    Tensor tXformedActGatherLegacy = make_tensor(
-        make_gmem_ptr(inputData.data().get()),
-        layouts.xformedActivationComposedLayoutLegacy(blockCount, gatherIndexDataLegacy.data().get())
-    );
-
     Tensor tXformedActGather = make_tensor(
         make_gmem_ptr(inputData.data().get()),
         layouts.xformedActivationComposedLayout(outputLeafCount, gatherIndexData.data().get())
-    );
-
-    Tensor tGatherIndexLegacy = make_tensor(
-        make_gmem_ptr(gatherIndexDataLegacy.data().get()),
-        layouts.gatherIndexLayoutLegacy(blockCount)
     );
 
     Tensor tGatherIndex = make_tensor(
@@ -735,104 +551,9 @@ void mainSparseConvolutionIGEMM(
     );
 
 
-#if 0
-    auto tXformedActGatherTiled = local_tile(tXformedActGather, ConvOp::TilerAct{}, make_coord(_,_));
-    auto tGatherIndexTiled = local_tile(tGatherIndex, ConvOp::TilerAct{}, make_coord(_,_));
-    // print("tXformedActGather.layout() = ");print(tXformedActGather.layout());print("\n");
-    // print("tXformedActGatherTiled.layout() = ");print(tXformedActGatherTiled.layout());print("\n");
-    // print("tGatherIndex.layout() = ");print(tGatherIndex.layout());print("\n");
-    // print("tGatherIndexTiled.layout() = ");print(tGatherIndexTiled.layout());print("\n");
-
-    for (int l = 0; l < outputLeafCount; ++l)
-        for (int bbi = 0; bbi < size<2,0,1>(tGatherIndexTiled); ++bbi)
-        for (int bbj = 0; bbj < size<2,0,2>(tGatherIndexTiled); ++bbj)
-        for (int bbk = 0; bbk < size<2,0,3>(tGatherIndexTiled); ++bbk)
-            for (int bii = 0; bii < size<0,0,1>(tGatherIndexTiled); ++bii)
-            for (int bjj = 0; bjj < size<0,0,2>(tGatherIndexTiled); ++bjj)
-            for (int bkk = 0; bkk < size<0,0,3>(tGatherIndexTiled); ++bkk)
-                for (int iii = 0; iii < size<0,1>(tGatherIndexTiled); ++iii)
-                for (int jjj = 0; jjj < size<0,2>(tGatherIndexTiled); ++jjj)
-                for (int kkk = 0; kkk < size<0,3>(tGatherIndexTiled); ++kkk)
-                    for (int t = 0; t < size<3,1>(tGatherIndexTiled); ++t)
-                    for (int r = 0; r < size<3,2>(tGatherIndexTiled); ++r)
-                    for (int s = 0; s < size<3,3>(tGatherIndexTiled); ++s)
-                    {
-                        //                     (((0,bii,bjj,bkk),iii,jjj,kkk),(cc,0,0,0),(( l,bbi,bbj,bbk),0,0,0),(bc,t,r,s))
-                        auto coord = 
-                            make_tuple         (
-                                make_tuple      (
-                                    make_tuple   (0,bii,bjj,bkk),iii,jjj,kkk),
-                                make_tuple                                    ( 0,0,0,0),
-                                make_tuple                                               (
-                                    make_tuple                                            ( l,bbi,bbj,bbk),0,0,0),
-                                make_tuple                                                                        ( 0,t,r,s));
-
-                        for (int bc = 0; bc < size<3,0>(tGatherIndexTiled); ++bc)
-                        for (int cc = 0; cc < size<1,0>(tGatherIndexTiled); ++cc)
-                        {
-                            //                     (((0,bii,bjj,bkk),iii,jjj,kkk),(cc,0,0,0),(( l,bbi,bbj,bbk),0,0,0),(bc,t,r,s))
-                            auto component_coord = 
-                                make_tuple         (
-                                    make_tuple      (
-                                        make_tuple   (0,bii,bjj,bkk),iii,jjj,kkk),
-                                    make_tuple                                    (cc,0,0,0),
-                                    make_tuple                                               (
-                                        make_tuple                                            ( l,bbi,bbj,bbk),0,0,0),
-                                    make_tuple                                                                        (bc,t,r,s));
-                            int c = bc * size<1,0>(tGatherIndexTiled) + cc;
-                            if(&tXformedActGatherTiled(component_coord) !=
-                                inputData.data().get() + tGatherIndexTiled(coord) * IGEMM_Geometry::C + c)
-                                throw std::runtime_error("Inconsistency detected between input activations and gather indices");
-                        }
-                }
-#endif
-
-#if 0
-    for (int n = 0; n < blockCount; ++n)
-        for (int z = 0; z < IGEMM_Geometry::Z; ++z)
-        for (int p = 0; p < IGEMM_Geometry::P; ++p)
-        for (int q = 0; q < IGEMM_Geometry::Q; ++q) 
-            for (int t = 0; t < IGEMM_Geometry::T; ++t)
-            for (int r = 0; r < IGEMM_Geometry::R; ++r)
-            for (int s = 0; s < IGEMM_Geometry::S; ++s)
-                for (int c = 0; c < IGEMM_Geometry::C; ++c) {
-                    if (&tXformedActGatherLegacy(make_tuple(n,z,p,q),make_tuple(c,t,r,s)) !=
-                        inputData.data().get()+IGEMM_Geometry::C*tGatherIndexLegacy(make_tuple(n,z+t,p+r,q+s),make_tuple(c,0,0,0))+c)
-                    {
-                        std::cout << "tXformedActGatherLegacy("
-                                  << "(" << std::setw(6) << n << "," << z << "," << p << "," << q << "),"
-                                  << "(" << std::setw(2) << c << "," << t << "," << r << "," << s << ")) = "
-                                  << tXformedActGatherLegacy(make_tuple(n,z,p,q),make_tuple(c,t,r,s))
-                                  << ", tGatherIndexLegacy(" 
-                                  << "(" << std::setw(6) << n << "," << z+t << "," << p+r << "," << q+s << "),"
-                                  << "(" << std::setw(2) << c << ",0,0,0)) = "
-                                  << tGatherIndexLegacy(make_tuple(n,z+t,p+r,q+s),make_tuple(c,0,0,0))
-                                  << std::endl;
-                    }
-                    if (tGatherIndexLegacy(make_tuple(n,z+t,p+r,q+s),make_tuple(c,0,0,0)) == 0)
-                        if (tXformedActGatherLegacy(make_tuple(n,z,p,q),make_tuple(c,t,r,s)) != 0.f)
-                        {
-                            std::cout << "tXformedActGatherLegacy("
-                                      << "(" << std::setw(6) << n << "," << z << "," << p << "," << q << "),"
-                                      << "(" << std::setw(2) << c << "," << t << "," << r << "," << s << ")) = "
-                                      << tXformedActGatherLegacy(make_tuple(n,z,p,q),make_tuple(c,t,r,s))
-                                      << ", tGatherIndexLegacy(" 
-                                      << "(" << std::setw(6) << n << "," << z+t << "," << p+r << "," << q+s << "),"
-                                      << "(" << std::setw(2) << c << ",0,0,0)) = "
-                                      << tGatherIndexLegacy(make_tuple(n,z+t,p+r,q+s),make_tuple(c,0,0,0))
-                                      << std::endl;
-                        }   
-                }
-#endif
-
     Tensor tFilter = make_tensor(
         make_gmem_ptr(filterData.data().get()),
         layouts.filterLayout()
-    );
-
-    Tensor tXformedOutScatterLegacy = make_tensor(
-        make_gmem_ptr(outputData.data().get()),
-        layouts.xformedOutputComposedLayoutLegacy(blockCount, scatterIndexDataLegacy.data().get())
     );
 
     Tensor tXformedOutScatter = make_tensor(
@@ -840,69 +561,11 @@ void mainSparseConvolutionIGEMM(
         layouts.xformedOutputComposedLayout(outputLeafCount, scatterIndexData.data().get())
     );
 
-    Tensor tScatterIndexLegacy = make_tensor(
-        make_gmem_ptr(scatterIndexDataLegacy.data().get()),
-        layouts.scatterIndexLayoutLegacy(blockCount)
-    );
- 
     Tensor tScatterIndex = make_tensor(
         make_gmem_ptr(scatterIndexData.data().get()),
         layouts.scatterIndexLayout(outputLeafCount)
     );
     
-#if 0
-    auto tXformedOutScatterTiled = local_tile(tXformedOutScatter, ConvOp::TilerOut{}, make_coord(_,_));
-    auto tScatterIndexTiled = local_tile(tScatterIndex, ConvOp::TilerOut{}, make_coord(_,_));
-    // print("tXformedOutScatter.layout() = ");print(tXformedOutScatter.layout());print("\n");
-    // print("tXformedOutScatterTiled.layout() = ");print(tXformedOutScatterTiled.layout());print("\n");
-    // print("tScatterIndex.layout() = ");print(tScatterIndex.layout());print("\n");
-    // print("tScatterIndexTiled.layout() = ");print(tScatterIndexTiled.layout());print("\n");
-
-    for (int l = 0; l < outputLeafCount; ++l)
-        for (int bbi = 0; bbi < size<3,0,1>(tScatterIndexTiled); ++bbi)
-        for (int bbj = 0; bbj < size<3,0,2>(tScatterIndexTiled); ++bbj)
-        for (int bbk = 0; bbk < size<3,0,3>(tScatterIndexTiled); ++bbk)
-            for (int bii = 0; bii < size<1,0,1>(tScatterIndexTiled); ++bii)
-            for (int bjj = 0; bjj < size<1,0,2>(tScatterIndexTiled); ++bjj)
-            for (int bkk = 0; bkk < size<1,0,3>(tScatterIndexTiled); ++bkk)
-                for (int iii = 0; iii < size<1,1>(tScatterIndexTiled); ++iii)
-                for (int jjj = 0; jjj < size<1,2>(tScatterIndexTiled); ++jjj)
-                for (int kkk = 0; kkk < size<1,3>(tScatterIndexTiled); ++kkk)
-                {
-                    auto coord =
-                        make_tuple
-                                           (0,
-                            make_tuple
-                                              (
-                                make_tuple
-                                               (0,bii,bjj,bkk),iii,jjj,kkk),0,
-                            make_tuple
-                                                                              (
-                                make_tuple
-                                                                               ( l,bbi,bbj,bbk),0,0,0));
-
-                    for (int bk = 0; bk < size<2>(tScatterIndexTiled); ++bk)
-                    for (int kk = 0; kk < size<0>(tScatterIndexTiled); ++kk)
-                    {
-                        int k = bk * size<0>(tScatterIndexTiled) + kk;
-                        auto component_coord = 
-                            make_tuple
-                                                 (kk,
-                                make_tuple
-                                                     (
-                                    make_tuple
-                                                      (0,bii,bjj,bkk),iii,jjj,kkk),bk,
-                                make_tuple
-                                                                                     (
-                                    make_tuple
-                                                                                      ( l,bbi,bbj,bbk),0,0,0));
-                        if(&tXformedOutScatterTiled(component_coord) !=
-                            outputData.data().get() + tScatterIndexTiled(coord) * IGEMM_Geometry::K + k)
-                            throw std::runtime_error("Inconsistent addresses");
-                    }
-                }
-#endif
-
     // ((BLK_M, BLK_N), (m', n'))
     Tensor gOutput_mn = zipped_divide(tXformedOutScatter, typename AmperePredicatedFprop<IGEMM_Geometry>::TilerOut{});
     print("\n");print("shape(gOutput_mn)=");print(shape(gOutput_mn));print("\n");

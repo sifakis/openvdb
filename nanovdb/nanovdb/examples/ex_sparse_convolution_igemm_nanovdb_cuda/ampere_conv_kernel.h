@@ -248,27 +248,23 @@ struct AmperePredicatedFprop {
         auto sCIdx_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sCIdxMatrix[0];
         for (int v = 0; v < SettingsT::VoxelsPerLeafnodeNoHalo(); v += MaxThreadsPerBlock)
             sCIdx_ptr[v+threadIdx.x] = outLeaf.getValue(v+threadIdx.x);
+        const auto& actTree = mActGrid->tree();
         auto sBIdx_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sBIdxMatrix[0];
+        const auto filterOrigin = outLeaf.origin().offsetBy(SettingsT::Dx,SettingsT::Dy,SettingsT::Dz);
         for (int v = 0; v < SettingsT::VoxelsPerLeafnodeWithHalo(); v += MaxThreadsPerBlock)
-            if ((v+threadIdx.x) < SettingsT::VoxelsPerLeafnodeWithHalo())
-            {
-                int ii =  (v+threadIdx.x) / (SettingsT::Hy*SettingsT::Hz);
-                int jj = ((v+threadIdx.x) / SettingsT::Hz) % SettingsT::Hy;
-                int kk =  (v+threadIdx.x)                  % SettingsT::Hz;
+            if ((v+threadIdx.x) < SettingsT::VoxelsPerLeafnodeWithHalo()) {
                 auto [i,j,k] = idx2crd(v+threadIdx.x, shape(HaloLayout{}), stride(HaloLayout{}));
-                if (leafID==0)
-                    printf("v=%d, (i,j,k)=(%d,%d,%d)\n", v+threadIdx.x, i, j,k);
-                
+                sBIdx_ptr[v+threadIdx.x] = actTree.getValue(filterOrigin.offsetBy(i,j,k));
             }
 
-        // sCIdx_ptr[v+threadIdx.x] = outLeaf.getValue(v+threadIdx.x);
-        if (thread0()) {
-            print("halo_layout=");print(HaloLayout{});print("\n");
-        }
         __syncthreads();
 
 #if 1
         if (threadIdx.x == 0) {
+            auto gBIdx_ptr = &mActIdx(make_tuple(make_tuple(make_tuple(leafID,0,0,0),0,0,0),make_tuple(0,0,0,0)));
+            for (int v = 0; v < SettingsT::VoxelsPerLeafnodeWithHalo(); ++v)
+               if (sBIdx_ptr[v] != gBIdx_ptr[v])
+                    printf("Inconsistency between on-the-fly and precomputed gather indices\n");
             auto gCIdx_ptr = &mOutIdx(make_tuple(0,make_tuple(make_tuple(leafID,0,0,0),0,0,0)));
             for (int v = 0; v < SettingsT::VoxelsPerLeafnodeNoHalo(); ++v)
                if (sCIdx_ptr[v] != gCIdx_ptr[v])

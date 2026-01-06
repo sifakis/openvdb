@@ -581,7 +581,7 @@ void mainSparseConvolutionIGEMM(
             smem_size
         ));
 
-    int num_iterations = 10;
+    int num_iterations = 1;
     for (int i = 0; i < num_iterations; ++i) {
         gpuTimer.start("Scatter-Gather Cutlass IGEMM (GPU) execution");
         kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, BuildT,

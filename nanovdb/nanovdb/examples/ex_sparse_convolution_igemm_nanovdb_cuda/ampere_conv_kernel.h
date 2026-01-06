@@ -47,26 +47,26 @@
 using namespace cute;
 
 
-template<class GeometryT>
+template<class SettingsT>
 struct IGEMM_Layouts
 {
-    static constexpr auto T = Int<GeometryT::T>{};
-    static constexpr auto R = Int<GeometryT::R>{};
-    static constexpr auto S = Int<GeometryT::S>{};
-    static constexpr auto Z = Int<GeometryT::Z>{};
-    static constexpr auto P = Int<GeometryT::P>{};
-    static constexpr auto Q = Int<GeometryT::Q>{};
-    static constexpr auto D = Int<GeometryT::D>{};
-    static constexpr auto H = Int<GeometryT::H>{};
-    static constexpr auto W = Int<GeometryT::W>{};
-    static constexpr auto C = Int<GeometryT::C>{};
-    static constexpr auto K = Int<GeometryT::K>{};
-    static constexpr auto Bx = Int<GeometryT::Bx>{};
-    static constexpr auto By = Int<GeometryT::By>{};
-    static constexpr auto Bz = Int<GeometryT::Bz>{};
-    static constexpr auto Hx = Int<GeometryT::Hx>{};
-    static constexpr auto Hy = Int<GeometryT::Hy>{};
-    static constexpr auto Hz = Int<GeometryT::Hz>{};
+    static constexpr auto T = Int<SettingsT::T>{};
+    static constexpr auto R = Int<SettingsT::R>{};
+    static constexpr auto S = Int<SettingsT::S>{};
+    static constexpr auto Z = Int<SettingsT::Z>{};
+    static constexpr auto P = Int<SettingsT::P>{};
+    static constexpr auto Q = Int<SettingsT::Q>{};
+    static constexpr auto D = Int<SettingsT::D>{};
+    static constexpr auto H = Int<SettingsT::H>{};
+    static constexpr auto W = Int<SettingsT::W>{};
+    static constexpr auto C = Int<SettingsT::C>{};
+    static constexpr auto K = Int<SettingsT::K>{};
+    static constexpr auto Bx = Int<SettingsT::Bx>{};
+    static constexpr auto By = Int<SettingsT::By>{};
+    static constexpr auto Bz = Int<SettingsT::Bz>{};
+    static constexpr auto Hx = Int<SettingsT::Hx>{};
+    static constexpr auto Hy = Int<SettingsT::Hy>{};
+    static constexpr auto Hz = Int<SettingsT::Hz>{};
 
     static auto xformedActivationComposedLayout(const int N, const uint64_t* gather_idx_buf)
     {
@@ -90,6 +90,41 @@ struct IGEMM_Layouts
             xformed_act_gather_outer,
             make_arithmetic_tuple(_0{}, _0{}),
             xformed_act_logical_inner);
+    }
+
+    __hostdev__
+    static auto activationComposedGatherLayout(const uint64_t* gather_idx_buf)
+    {
+        // Input gather layout
+        // inner_layout(make_coord((nzpq), (csrt))) => (idx_buffer_idx, dense_c_idx)
+        auto EG = E<0>{};  // Gather basis     (1,0) (idx_buffer_idx) 
+        auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)    
+        auto xformed_act_logical_inner = make_layout(
+            make_shape (make_shape (make_shape (        Bx,      By,   Bz),        Z,     P,  Q), make_shape ( C,        T,     R,  S)),
+            make_stride(make_stride(make_stride(Hy*Hz*Z*EG, Hz*P*EG, Q*EG), Hy*Hz*EG, Hz*EG, EG), make_stride(EC, Hy*Hz*EG, Hz*EG, EG)));
+
+        // outer_layout(make_coord(idx_buffer_idx, dense_c_idx)) => idx
+        // IndexedGather obtains idx by applying (gmem_base_ptr + gather_idx_buf[idx_buffer_idx] + dense_offset)
+        auto xformed_act_gather_outer = make_layout(
+            make_shape(_1{},_1{}),
+            make_stride(example::CustomStride{example::IndexedGather{gather_idx_buf}, Int<SettingsT::C>{}}, _1{}));
+
+        // Compose the inner and outer layouts
+        // gather_composed(make_coord((nzpq), (csrt))) => idx
+        return composition(
+            xformed_act_gather_outer,
+            make_arithmetic_tuple(_0{}, _0{}),
+            xformed_act_logical_inner);
+    }
+
+    __hostdev__
+    static auto activationIndexLayout()
+    {
+        // Input gather index layout
+        // gather_layout_index(make_coord((ndhw), c)) => buffer_idx
+        return make_layout(
+            make_shape (make_shape (make_shape (     Bx,   By, Bz),     Z,  P,    Q), make_shape (   C,     T,  R,    S)),
+            make_stride(make_stride(make_stride(Hy*Hz*Z, Hz*P,  Q), Hy*Hz, Hz, _1{}), make_stride(_0{}, Hy*Hz, Hz, _1{})));
     }
 
     static auto gatherIndexLayout(const int N)
@@ -143,9 +178,6 @@ struct AmperePredicatedFprop {
     //
     // Static config for conv problem shape
     //
-    using D = Int<SettingsT::D>;
-    using H = Int<SettingsT::H>;
-    using W = Int<SettingsT::W>;
 
     using T = Int<SettingsT::T>;
     using R = Int<SettingsT::R>;
@@ -194,20 +226,6 @@ struct AmperePredicatedFprop {
     using ClusterShape = Shape<Cx,Cy,Cz>;
     using HaloLayout = decltype(make_layout(Shape<Hx,Hy,Hz>{},GenRowMajor{}));
 
-    // static auto gatherIndexLayout(const int N)
-    // {
-    //     // Input gather index layout
-    //     // gather_layout_index(make_coord((ndhw), c)) => buffer_idx
-    //     return make_layout(
-    //         make_shape (make_shape (make_shape (       N,      Bx,   By, Bz),     Z,  P,    Q), make_shape (   C,     T,  R,    S)),
-    //         make_stride(make_stride(make_stride(Hx*Hy*Hz, Hy*Hz*Z, Hz*P,  Q), Hy*Hz, Hz, _1{}), make_stride(_0{}, Hy*Hz, Hz, _1{})));
-    // }
-
-    // using GatherIndex =
-    //  // make_shape (make_shape (make_shape (       N,      Bx,   By, Bz),     Z,  P,    Q), make_shape (   C,     T,  R,    S)),
-    //     Shape      <Shape      <Shape      <               Bx,   By, Bz>,     Z,  P,    Q>, Shape <   C,     T,  R,    S>>
-    //     ;
-        
     using TiledMma = TiledMMA<
         MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>,
         Layout<Shape<_2,_2,_1>>,
@@ -363,6 +381,43 @@ struct AmperePredicatedFprop {
                 sBIdx_ptr[v+threadIdx.x] = actTree.getValue(filterOrigin.offsetBy(i,j,k));
             }
 
+        __syncthreads();
+
+        Tensor gAct = make_tensor(
+            make_gmem_ptr(actData),
+            IGEMM_Layouts<SettingsT>::activationComposedGatherLayout(sBIdx_ptr)
+        );
+            
+        Tensor sActIdx = make_tensor(
+            make_smem_ptr(sBIdx_ptr),
+            IGEMM_Layouts<SettingsT>::activationIndexLayout()
+        );
+
+        if (threadIdx.x == 0)
+        {
+            for (int bi = 0; bi < size<0,0,0>(sActIdx); ++bi)
+            for (int bj = 0; bj < size<0,0,1>(sActIdx); ++bj)
+            for (int bk = 0; bk < size<0,0,2>(sActIdx); ++bk)
+                for (int z = 0; z < size<0,1>(sActIdx); ++z)
+                for (int p = 0; p < size<0,2>(sActIdx); ++p)
+                for (int q = 0; q < size<0,3>(sActIdx); ++q)
+                    for (int t = 0; t < size<1,1>(sActIdx); ++t)
+                    for (int r = 0; r < size<1,2>(sActIdx); ++r)
+                    for (int s = 0; s < size<1,3>(sActIdx); ++s)
+                    {
+                        auto sCoord0 = make_tuple(make_tuple(make_tuple(       bi,bj,bk),z,p,q),make_tuple(0,t,r,s));
+                        auto mCoord0 = make_tuple(make_tuple(make_tuple(leafID,bi,bj,bk),z,p,q),make_tuple(0,t,r,s));
+                        if (sActIdx(sCoord0) != mActIdx(mCoord0))
+                            printf("Inconsistency between mActIdx and sActIdx\n");
+                        for (int c = 0; c < size<1,0>(sActIdx); ++c)
+                        {
+                            auto gCoord = make_tuple(make_tuple(make_tuple(       bi,bj,bk),z,p,q),make_tuple(c,t,r,s));
+                            auto mCoord = make_tuple(make_tuple(make_tuple(leafID,bi,bj,bk),z,p,q),make_tuple(c,t,r,s));
+                            if (&gAct(gCoord) != &mAct(mCoord))
+                                printf("Inconsistency between &gAct and &mAct\n");
+                        }
+                    }
+        }
         __syncthreads();
 
 #if 0

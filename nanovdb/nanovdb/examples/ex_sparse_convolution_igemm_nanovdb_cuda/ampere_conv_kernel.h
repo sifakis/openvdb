@@ -206,12 +206,15 @@ struct AmperePredicatedFprop {
     using Tiler_K  = decltype(cute::min(K{}, _32{}));
     using Tiler_C  = decltype(cute::min(C{}, _32{}));
     using Tiler_N  = Shape<_1, ZZ, PP, QQ>;
+    using Tiler_NN = Shape<ZZ, PP, QQ>;
     using TileM    = Tiler_K;
     using TileN    = Shape<Tiler_N, Z, P, Q>;
+    using TileNN   = Shape<Tiler_NN, Z, P, Q>;
     using TileK    = Shape<Tiler_C,_1,_1,_1>;
     using PIPE     = _3;
     using TilerFlt = Shape<TileM, TileK>;
     using TilerAct = Shape<TileN, TileK>;
+    using TilerActN = Shape<TileNN, TileK>;
     using TilerOut = Shape<TileM, TileN>;
 
     using TileSizeM = Int<size(TileM{})>;
@@ -383,6 +386,20 @@ struct AmperePredicatedFprop {
 
         __syncthreads();
 
+#if 0
+        if (threadIdx.x == 0) {
+            auto gBIdx_ptr = &mActIdx(make_tuple(make_tuple(make_tuple(leafID,0,0,0),0,0,0),make_tuple(0,0,0,0)));
+            for (int v = 0; v < SettingsT::VoxelsPerLeafnodeWithHalo(); ++v)
+               if (sBIdx_ptr[v] != gBIdx_ptr[v])
+                    printf("Inconsistency between on-the-fly and precomputed gather indices\n");
+            auto gCIdx_ptr = &mOutIdx(make_tuple(0,make_tuple(make_tuple(leafID,0,0,0),0,0,0)));
+            for (int v = 0; v < SettingsT::VoxelsPerLeafnodeNoHalo(); ++v)
+               if (sCIdx_ptr[v] != gCIdx_ptr[v])
+                    printf("Inconsistency between on-the-fly and precomputed gather indices\n");
+        }
+        __syncthreads();
+#endif
+
         Tensor gAct = make_tensor(
             make_gmem_ptr(actData),
             IGEMM_Layouts<SettingsT>::activationComposedGatherLayout(sBIdx_ptr)
@@ -393,6 +410,7 @@ struct AmperePredicatedFprop {
             IGEMM_Layouts<SettingsT>::activationIndexLayout()
         );
 
+#if 0
         if (threadIdx.x == 0)
         {
             for (int bi = 0; bi < size<0,0,0>(sActIdx); ++bi)
@@ -419,19 +437,6 @@ struct AmperePredicatedFprop {
                     }
         }
         __syncthreads();
-
-#if 0
-        if (threadIdx.x == 0) {
-            auto gBIdx_ptr = &mActIdx(make_tuple(make_tuple(make_tuple(leafID,0,0,0),0,0,0),make_tuple(0,0,0,0)));
-            for (int v = 0; v < SettingsT::VoxelsPerLeafnodeWithHalo(); ++v)
-               if (sBIdx_ptr[v] != gBIdx_ptr[v])
-                    printf("Inconsistency between on-the-fly and precomputed gather indices\n");
-            auto gCIdx_ptr = &mOutIdx(make_tuple(0,make_tuple(make_tuple(leafID,0,0,0),0,0,0)));
-            for (int v = 0; v < SettingsT::VoxelsPerLeafnodeNoHalo(); ++v)
-               if (sCIdx_ptr[v] != gCIdx_ptr[v])
-                    printf("Inconsistency between on-the-fly and precomputed gather indices\n");
-        }
-        __syncthreads();
 #endif
 
         TiledMma tiled_mma;
@@ -440,7 +445,8 @@ struct AmperePredicatedFprop {
         // Set up tensors
         // NOTE: blockIdx.x projects onto act-NDHW mode, y along the flt-K mode for the sake of higher dynamic range in NDHW
         Tensor gA_mk    = local_tile(mFlt,    TilerFlt{}, make_coord(_,_));                // (BLK_M,BLK_K,m',k')
-        Tensor gB_nk    = local_tile(mAct,    TilerAct{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
+        Tensor mB_nk    = local_tile(mAct,    TilerAct{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
+        Tensor gB_nk    = local_tile(gAct,    TilerActN{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
         Tensor gBIdx_nk = local_tile(mActIdx, TilerAct{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
         Tensor gC_mn    = local_tile(mOut,    TilerOut{}, make_coord(_,_));                // (BLK_M,BLK_N,m',n')
         Tensor gCIdx_mn = local_tile(mOutIdx, TilerOut{}, make_coord(_,_));                // (BLK_M,BLK_N,m',n')        
@@ -451,7 +457,7 @@ struct AmperePredicatedFprop {
             clear(accum);
         
 #if 0
-            auto n_layout = make_layout(shape<2>(gB_nk), GenRowMajor{});
+            auto n_layout = make_layout(shape<2>(mB_nk), GenRowMajor{});
             auto n_coord = idx2crd(int(8*leafID+clusterID), shape(n_layout), stride(n_layout));
 #elif 0
             // This version produces the exactly same order as above
@@ -462,10 +468,37 @@ struct AmperePredicatedFprop {
             // Also correct, but clusters traversed in co-lex order
             auto clusterCoord = idx2crd(clusterID, ClusterShape{});
             auto n_coord = make_tuple(cute::prepend(clusterCoord, leafID),_0{},_0{},_0{});
+            auto N_coord = make_tuple(clusterCoord,_0{},_0{},_0{});
 #endif
 
             Tensor gA    = gA_mk   (_,_,m_coord,_);                                            // (BLK_M,BLK_K,k')
-            Tensor gB    = gB_nk   (_,_,n_coord,_);                                            // (BLK_N,BLK_K,_1)
+            Tensor mB    = mB_nk   (_,_,n_coord,_);                                            // (BLK_N,BLK_K,_1)
+            Tensor gB    = gB_nk   (_,_,N_coord,_);                                            // (BLK_N,BLK_K,_1)
+#if 1
+            if(threadIdx.x == 0)
+            {
+                for (int bii = 0; bii < shape<0,0,0>(gB); ++bii)
+                for (int bjj = 0; bjj < shape<0,0,1>(gB); ++bjj)
+                for (int bkk = 0; bkk < shape<0,0,2>(gB); ++bkk)
+                    for (int z = 0; z < shape<0,1>(gB); ++z)
+                    for (int p = 0; p < shape<0,2>(gB); ++p)
+                    for (int q = 0; q < shape<0,3>(gB); ++q)
+                        for (int t = 0; t < shape<2,1>(gB); ++t)
+                        for (int r = 0; r < shape<2,2>(gB); ++r)
+                        for (int s = 0; s < shape<2,3>(gB); ++s)
+                {
+                    for (int bc = 0; bc < shape<2,0>(gB); ++bc)
+                    for (int cc = 0; cc < shape<1,0>(gB); ++cc)
+                    {
+                        auto gCoord = make_tuple(make_tuple(make_tuple(  bii,bjj,bkk),z,p,q),make_tuple(cc,0,0,0),make_tuple(bc,t,r,s));
+                        auto mCoord = make_tuple(make_tuple(make_tuple(0,bii,bjj,bkk),z,p,q),make_tuple(cc,0,0,0),make_tuple(bc,t,r,s));
+                        if(&gB(gCoord) != &mB(mCoord))
+                            printf("Inconsistency between &gB and &mB\n");
+                    }
+                        
+                }
+            }
+#endif
             Tensor gBIdx = gBIdx_nk(_,_,n_coord,_);                                            // (BLK_N,BLK_K,_1)
             Tensor gC    = gC_mn   (_,_,m_coord,n_coord);                                      // (BLK_M,BLK_N)
             Tensor gCIdx = gCIdx_mn(_,_,m_coord,n_coord);                                      // (BLK_M,BLK_N)
@@ -497,7 +530,7 @@ struct AmperePredicatedFprop {
             collective_mma(
                 accum,
                 gA,
-                gB,
+                mB,
                 sBPred,
                 accum,
                 k_tile_iter, k_tile_count,

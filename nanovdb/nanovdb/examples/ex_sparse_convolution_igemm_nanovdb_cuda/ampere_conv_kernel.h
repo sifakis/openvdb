@@ -70,6 +70,9 @@ struct IGEMM_Layouts
     static constexpr auto Hx = Int<SettingsT::Hx>{};
     static constexpr auto Hy = Int<SettingsT::Hy>{};
     static constexpr auto Hz = Int<SettingsT::Hz>{};
+    static constexpr auto CHx = Int<SettingsT::CHx>{};
+    static constexpr auto CHy = Int<SettingsT::CHy>{};
+    static constexpr auto CHz = Int<SettingsT::CHz>{};
 
     __hostdev__
     static auto activationComposedGatherLayout(const uint64_t* gather_idx_buf)
@@ -111,9 +114,8 @@ struct IGEMM_Layouts
     {
         // Input gather index layout
         // gather_layout_index(make_coord((ndhw), c)) => buffer_idx
-        return make_layout(
-            make_shape (make_shape (make_shape (     Bx,   By, Bz),     Z,  P,    Q), make_shape (   C,     T,  R,    S)),
-            make_stride(make_stride(make_stride(Hy*Hz*Z, Hz*P,  Q), Hy*Hz, Hz, _1{}), make_stride(_0{}, Hy*Hz, Hz, _1{})));
+        //     make_shape (make_shape (make_shape (       Bx,    By, Bz),       Z,   P,    Q), make_shape (  KK,  _1,  _1,  _1), make_shape (  BC,       T,   R,    S)),
+        return make_stride(make_stride(make_stride(CHy*CHz*Z, CHz*P,  Q), CHy*CHz, CHz, _1{}), make_stride(_0{},_0{},_0{},_0{}), make_stride(_0{}, CHy*CHz, CHz, _1{}));
     }
 
     __hostdev__
@@ -182,6 +184,10 @@ struct AmperePredicatedFprop {
     using Hy = Int<SettingsT::Hy>;
     using Hz = Int<SettingsT::Hz>;
 
+    using CHx = Int<SettingsT::CHx>;
+    using CHy = Int<SettingsT::CHy>;
+    using CHz = Int<SettingsT::CHz>;
+
     using C = Int<SettingsT::C>;
     using K = Int<SettingsT::K>;
 
@@ -208,6 +214,7 @@ struct AmperePredicatedFprop {
 
     using ClusterShape = Shape<Cx,Cy,Cz>;
     using HaloLayout = decltype(make_layout(Shape<Hx,Hy,Hz>{},GenRowMajor{}));
+    using ClusterHaloLayout = decltype(make_layout(Shape<CHx,CHy,CHz>{},GenRowMajor{}));
 
     using TiledMma = TiledMMA<
         MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>,
@@ -237,6 +244,7 @@ struct AmperePredicatedFprop {
         bool sCPredMatrix[SettingsT::VoxelsPerLeafnodeNoHalo()];
 #else
         // Using only the cosize of the relevant tensor
+        bool sBPredMatrixNew[SettingsT::VoxelsPerClusterWithHalo()];
         bool sBPredMatrix[556];
         bool sCPredMatrix[220];
 #endif
@@ -399,18 +407,44 @@ struct AmperePredicatedFprop {
             
             // Build gather predicate tensors in SMEM
         
-            if (thread0() && clusterID == 0 && m_coord == 0) {
-                print("\nshape(sBIdx)=");print(shape(sBIdx));print("\n");
-            }
             auto sBPred_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sBPredMatrix[0];
+            auto sBPredNew_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sBPredMatrixNew[0];
             auto sBIdx_ptr = sBIdx.data();
             // Tensor sBPred = make_tensor(make_smem_ptr(sBPred_ptr), sBIdx.layout());
             Tensor sBPred = make_tensor(make_smem_ptr(sBPred_ptr), shape(sBIdx), stride(sBIdx.layout()));
+            Tensor sBPredNew = make_tensor(make_smem_ptr(sBPredNew_ptr), shape(sBIdx),
+                IGEMM_Layouts<SettingsT>::clusterActivationPredicateStride());
             auto sBPred_cosize = cosize(sBIdx.layout());
+            auto sBPredNew_cosize = cosize(sBPredNew.layout());
+            auto sBPredNew_size = size(sBPredNew);
+            for (int v = 0; v < SettingsT::VoxelsPerClusterWithHalo(); v += MaxThreadsPerBlock)
+            {
+                auto [i,j,k] = idx2crd(v+threadIdx.x, shape(ClusterHaloLayout{}), stride(ClusterHaloLayout{}));
+                auto coord = make_tuple(make_tuple(make_tuple(0,0,0),i,j,k),make_tuple(0,0,0,0),make_tuple(0,0,0,0));
+                sBPredNew(coord) = sBIdx(coord);
+            }
             for (int i = 0; i < sBPred_cosize; i += MaxThreadsPerBlock)
                 if (i+threadIdx.x < sBPred_cosize)
                     sBPred_ptr[i+threadIdx.x] = sBIdx_ptr[i+threadIdx.x];
-            
+            __syncthreads();
+#if 0
+            if (threadIdx.x == 0) {
+                for (int bii = 0; bii < shape<0,0,0>(sBIdx); bii++)
+                for (int bjj = 0; bjj < shape<0,0,1>(sBIdx); bjj++)
+                for (int bkk = 0; bkk < shape<0,0,2>(sBIdx); bkk++)
+                    for (int iii = 0; iii < shape<0,1>(sBIdx); iii++)
+                    for (int jjj = 0; jjj < shape<0,2>(sBIdx); jjj++)
+                    for (int kkk = 0; kkk < shape<0,3>(sBIdx); kkk++)
+                        for (int t = 0; t < shape<2,1>(sBIdx); t++)
+                        for (int r = 0; r < shape<2,2>(sBIdx); r++)
+                        for (int s = 0; s < shape<2,3>(sBIdx); s++)
+                        {
+                            auto coord = make_tuple(make_tuple(make_tuple(bii,bjj,bkk),iii,jjj,kkk),make_tuple(0,0,0,0),make_tuple(0,t,r,s));
+                            if(sBPredNew(coord) != sBPred(coord))
+                                printf("Barf\n");
+                        }
+                }
+#endif
             auto sCPred_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sCPredMatrix[0];
             auto sCIdx_ptr = sCIdx.data();
             auto sCPred_cosize = cosize(sCIdx.layout());
@@ -429,7 +463,7 @@ struct AmperePredicatedFprop {
                 accum,
                 gA,
                 gB,
-                sBPred,
+                sBPredNew,
                 accum,
                 k_tile_iter, k_tile_count,
                 Underscore{}, // no residue since we do not support predication

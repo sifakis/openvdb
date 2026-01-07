@@ -52,24 +52,31 @@ struct IGEMM_Geometry
     // Leaf node geometry
     //
 
-    static constexpr int ZZ = 1;        // Blocks of size (Z,P,Q) are grouped into "clusters" in a (ZZ,PP,QQ) arrangement
-    static constexpr int PP = 2;        // I.e. ZZ blocks are grouped along the X-dimension, PP along the Y- and QQ along the Z-dimension
-    static constexpr int QQ = 2;        // The total voxel size of a cluster will be (ZZ*Z,PP*P,QQ*Q)
+    static constexpr int ZZ = 1;         // Blocks of size (Z,P,Q) are grouped into "clusters" in a (ZZ,PP,QQ) arrangement
+    static constexpr int PP = 2;         // I.e. ZZ blocks are grouped along the X-dimension, PP along the Y- and QQ along the Z-dimension
+    static constexpr int QQ = 2;         // The total voxel size of a cluster will be (ZZ*Z,PP*P,QQ*Q)
 
-    static constexpr int Bx = 8/Z;      // Block count along X-dimension of leaf node
-    static constexpr int By = 8/P;      // Block count along Y-dimension of leaf node
-    static constexpr int Bz = 8/Q;      // Block count along Z-dimension of leaf node
+    static constexpr int Bx = 8/Z;       // Block count along X-dimension of leaf node
+    static constexpr int By = 8/P;       // Block count along Y-dimension of leaf node
+    static constexpr int Bz = 8/Q;       // Block count along Z-dimension of leaf node
 
-    static constexpr int Cx = 8/(ZZ*Z); // Cluster count along X-dimension of leaf node
-    static constexpr int Cy = 8/(PP*P); // Cluster count along Y-dimension of leaf node
-    static constexpr int Cz = 8/(QQ*Q); // Cluster count along Z-dimension of leaf node
+    static constexpr int Cx = 8/(ZZ*Z);  // Cluster count along X-dimension of leaf node
+    static constexpr int Cy = 8/(PP*P);  // Cluster count along Y-dimension of leaf node
+    static constexpr int Cz = 8/(QQ*Q);  // Cluster count along Z-dimension of leaf node
 
-    static constexpr int Hx = T+7;      // X-dimension of leaf node domain, enlarged by the necessary halo for convolution
-    static constexpr int Hy = R+7;      // Y-dimension of leaf node domain, enlarged by the necessary halo for convolution
-    static constexpr int Hz = S+7;      // Z-dimension of leaf node domain, enlarged by the necessary halo for convolution
+    static constexpr int Hx = T+7;       // X-dimension of leaf node domain, enlarged by the necessary halo for convolution
+    static constexpr int Hy = R+7;       // Y-dimension of leaf node domain, enlarged by the necessary halo for convolution
+    static constexpr int Hz = S+7;       // Z-dimension of leaf node domain, enlarged by the necessary halo for convolution
+
+    static constexpr int CHx = ZZ*Z+T-1; // Cluster halo (voxel width, plus halo of one cluster) count along X-dimension
+    static constexpr int CHy = PP*P+R-1; // Cluster halo (voxel width, plus halo of one cluster) count along X-dimension
+    static constexpr int CHz = QQ*Q+S-1; // Cluster halo (voxel width, plus halo of one cluster) count along X-dimension
 
     static constexpr int VoxelsPerLeafnodeNoHalo() { return 512; }
     static constexpr int VoxelsPerLeafnodeWithHalo() { return Hx*Hy*Hz; }
+
+    static constexpr int VoxelsPerClusterNoHalo() { return Z*P*Q*ZZ*PP*QQ; }
+    static constexpr int VoxelsPerClusterWithHalo() { return CHx*CHy*CHz; }
 
     //
     // Filter offset (coordinate offset in the input domain that the [0,0,0] filter spoke corresponds to)

@@ -514,8 +514,8 @@ struct AmperePredicatedFprop {
         Tensor gB_nk    = local_tile(gAct,    TilerActN{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
         Tensor mBIdx_nk = local_tile(mActIdx, TilerAct{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
         Tensor sBIdx_nk = local_tile(sActIdx, TilerActN{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
-        Tensor gC_mn    = local_tile(mOut,    TilerOut{}, make_coord(_,_));                // (BLK_M,BLK_N,m',n')
-        Tensor gCIdx_mn = local_tile(mOutIdx, TilerOut{}, make_coord(_,_));                // (BLK_M,BLK_N,m',n')        
+        Tensor mC_mn    = local_tile(mOut,    TilerOut{}, make_coord(_,_));                // (BLK_M,BLK_N,m',n')
+        Tensor mCIdx_mn = local_tile(mOutIdx, TilerOut{}, make_coord(_,_));                // (BLK_M,BLK_N,m',n')        
         
         for (int m_coord = 0; m_coord < size<2>(gA_mk); ++m_coord)
         for (int clusterID = 0; clusterID < size(ClusterShape{}); ++clusterID)
@@ -569,8 +569,8 @@ struct AmperePredicatedFprop {
                 }
             }
 #endif
-            Tensor gC    = gC_mn   (_,_,m_coord,n_coord);                                      // (BLK_M,BLK_N)
-            Tensor gCIdx = gCIdx_mn(_,_,m_coord,n_coord);                                      // (BLK_M,BLK_N)
+            Tensor mC    = mC_mn   (_,_,m_coord,n_coord);                                      // (BLK_M,BLK_N)
+            Tensor mCIdx = mCIdx_mn(_,_,m_coord,n_coord);                                      // (BLK_M,BLK_N)
             
             // Build gather predicate tensors in SMEM
         
@@ -583,12 +583,12 @@ struct AmperePredicatedFprop {
                     sBPred_ptr[i+threadIdx.x] = mBIdx_ptr[i+threadIdx.x];
             
             auto sCPred_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sCPredMatrix[0];
-            auto gCIdx_ptr = gCIdx.data();
-            auto sCPred_cosize = cosize(gCIdx.layout());
-            Tensor sCPred = make_tensor(make_smem_ptr(sCPred_ptr), gCIdx.layout());
+            auto mCIdx_ptr = mCIdx.data();
+            auto sCPred_cosize = cosize(mCIdx.layout());
+            Tensor sCPred = make_tensor(make_smem_ptr(sCPred_ptr), mCIdx.layout());
             for (int i = 0; i < sCPred_cosize; i += MaxThreadsPerBlock)
                 if (i+threadIdx.x < sCPred_cosize)
-                    sCPred_ptr[i+threadIdx.x] = gCIdx_ptr[i+threadIdx.x];
+                    sCPred_ptr[i+threadIdx.x] = mCIdx_ptr[i+threadIdx.x];
         
             __syncthreads();
         
@@ -625,10 +625,10 @@ struct AmperePredicatedFprop {
             GmemTiledCopyOut gmem_tiled_copy_C;
             auto gmem_thr_copy_C = gmem_tiled_copy_C.get_slice(threadIdx.x);
             auto tDsC = gmem_thr_copy_C.partition_S(sC);
-            auto tDgC = gmem_thr_copy_C.partition_D(gC);
+            auto tDmC = gmem_thr_copy_C.partition_D(mC);
             auto tDsCPred = gmem_thr_copy_C.partition_D(sCPred);
         
-            copy_if(gmem_tiled_copy_C, tDsCPred, tDsC, tDgC);
+            copy_if(gmem_tiled_copy_C, tDsCPred, tDsC, tDmC);
 
             __syncthreads(); // necessary while the predicate tensors are built once per iteration; TODO: revise
         }

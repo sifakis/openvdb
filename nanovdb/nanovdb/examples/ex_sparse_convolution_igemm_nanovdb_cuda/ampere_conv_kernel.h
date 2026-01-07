@@ -162,6 +162,25 @@ struct IGEMM_Layouts
             xformed_out_logical_inner);
     }
 
+    __hostdev__
+    static auto outputComposedScatterLayout(const uint64_t* scatter_idx_buf)
+    {
+        // Output scatter layout
+        // scatter_layout_index(k, make_coord((nzpq))) => buffer_idx
+        auto ES = E<0>{};  // Scatter basis    (1,0) (idx_buffer_idx)
+        auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)
+        auto xformed_out_logical_inner = make_layout(
+            make_shape ( K, make_shape (make_shape (        Bx,        By,   Bz),        Z,       P,  Q)),
+            make_stride(EC, make_stride(make_stride(_64{}*Z*ES, _8()*P*ES, Q*ES), _64{}*ES, _8{}*ES, ES)));
+        auto xformed_out_scatter_outer = make_layout(
+            make_shape(_1{},_1{}),
+            make_stride(example::CustomStride{example::IndexedGather{scatter_idx_buf}, Int<SettingsT::K>{}}, _1{}));
+        return composition(
+            xformed_out_scatter_outer,
+            make_arithmetic_tuple(_0{},_0{}),
+            xformed_out_logical_inner);
+    }
+
     static auto scatterIndexLayout(const int N)
     {
         // Output scatter index layout
@@ -171,7 +190,8 @@ struct IGEMM_Layouts
             make_stride(_0{}, make_stride(make_stride(_512{}, _64{}*Z, _8{}*P,  Q), _64{}, _8{}, _1{})));
     }
 
-    static auto outputIndexLayout(const int N)
+    __hostdev__
+    static auto outputIndexLayout()
     {
         // Output scatter index layout
         // scatter_layout_index(k, make_coord((nzpq))) => buffer_idx
@@ -444,6 +464,42 @@ struct AmperePredicatedFprop {
                                 printf("Inconsistency between &gAct and &mAct\n");
                         }
                     }
+        }
+        __syncthreads();
+#endif
+
+        Tensor gOut = make_tensor(
+            make_gmem_ptr(outData),
+            IGEMM_Layouts<SettingsT>::outputComposedScatterLayout(sCIdx_ptr)
+        );
+
+        Tensor sOutIdx = make_tensor(
+            make_smem_ptr(sCIdx_ptr),
+            IGEMM_Layouts<SettingsT>::outputIndexLayout()        
+        );
+
+#if 0
+        if (threadIdx.x == 0)
+        {
+            for (int bi = 0; bi < size<1,0,0>(sOutIdx); ++bi)
+            for (int bj = 0; bj < size<1,0,1>(sOutIdx); ++bj)
+            for (int bk = 0; bk < size<1,0,2>(sOutIdx); ++bk)
+                for (int z = 0; z < size<1,1>(sOutIdx); ++z)
+                for (int p = 0; p < size<1,2>(sOutIdx); ++p)
+                for (int q = 0; q < size<1,3>(sOutIdx); ++q)
+                {
+                    auto sCoord0 = make_tuple(0,make_tuple(make_tuple(       bi,bj,bk),z,p,q));
+                    auto mCoord0 = make_tuple(0,make_tuple(make_tuple(leafID,bi,bj,bk),z,p,q));
+                    if (sOutIdx(sCoord0) != mOutIdx(mCoord0))
+                        printf("Inconsistency between mOutIdx and sOutIdx\n");
+                    for (int k = 0; k < size<0>(sOutIdx); ++k)
+                    {
+                        auto gCoord = make_tuple(k,make_tuple(make_tuple(       bi,bj,bk),z,p,q));
+                        auto mCoord = make_tuple(k,make_tuple(make_tuple(leafID,bi,bj,bk),z,p,q));
+                        if (&gOut(gCoord) != &mOut(mCoord))
+                            printf("Inconsistency between &gOut and &mOut\n");
+                    }
+                }
         }
         __syncthreads();
 #endif

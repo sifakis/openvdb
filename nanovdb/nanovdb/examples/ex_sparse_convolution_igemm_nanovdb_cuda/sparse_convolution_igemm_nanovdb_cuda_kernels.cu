@@ -200,32 +200,16 @@ void ResultCompare(
     ValueType result = 0.f;
 #pragma omp parallel for reduction(max:result)
     for (int i = 0; i < size; i++)
-        for (int j = 0; j < Do; j++) {
-            // if (outputArray1[i][j] != outputArray2[i][j]) {
-            //     std::cout << "outputArray1[" << i << "][" << j << "] = " << outputArray1[i][j]
-            //               << ", outputArray2[" << i << "][" << j << "] = " << outputArray2[i][j] << std::endl;
-            // }
+        for (int j = 0; j < Do; j++)
             result = std::max(result, std::abs(outputArray1[i][j]-outputArray2[i][j]));
-        }
     std::cout << "Discrepancy = " << result << std::endl;
 }
 
-template<class Operator,
-    class BuildT,
-    class FilterTensor,
-    class ActivationTensor,
-    class ActivationTensorIndex,
-    class OutputTensor,
-    class OutputTensorIndex
-    >
+template<class Operator, class BuildT, class FilterTensor>
 __global__
 __launch_bounds__(Operator::MaxThreadsPerBlock, Operator::MinBlocksPerMultiprocessor)
   void kernel_entrypoint_custom(
       FilterTensor mFlt,
-      ActivationTensor mAct,
-      ActivationTensorIndex mActI,
-      OutputTensor mOut,
-      OutputTensorIndex mOutI,
       const nanovdb::NanoGrid<BuildT>* inputGrid,
       const nanovdb::NanoGrid<BuildT>* outputGrid,
       const float *inputData,
@@ -235,10 +219,6 @@ __launch_bounds__(Operator::MaxThreadsPerBlock, Operator::MinBlocksPerMultiproce
   Operator op;
   op(
       mFlt,
-      mAct,
-      mActI,
-      mOut,
-      mOutI,
       inputGrid,
       outputGrid,
       inputData,
@@ -540,43 +520,17 @@ void mainSparseConvolutionIGEMM(
 
     IGEMM_Layouts<IGEMM_Geometry> layouts;
 
-    Tensor tXformedActGather = make_tensor(
-        make_gmem_ptr(inputData.data().get()),
-        layouts.xformedActivationComposedLayout(outputLeafCount, gatherIndexData.data().get())
-    );
-
-    Tensor tGatherIndex = make_tensor(
-        make_gmem_ptr(gatherIndexData.data().get()),
-        layouts.gatherIndexLayout(outputLeafCount)
-    );
-
-
     Tensor tFilter = make_tensor(
         make_gmem_ptr(filterData.data().get()),
         layouts.filterLayout()
     );
 
-    Tensor tXformedOutScatter = make_tensor(
-        make_gmem_ptr(outputData.data().get()),
-        layouts.xformedOutputComposedLayout(outputLeafCount, scatterIndexData.data().get())
-    );
-
-    Tensor tScatterIndex = make_tensor(
-        make_gmem_ptr(scatterIndexData.data().get()),
-        layouts.scatterIndexLayout(outputLeafCount)
-    );
-    
-    // ((BLK_M, BLK_N), (m', n'))
-    // Tensor gOutput_mn = zipped_divide(tXformedOutScatter, typename AmperePredicatedFprop<IGEMM_Geometry>::TilerOut{});
-    // print("\n");print("shape(gOutput_mn)=");print(shape(gOutput_mn));print("\n");
     constexpr size_t smem_size = sizeof(typename AmperePredicatedFprop<IGEMM_Geometry>::SharedStorage);
     std::cout << "smem_size = " << smem_size << std::endl;
 
     cudaCheck(
         cudaFuncSetAttribute(
-            kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, BuildT,
-                decltype(tFilter), decltype(tXformedActGather),
-                decltype(tGatherIndex), decltype(tXformedOutScatter), decltype(tScatterIndex)>,
+            kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, BuildT, decltype(tFilter)>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             smem_size
         ));
@@ -584,15 +538,9 @@ void mainSparseConvolutionIGEMM(
     int num_iterations = 10;
     for (int i = 0; i < num_iterations; ++i) {
         gpuTimer.start("Scatter-Gather Cutlass IGEMM (GPU) execution");
-        kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, BuildT,
-            decltype(tFilter), decltype(tXformedActGather),
-            decltype(tGatherIndex), decltype(tXformedOutScatter), decltype(tScatterIndex)>
+        kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, BuildT, decltype(tFilter)>
             <<<outputLeafCount, AmperePredicatedFprop<IGEMM_Geometry>::MaxThreadsPerBlock, smem_size>>>(
                 tFilter,
-                tXformedActGather,
-                tGatherIndex,
-                tXformedOutScatter,
-                tScatterIndex,
                 inputGrid,
                 outputGrid,
                 inputData.data().get(),

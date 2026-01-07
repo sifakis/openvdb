@@ -56,6 +56,9 @@ struct IGEMM_Layouts
     static constexpr auto Z = Int<SettingsT::Z>{};
     static constexpr auto P = Int<SettingsT::P>{};
     static constexpr auto Q = Int<SettingsT::Q>{};
+    static constexpr auto ZZ = Int<SettingsT::ZZ>{};
+    static constexpr auto PP = Int<SettingsT::PP>{};
+    static constexpr auto QQ = Int<SettingsT::QQ>{};
     static constexpr auto D = Int<SettingsT::D>{};
     static constexpr auto H = Int<SettingsT::H>{};
     static constexpr auto W = Int<SettingsT::W>{};
@@ -67,30 +70,6 @@ struct IGEMM_Layouts
     static constexpr auto Hx = Int<SettingsT::Hx>{};
     static constexpr auto Hy = Int<SettingsT::Hy>{};
     static constexpr auto Hz = Int<SettingsT::Hz>{};
-
-    static auto xformedActivationComposedLayout(const int N, const uint64_t* gather_idx_buf)
-    {
-        // Input gather layout
-        // inner_layout(make_coord((nzpq), (csrt))) => (idx_buffer_idx, dense_c_idx)
-        auto EG = E<0>{};  // Gather basis     (1,0) (idx_buffer_idx) 
-        auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)    
-        auto xformed_act_logical_inner = make_layout(
-            make_shape (make_shape (make_shape (          N,         Bx,      By,   Bz),        Z,     P,  Q), make_shape ( C,        T,     R,  S)),
-            make_stride(make_stride(make_stride(Hx*Hy*Hz*EG, Hy*Hz*Z*EG, Hz*P*EG, Q*EG), Hy*Hz*EG, Hz*EG, EG), make_stride(EC, Hy*Hz*EG, Hz*EG, EG)));
-
-        // outer_layout(make_coord(idx_buffer_idx, dense_c_idx)) => idx
-        // IndexedGather obtains idx by applying (gmem_base_ptr + gather_idx_buf[idx_buffer_idx] + dense_offset)
-        auto xformed_act_gather_outer = make_layout(
-            make_shape(_1{},_1{}),
-            make_stride(example::CustomStride{example::IndexedGather{gather_idx_buf}, C}, _1{}));
-
-        // Compose the inner and outer layouts
-        // gather_composed(make_coord((nzpq), (csrt))) => idx
-        return composition(
-            xformed_act_gather_outer,
-            make_arithmetic_tuple(_0{}, _0{}),
-            xformed_act_logical_inner);
-    }
 
     __hostdev__
     static auto activationComposedGatherLayout(const uint64_t* gather_idx_buf)
@@ -127,39 +106,23 @@ struct IGEMM_Layouts
             make_stride(make_stride(make_stride(Hy*Hz*Z, Hz*P,  Q), Hy*Hz, Hz, _1{}), make_stride(_0{}, Hy*Hz, Hz, _1{})));
     }
 
-    static auto gatherIndexLayout(const int N)
+    __hostdev__
+    static auto clusterActivationPredicateStride()
     {
         // Input gather index layout
         // gather_layout_index(make_coord((ndhw), c)) => buffer_idx
         return make_layout(
-            make_shape (make_shape (make_shape (       N,      Bx,   By, Bz),     Z,  P,    Q), make_shape (   C,     T,  R,    S)),
-            make_stride(make_stride(make_stride(Hx*Hy*Hz, Hy*Hz*Z, Hz*P,  Q), Hy*Hz, Hz, _1{}), make_stride(_0{}, Hy*Hz, Hz, _1{})));
+            make_shape (make_shape (make_shape (     Bx,   By, Bz),     Z,  P,    Q), make_shape (   C,     T,  R,    S)),
+            make_stride(make_stride(make_stride(Hy*Hz*Z, Hz*P,  Q), Hy*Hz, Hz, _1{}), make_stride(_0{}, Hy*Hz, Hz, _1{})));
     }
 
+    __hostdev__
     static auto filterLayout()
     {
         return make_ordered_layout(
             make_shape(K, make_shape(C, T, R, S)),
             tuple<_1, tuple<_0,_4,_3,_2>>{}
         );
-    }
-
-    static auto xformedOutputComposedLayout(const int N, const uint64_t* scatter_idx_buf)
-    {
-        // Output scatter layout
-        // scatter_layout_index(k, make_coord((nzpq))) => buffer_idx
-        auto ES = E<0>{};  // Scatter basis    (1,0) (idx_buffer_idx)
-        auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)
-        auto xformed_out_logical_inner = make_layout(
-            make_shape ( K, make_shape (make_shape (        N,         Bx,        By,   Bz),        Z,       P,  Q)),
-            make_stride(EC, make_stride(make_stride(_512{}*ES, _64{}*Z*ES, _8()*P*ES, Q*ES), _64{}*ES, _8{}*ES, ES)));
-        auto xformed_out_scatter_outer = make_layout(
-            make_shape(_1{},_1{}),
-            make_stride(example::CustomStride{example::IndexedGather{scatter_idx_buf}, K}, _1{}));
-        return composition(
-            xformed_out_scatter_outer,
-            make_arithmetic_tuple(_0{},_0{}),
-            xformed_out_logical_inner);
     }
 
     __hostdev__
@@ -179,15 +142,6 @@ struct IGEMM_Layouts
             xformed_out_scatter_outer,
             make_arithmetic_tuple(_0{},_0{}),
             xformed_out_logical_inner);
-    }
-
-    static auto scatterIndexLayout(const int N)
-    {
-        // Output scatter index layout
-        // scatter_layout_index(k, make_coord((nzpq))) => buffer_idx
-        return make_layout(
-            make_shape (   K, make_shape (make_shape (     N,      Bx,     By, Bz),     Z,    P,    Q)),
-            make_stride(_0{}, make_stride(make_stride(_512{}, _64{}*Z, _8{}*P,  Q), _64{}, _8{}, _1{})));
     }
 
     __hostdev__
@@ -363,13 +317,14 @@ struct AmperePredicatedFprop {
     //
     // Conv functor (predicated IGEMM)
     //
-    template <class BuildT, class EngineFlt, class ActivationTensor, class ActivationIndexTensor, class OutputTensor, class OutputIndexTensor>
+    template <class BuildT, class EngineFlt>
+    // class ActivationTensor, class ActivationIndexTensor, class OutputTensor, class OutputIndexTensor>
     void __device__
     operator()(cute::Tensor<EngineFlt, GmemLayoutFlt> mFlt,        // (                   K,           (C,T,R,S))
-        ActivationTensor                              mAct_,       // (((N,Bx,By,Bz),Z,P,Q),           (C,T,R,S))
-        ActivationIndexTensor                         mActIdx_,    // (((N,Bx,By,Bz),Z,P,Q),           (C,T,R,S))
-        OutputTensor                                  mOut_,       // ( K,                  ((N,Bx,By,Bz),Z,P,Q))
-        OutputIndexTensor                             mOutIdx_,    // ( K,                  ((N,Bx,By,Bz),Z,P,Q))
+        // ActivationTensor                              mAct_,       // (((N,Bx,By,Bz),Z,P,Q),           (C,T,R,S))
+        // ActivationIndexTensor                         mActIdx_,    // (((N,Bx,By,Bz),Z,P,Q),           (C,T,R,S))
+        // OutputTensor                                  mOut_,       // ( K,                  ((N,Bx,By,Bz),Z,P,Q))
+        // OutputIndexTensor                             mOutIdx_,    // ( K,                  ((N,Bx,By,Bz),Z,P,Q))
         const nanovdb::NanoGrid<BuildT>               *mActGrid,
         const nanovdb::NanoGrid<BuildT>               *mOutGrid,
         const float                                   *actData,
@@ -444,9 +399,13 @@ struct AmperePredicatedFprop {
             
             // Build gather predicate tensors in SMEM
         
+            if (thread0() && clusterID == 0 && m_coord == 0) {
+                print("\nshape(sBIdx)=");print(shape(sBIdx));print("\n");
+            }
             auto sBPred_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sBPredMatrix[0];
             auto sBIdx_ptr = sBIdx.data();
-            Tensor sBPred = make_tensor(make_smem_ptr(sBPred_ptr), sBIdx.layout());
+            // Tensor sBPred = make_tensor(make_smem_ptr(sBPred_ptr), sBIdx.layout());
+            Tensor sBPred = make_tensor(make_smem_ptr(sBPred_ptr), shape(sBIdx), stride(sBIdx.layout()));
             auto sBPred_cosize = cosize(sBIdx.layout());
             for (int i = 0; i < sBPred_cosize; i += MaxThreadsPerBlock)
                 if (i+threadIdx.x < sBPred_cosize)

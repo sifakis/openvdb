@@ -69,13 +69,17 @@ struct IGEMM_Geometry
     static constexpr int Hz = S+7;       // Z-dimension of leaf node domain, enlarged by the necessary halo for convolution
 
     static constexpr int CHx = ZZ*Z+T-1; // Cluster halo (voxel width, plus halo of one cluster) count along X-dimension
-    static constexpr int CHy = PP*P+R-1; // Cluster halo (voxel width, plus halo of one cluster) count along X-dimension
-    static constexpr int CHz = QQ*Q+S-1; // Cluster halo (voxel width, plus halo of one cluster) count along X-dimension
+    static constexpr int CHy = PP*P+R-1; // Cluster halo (voxel width, plus halo of one cluster) count along Y-dimension
+    static constexpr int CHz = QQ*Q+S-1; // Cluster halo (voxel width, plus halo of one cluster) count along Z-dimension
+
+    static constexpr int CVx = ZZ*Z;     // Voxel count per cluster along X-dimension
+    static constexpr int CVy = PP*P;     // Voxel count per cluster along Y-dimension
+    static constexpr int CVz = QQ*Q;     // Voxel count per cluster along Z-dimension
 
     static constexpr int VoxelsPerLeafnodeNoHalo() { return 512; }
     static constexpr int VoxelsPerLeafnodeWithHalo() { return Hx*Hy*Hz; }
 
-    static constexpr int VoxelsPerClusterNoHalo() { return Z*P*Q*ZZ*PP*QQ; }
+    static constexpr int VoxelsPerClusterNoHalo() { return CVx*CVy*CVz; }
     static constexpr int VoxelsPerClusterWithHalo() { return CHx*CHy*CHz; }
 
     //

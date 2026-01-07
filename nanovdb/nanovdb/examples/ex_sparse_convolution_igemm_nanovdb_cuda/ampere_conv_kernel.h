@@ -56,12 +56,6 @@ struct IGEMM_Layouts
     static constexpr auto Z = Int<SettingsT::Z>{};
     static constexpr auto P = Int<SettingsT::P>{};
     static constexpr auto Q = Int<SettingsT::Q>{};
-    static constexpr auto ZZ = Int<SettingsT::ZZ>{};
-    static constexpr auto PP = Int<SettingsT::PP>{};
-    static constexpr auto QQ = Int<SettingsT::QQ>{};
-    static constexpr auto D = Int<SettingsT::D>{};
-    static constexpr auto H = Int<SettingsT::H>{};
-    static constexpr auto W = Int<SettingsT::W>{};
     static constexpr auto C = Int<SettingsT::C>{};
     static constexpr auto K = Int<SettingsT::K>{};
     static constexpr auto Bx = Int<SettingsT::Bx>{};
@@ -73,6 +67,9 @@ struct IGEMM_Layouts
     static constexpr auto CHx = Int<SettingsT::CHx>{};
     static constexpr auto CHy = Int<SettingsT::CHy>{};
     static constexpr auto CHz = Int<SettingsT::CHz>{};
+    static constexpr auto CVx = Int<SettingsT::CVx>{};
+    static constexpr auto CVy = Int<SettingsT::CVy>{};
+    static constexpr auto CVz = Int<SettingsT::CVz>{};
 
     __hostdev__
     static auto activationComposedGatherLayout(const uint64_t* gather_idx_buf)
@@ -156,6 +153,15 @@ struct IGEMM_Layouts
             make_stride(_0{}, make_stride(make_stride(_64{}*Z, _8{}*P,  Q), _64{}, _8{}, _1{})));
     }
 
+    __hostdev__
+    static auto clusterOutputPredicateStride()
+    {
+        // Output scatter index layout
+        // scatter_layout_index(k, make_coord((nzpq))) => buffer_idx
+        //     make_shape (  BK, make_shape (make_shape (       Bx,    By, Bz),       Z,   P,    Q)),
+        return make_stride(_0{}, make_stride(make_stride(CVy*CVz*Z, CVz*P,  Q), CVy*CVz, CVz, _1{}));
+    }
+
 };
 
 template<class SettingsT>
@@ -188,6 +194,10 @@ struct AmperePredicatedFprop {
     using CHy = Int<SettingsT::CHy>;
     using CHz = Int<SettingsT::CHz>;
 
+    using CVx = Int<SettingsT::CVx>;
+    using CVy = Int<SettingsT::CVy>;
+    using CVz = Int<SettingsT::CVz>;
+
     using C = Int<SettingsT::C>;
     using K = Int<SettingsT::K>;
 
@@ -215,6 +225,7 @@ struct AmperePredicatedFprop {
     using ClusterShape = Shape<Cx,Cy,Cz>;
     using HaloLayout = decltype(make_layout(Shape<Hx,Hy,Hz>{},GenRowMajor{}));
     using ClusterHaloLayout = decltype(make_layout(Shape<CHx,CHy,CHz>{},GenRowMajor{}));
+    using ClusterVoxelLayout = decltype(make_layout(Shape<CVx,CVy,CVz>{},GenRowMajor{}));
 
     using TiledMma = TiledMMA<
         MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>,
@@ -238,16 +249,9 @@ struct AmperePredicatedFprop {
 
         uint64_t sBIdxMatrix[SettingsT::VoxelsPerLeafnodeWithHalo()];
         uint64_t sCIdxMatrix[SettingsT::VoxelsPerLeafnodeNoHalo()];
-#if 0
-        // Maximal sizes
-        bool sBPredMatrix[SettingsT::VoxelsPerLeafnodeWithHalo()];
-        bool sCPredMatrix[SettingsT::VoxelsPerLeafnodeNoHalo()];
-#else
-        // Using only the cosize of the relevant tensor
-        bool sBPredMatrixNew[SettingsT::VoxelsPerClusterWithHalo()];
-        bool sBPredMatrix[556];
-        bool sCPredMatrix[220];
-#endif
+        bool sBPredMatrix[SettingsT::VoxelsPerClusterWithHalo()];
+        bool sCPredMatrixNew[SettingsT::VoxelsPerClusterNoHalo()];
+        // bool sCPredMatrix[220];
     };
 
     //
@@ -368,7 +372,8 @@ struct AmperePredicatedFprop {
         auto sBIdx_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sBIdxMatrix[0];
         const auto filterOrigin = outLeaf.origin().offsetBy(SettingsT::Dx,SettingsT::Dy,SettingsT::Dz);
         for (int v = 0; v < SettingsT::VoxelsPerLeafnodeWithHalo(); v += MaxThreadsPerBlock)
-            if ((v+threadIdx.x) < SettingsT::VoxelsPerLeafnodeWithHalo()) {
+            if ((v+threadIdx.x) < SettingsT::VoxelsPerLeafnodeWithHalo())
+            {
                 auto [i,j,k] = idx2crd(v+threadIdx.x, shape(HaloLayout{}), stride(HaloLayout{}));
                 sBIdx_ptr[v+threadIdx.x] = actTree.getValue(filterOrigin.offsetBy(i,j,k));
             }
@@ -408,52 +413,47 @@ struct AmperePredicatedFprop {
             // Build gather predicate tensors in SMEM
         
             auto sBPred_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sBPredMatrix[0];
-            auto sBPredNew_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sBPredMatrixNew[0];
-            auto sBIdx_ptr = sBIdx.data();
-            // Tensor sBPred = make_tensor(make_smem_ptr(sBPred_ptr), sBIdx.layout());
-            Tensor sBPred = make_tensor(make_smem_ptr(sBPred_ptr), shape(sBIdx), stride(sBIdx.layout()));
-            Tensor sBPredNew = make_tensor(make_smem_ptr(sBPredNew_ptr), shape(sBIdx),
+            Tensor sBPred = make_tensor(make_smem_ptr(sBPred_ptr), shape(sBIdx),
                 IGEMM_Layouts<SettingsT>::clusterActivationPredicateStride());
-            auto sBPred_cosize = cosize(sBIdx.layout());
-            auto sBPredNew_cosize = cosize(sBPredNew.layout());
-            auto sBPredNew_size = size(sBPredNew);
             for (int v = 0; v < SettingsT::VoxelsPerClusterWithHalo(); v += MaxThreadsPerBlock)
-            {
-                auto [i,j,k] = idx2crd(v+threadIdx.x, shape(ClusterHaloLayout{}), stride(ClusterHaloLayout{}));
-                auto coord = make_tuple(make_tuple(make_tuple(0,0,0),i,j,k),make_tuple(0,0,0,0),make_tuple(0,0,0,0));
-                sBPredNew(coord) = sBIdx(coord);
-            }
-            for (int i = 0; i < sBPred_cosize; i += MaxThreadsPerBlock)
-                if (i+threadIdx.x < sBPred_cosize)
-                    sBPred_ptr[i+threadIdx.x] = sBIdx_ptr[i+threadIdx.x];
+                if (v+threadIdx.x < SettingsT::VoxelsPerClusterWithHalo())
+                {
+                    auto [i,j,k] = idx2crd(v+threadIdx.x, shape(ClusterHaloLayout{}), stride(ClusterHaloLayout{}));
+                    auto coord = make_tuple(make_tuple(make_tuple(0,0,0),i,j,k),make_tuple(0,0,0,0),make_tuple(0,0,0,0));
+                    sBPred(coord) = sBIdx(coord);
+                }
+
             __syncthreads();
+
+            auto sCPredNew_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sCPredMatrixNew[0];
+            Tensor sCPredNew = make_tensor(make_smem_ptr(sCPredNew_ptr), shape(sCIdx),
+                IGEMM_Layouts<SettingsT>::clusterOutputPredicateStride());
+            for (int v = 0; v < SettingsT::VoxelsPerClusterNoHalo(); v += MaxThreadsPerBlock)
+                if (v+threadIdx.x < SettingsT::VoxelsPerClusterNoHalo())
+                {
+                    auto [i,j,k] = idx2crd(v+threadIdx.x, shape(ClusterVoxelLayout{}), stride(ClusterVoxelLayout{}));
+                    auto coord = make_tuple(0,make_tuple(make_tuple(0,0,0),i,j,k));
+                    sCPredNew(coord) = sCIdx(coord);
+                }
+
+            __syncthreads();
+
 #if 0
             if (threadIdx.x == 0) {
-                for (int bii = 0; bii < shape<0,0,0>(sBIdx); bii++)
-                for (int bjj = 0; bjj < shape<0,0,1>(sBIdx); bjj++)
-                for (int bkk = 0; bkk < shape<0,0,2>(sBIdx); bkk++)
-                    for (int iii = 0; iii < shape<0,1>(sBIdx); iii++)
-                    for (int jjj = 0; jjj < shape<0,2>(sBIdx); jjj++)
-                    for (int kkk = 0; kkk < shape<0,3>(sBIdx); kkk++)
-                        for (int t = 0; t < shape<2,1>(sBIdx); t++)
-                        for (int r = 0; r < shape<2,2>(sBIdx); r++)
-                        for (int s = 0; s < shape<2,3>(sBIdx); s++)
-                        {
-                            auto coord = make_tuple(make_tuple(make_tuple(bii,bjj,bkk),iii,jjj,kkk),make_tuple(0,0,0,0),make_tuple(0,t,r,s));
-                            if(sBPredNew(coord) != sBPred(coord))
-                                printf("Barf\n");
-                        }
-                }
+                // print("\nshape(sCIdx)=");print(shape(sCIdx));print("\n");
+                for (int bii = 0; bii < shape<1,0,0>(sCIdx); bii++)
+                for (int bjj = 0; bjj < shape<1,0,1>(sCIdx); bjj++)
+                for (int bkk = 0; bkk < shape<1,0,2>(sCIdx); bkk++)
+                    for (int iii = 0; iii < shape<1,1>(sCIdx); iii++)
+                    for (int jjj = 0; jjj < shape<1,2>(sCIdx); jjj++)
+                    for (int kkk = 0; kkk < shape<1,3>(sCIdx); kkk++)
+                    {
+                        auto coord = make_tuple(0,make_tuple(make_tuple(bii,bjj,bkk),iii,jjj,kkk));                   
+                        if(sCPredNew(coord) != sCPred(coord))
+                            printf("Barf\n");
+                    }
+            }
 #endif
-            auto sCPred_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sCPredMatrix[0];
-            auto sCIdx_ptr = sCIdx.data();
-            auto sCPred_cosize = cosize(sCIdx.layout());
-            Tensor sCPred = make_tensor(make_smem_ptr(sCPred_ptr), sCIdx.layout());
-            for (int i = 0; i < sCPred_cosize; i += MaxThreadsPerBlock)
-                if (i+threadIdx.x < sCPred_cosize)
-                    sCPred_ptr[i+threadIdx.x] = sCIdx_ptr[i+threadIdx.x];
-        
-            __syncthreads();
         
             auto k_tile_iter = cute::make_coord_iterator(size<2>(gA));
             int k_tile_count = size<2>(gA);
@@ -463,7 +463,7 @@ struct AmperePredicatedFprop {
                 accum,
                 gA,
                 gB,
-                sBPredNew,
+                sBPred,
                 accum,
                 k_tile_iter, k_tile_count,
                 Underscore{}, // no residue since we do not support predication
@@ -489,7 +489,7 @@ struct AmperePredicatedFprop {
             auto gmem_thr_copy_C = gmem_tiled_copy_C.get_slice(threadIdx.x);
             auto tDsC = gmem_thr_copy_C.partition_S(sC);
             auto tDgC = gmem_thr_copy_C.partition_D(gC);
-            auto tDsCPred = gmem_thr_copy_C.partition_D(sCPred);
+            auto tDsCPred = gmem_thr_copy_C.partition_D(sCPredNew);
             copy_if(gmem_tiled_copy_C, tDsCPred, tDsC, tDgC);
 
             __syncthreads(); // necessary while the predicate tensors are built once per iteration; TODO: revise

@@ -250,8 +250,7 @@ struct AmperePredicatedFprop {
         uint64_t sBIdxMatrix[SettingsT::VoxelsPerLeafnodeWithHalo()];
         uint64_t sCIdxMatrix[SettingsT::VoxelsPerLeafnodeNoHalo()];
         bool sBPredMatrix[SettingsT::VoxelsPerClusterWithHalo()];
-        bool sCPredMatrixNew[SettingsT::VoxelsPerClusterNoHalo()];
-        // bool sCPredMatrix[220];
+        bool sCPredMatrix[SettingsT::VoxelsPerClusterNoHalo()];
     };
 
     //
@@ -423,38 +422,19 @@ struct AmperePredicatedFprop {
                     sBPred(coord) = sBIdx(coord);
                 }
 
-            __syncthreads();
-
-            auto sCPredNew_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sCPredMatrixNew[0];
-            Tensor sCPredNew = make_tensor(make_smem_ptr(sCPredNew_ptr), shape(sCIdx),
+            auto sCPred_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sCPredMatrix[0];
+            Tensor sCPred = make_tensor(make_smem_ptr(sCPred_ptr), shape(sCIdx),
                 IGEMM_Layouts<SettingsT>::clusterOutputPredicateStride());
             for (int v = 0; v < SettingsT::VoxelsPerClusterNoHalo(); v += MaxThreadsPerBlock)
                 if (v+threadIdx.x < SettingsT::VoxelsPerClusterNoHalo())
                 {
                     auto [i,j,k] = idx2crd(v+threadIdx.x, shape(ClusterVoxelLayout{}), stride(ClusterVoxelLayout{}));
                     auto coord = make_tuple(0,make_tuple(make_tuple(0,0,0),i,j,k));
-                    sCPredNew(coord) = sCIdx(coord);
+                    sCPred(coord) = sCIdx(coord);
                 }
 
             __syncthreads();
 
-#if 0
-            if (threadIdx.x == 0) {
-                // print("\nshape(sCIdx)=");print(shape(sCIdx));print("\n");
-                for (int bii = 0; bii < shape<1,0,0>(sCIdx); bii++)
-                for (int bjj = 0; bjj < shape<1,0,1>(sCIdx); bjj++)
-                for (int bkk = 0; bkk < shape<1,0,2>(sCIdx); bkk++)
-                    for (int iii = 0; iii < shape<1,1>(sCIdx); iii++)
-                    for (int jjj = 0; jjj < shape<1,2>(sCIdx); jjj++)
-                    for (int kkk = 0; kkk < shape<1,3>(sCIdx); kkk++)
-                    {
-                        auto coord = make_tuple(0,make_tuple(make_tuple(bii,bjj,bkk),iii,jjj,kkk));                   
-                        if(sCPredNew(coord) != sCPred(coord))
-                            printf("Barf\n");
-                    }
-            }
-#endif
-        
             auto k_tile_iter = cute::make_coord_iterator(size<2>(gA));
             int k_tile_count = size<2>(gA);
         
@@ -489,10 +469,11 @@ struct AmperePredicatedFprop {
             auto gmem_thr_copy_C = gmem_tiled_copy_C.get_slice(threadIdx.x);
             auto tDsC = gmem_thr_copy_C.partition_S(sC);
             auto tDgC = gmem_thr_copy_C.partition_D(gC);
-            auto tDsCPred = gmem_thr_copy_C.partition_D(sCPredNew);
+            auto tDsCPred = gmem_thr_copy_C.partition_D(sCPred);
             copy_if(gmem_tiled_copy_C, tDsCPred, tDsC, tDgC);
 
-            __syncthreads(); // necessary while the predicate tensors are built once per iteration; TODO: revise
+            // __syncthreads(); // necessary if the predicate tensors are built once per leafnode
         }
+        __syncthreads(); // should be safe to synchronize only here; predicates built at every iteration
     }
 };

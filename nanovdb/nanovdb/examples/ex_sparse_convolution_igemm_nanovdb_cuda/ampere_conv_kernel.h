@@ -232,18 +232,15 @@ struct AmperePredicatedFprop {
     using K = Int<SettingsT::K>;
 
     // Tiler config
-    using Tiler_K  = decltype(cute::min(K{}, _32{}));
-    using Tiler_C  = decltype(cute::min(C{}, _32{}));
-    using Tiler_N  = Shape<_1, ZZ, PP, QQ>;
-    using Tiler_NN = Shape<ZZ, PP, QQ>;
-    using TileM    = Tiler_K;
-    using TileN    = Shape<Tiler_N, Z, P, Q>;
-    using TileNN   = Shape<Tiler_NN, Z, P, Q>;
-    using TileK    = Shape<Tiler_C,_1,_1,_1>;
-    using PIPE     = _3;
+    using Tiler_K = decltype(cute::min(K{}, _32{}));
+    using Tiler_C = decltype(cute::min(C{}, _32{}));
+    using Tiler_N = Shape<ZZ, PP, QQ>;
+    using TileM   = Tiler_K;
+    using TileN   = Shape<Tiler_N, Z, P, Q>;
+    using TileK   = Shape<Tiler_C,_1,_1,_1>;
+    using PIPE    = _3;
     using TilerFlt = Shape<TileM, TileK>;
     using TilerAct = Shape<TileN, TileK>;
-    using TilerActN = Shape<TileNN, TileK>;
     using TilerOut = Shape<TileM, TileN>;
 
     using TileSizeM = Int<size(TileM{})>;
@@ -369,10 +366,10 @@ struct AmperePredicatedFprop {
     template <class BuildT, class EngineFlt, class ActivationTensor, class ActivationIndexTensor, class OutputTensor, class OutputIndexTensor>
     void __device__
     operator()(cute::Tensor<EngineFlt, GmemLayoutFlt> mFlt,        // (                   K,           (C,T,R,S))
-        ActivationTensor                              mAct,        // (((N,Bx,By,Bz),Z,P,Q),           (C,T,R,S))
-        ActivationIndexTensor                         mActIdx,     // (((N,Bx,By,Bz),Z,P,Q),           (C,T,R,S))
-        OutputTensor                                  mOut,        // ( K,                  ((N,Bx,By,Bz),Z,P,Q))
-        OutputIndexTensor                             mOutIdx,     // ( K,                  ((N,Bx,By,Bz),Z,P,Q))
+        ActivationTensor                              mAct_,       // (((N,Bx,By,Bz),Z,P,Q),           (C,T,R,S))
+        ActivationIndexTensor                         mActIdx_,    // (((N,Bx,By,Bz),Z,P,Q),           (C,T,R,S))
+        OutputTensor                                  mOut_,       // ( K,                  ((N,Bx,By,Bz),Z,P,Q))
+        OutputIndexTensor                             mOutIdx_,    // ( K,                  ((N,Bx,By,Bz),Z,P,Q))
         const nanovdb::NanoGrid<BuildT>               *mActGrid,
         const nanovdb::NanoGrid<BuildT>               *mOutGrid,
         const float                                   *actData,
@@ -415,94 +412,10 @@ struct AmperePredicatedFprop {
 
         __syncthreads();
 
-#if 0
-        if (threadIdx.x == 0) {
-            auto gBIdx_ptr = &mActIdx(make_tuple(make_tuple(make_tuple(leafID,0,0,0),0,0,0),make_tuple(0,0,0,0)));
-            for (int v = 0; v < SettingsT::VoxelsPerLeafnodeWithHalo(); ++v)
-               if (sBIdx_ptr[v] != gBIdx_ptr[v])
-                    printf("Inconsistency between on-the-fly and precomputed gather indices\n");
-            auto gCIdx_ptr = &mOutIdx(make_tuple(0,make_tuple(make_tuple(leafID,0,0,0),0,0,0)));
-            for (int v = 0; v < SettingsT::VoxelsPerLeafnodeNoHalo(); ++v)
-               if (sCIdx_ptr[v] != gCIdx_ptr[v])
-                    printf("Inconsistency between on-the-fly and precomputed gather indices\n");
-        }
-        __syncthreads();
-#endif
-
-        Tensor gAct = make_tensor(
-            make_gmem_ptr(actData),
-            IGEMM_Layouts<SettingsT>::activationComposedGatherLayout(sBIdx_ptr)
-        );
-            
-        Tensor sActIdx = make_tensor(
-            make_smem_ptr(sBIdx_ptr),
-            IGEMM_Layouts<SettingsT>::activationIndexLayout()
-        );
-
-#if 0
-        if (threadIdx.x == 0)
-        {
-            for (int bi = 0; bi < size<0,0,0>(sActIdx); ++bi)
-            for (int bj = 0; bj < size<0,0,1>(sActIdx); ++bj)
-            for (int bk = 0; bk < size<0,0,2>(sActIdx); ++bk)
-                for (int z = 0; z < size<0,1>(sActIdx); ++z)
-                for (int p = 0; p < size<0,2>(sActIdx); ++p)
-                for (int q = 0; q < size<0,3>(sActIdx); ++q)
-                    for (int t = 0; t < size<1,1>(sActIdx); ++t)
-                    for (int r = 0; r < size<1,2>(sActIdx); ++r)
-                    for (int s = 0; s < size<1,3>(sActIdx); ++s)
-                    {
-                        auto sCoord0 = make_tuple(make_tuple(make_tuple(       bi,bj,bk),z,p,q),make_tuple(0,t,r,s));
-                        auto mCoord0 = make_tuple(make_tuple(make_tuple(leafID,bi,bj,bk),z,p,q),make_tuple(0,t,r,s));
-                        if (sActIdx(sCoord0) != mActIdx(mCoord0))
-                            printf("Inconsistency between mActIdx and sActIdx\n");
-                        for (int c = 0; c < size<1,0>(sActIdx); ++c)
-                        {
-                            auto gCoord = make_tuple(make_tuple(make_tuple(       bi,bj,bk),z,p,q),make_tuple(c,t,r,s));
-                            auto mCoord = make_tuple(make_tuple(make_tuple(leafID,bi,bj,bk),z,p,q),make_tuple(c,t,r,s));
-                            if (&gAct(gCoord) != &mAct(mCoord))
-                                printf("Inconsistency between &gAct and &mAct\n");
-                        }
-                    }
-        }
-        __syncthreads();
-#endif
-
-        Tensor gOut = make_tensor(
-            make_gmem_ptr(outData),
-            IGEMM_Layouts<SettingsT>::outputComposedScatterLayout(sCIdx_ptr)
-        );
-
-        Tensor sOutIdx = make_tensor(
-            make_smem_ptr(sCIdx_ptr),
-            IGEMM_Layouts<SettingsT>::outputIndexLayout()        
-        );
-
-#if 0
-        if (threadIdx.x == 0)
-        {
-            for (int bi = 0; bi < size<1,0,0>(sOutIdx); ++bi)
-            for (int bj = 0; bj < size<1,0,1>(sOutIdx); ++bj)
-            for (int bk = 0; bk < size<1,0,2>(sOutIdx); ++bk)
-                for (int z = 0; z < size<1,1>(sOutIdx); ++z)
-                for (int p = 0; p < size<1,2>(sOutIdx); ++p)
-                for (int q = 0; q < size<1,3>(sOutIdx); ++q)
-                {
-                    auto sCoord0 = make_tuple(0,make_tuple(make_tuple(       bi,bj,bk),z,p,q));
-                    auto mCoord0 = make_tuple(0,make_tuple(make_tuple(leafID,bi,bj,bk),z,p,q));
-                    if (sOutIdx(sCoord0) != mOutIdx(mCoord0))
-                        printf("Inconsistency between mOutIdx and sOutIdx\n");
-                    for (int k = 0; k < size<0>(sOutIdx); ++k)
-                    {
-                        auto gCoord = make_tuple(k,make_tuple(make_tuple(       bi,bj,bk),z,p,q));
-                        auto mCoord = make_tuple(k,make_tuple(make_tuple(leafID,bi,bj,bk),z,p,q));
-                        if (&gOut(gCoord) != &mOut(mCoord))
-                            printf("Inconsistency between &gOut and &mOut\n");
-                    }
-                }
-        }
-        __syncthreads();
-#endif
+        Tensor gAct    = make_tensor(make_gmem_ptr(actData),IGEMM_Layouts<SettingsT>::activationComposedGatherLayout(sBIdx_ptr));
+        Tensor sActIdx = make_tensor(make_smem_ptr(sBIdx_ptr),IGEMM_Layouts<SettingsT>::activationIndexLayout());
+        Tensor gOut    = make_tensor(make_gmem_ptr(outData),IGEMM_Layouts<SettingsT>::outputComposedScatterLayout(sCIdx_ptr));
+        Tensor sOutIdx = make_tensor(make_smem_ptr(sCIdx_ptr),IGEMM_Layouts<SettingsT>::outputIndexLayout());
 
         TiledMma tiled_mma;
         Tensor accum = partition_fragment_C(tiled_mma, TilerOut{});
@@ -510,85 +423,42 @@ struct AmperePredicatedFprop {
         // Set up tensors
         // NOTE: blockIdx.x projects onto act-NDHW mode, y along the flt-K mode for the sake of higher dynamic range in NDHW
         Tensor gA_mk    = local_tile(mFlt,    TilerFlt{}, make_coord(_,_));                // (BLK_M,BLK_K,m',k')
-        Tensor mB_nk    = local_tile(mAct,    TilerAct{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
-        Tensor gB_nk    = local_tile(gAct,    TilerActN{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
-        Tensor mBIdx_nk = local_tile(mActIdx, TilerAct{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
-        Tensor sBIdx_nk = local_tile(sActIdx, TilerActN{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
-        Tensor mC_mn    = local_tile(mOut,    TilerOut{}, make_coord(_,_));                // (BLK_M,BLK_N,m',n')
-        Tensor mCIdx_mn = local_tile(mOutIdx, TilerOut{}, make_coord(_,_));                // (BLK_M,BLK_N,m',n')        
+        Tensor gB_nk    = local_tile(gAct,    TilerAct{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
+        Tensor sBIdx_nk = local_tile(sActIdx, TilerAct{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
+        Tensor gC_mn    = local_tile(gOut,    TilerOut{}, make_coord(_,_));                // (BLK_M,BLK_N,m',n')
+        Tensor sCIdx_mn = local_tile(sOutIdx, TilerOut{}, make_coord(_,_));                // (BLK_M,BLK_N,m',n')        
         
         for (int m_coord = 0; m_coord < size<2>(gA_mk); ++m_coord)
         for (int clusterID = 0; clusterID < size(ClusterShape{}); ++clusterID)
         {
             clear(accum);
         
-#if 0
-            auto n_layout = make_layout(shape<2>(mB_nk), GenRowMajor{});
-            auto n_coord = idx2crd(int(8*leafID+clusterID), shape(n_layout), stride(n_layout));
-#elif 0
-            // This version produces the exactly same order as above
-            auto clusterLayout = make_layout(ClusterShape{}, GenRowMajor{});
-            auto clusterCoord = idx2crd(clusterID, shape(clusterLayout), stride(clusterLayout));
-            auto n_coord = make_tuple(cute::prepend(clusterCoord, leafID),_0{},_0{},_0{});
-#elif 1
-            // Also correct, but clusters traversed in co-lex order
             auto clusterCoord = idx2crd(clusterID, ClusterShape{});
-            auto n_coord = make_tuple(cute::prepend(clusterCoord, leafID),_0{},_0{},_0{});
-            auto N_coord = make_tuple(clusterCoord,_0{},_0{},_0{});
-#endif
+            auto n_coord = make_tuple(clusterCoord,_0{},_0{},_0{});
 
             Tensor gA    = gA_mk   (_,_,m_coord,_);                                            // (BLK_M,BLK_K,k')
-            Tensor mB    = mB_nk   (_,_,n_coord,_);                                            // (BLK_N,BLK_K,_1)
-            Tensor gB    = gB_nk   (_,_,N_coord,_);                                            // (BLK_N,BLK_K,_1)
-            Tensor mBIdx = mBIdx_nk(_,_,n_coord,_);                                            // (BLK_N,BLK_K,_1)
-            Tensor sBIdx = sBIdx_nk(_,_,N_coord,_);                                            // (BLK_N,BLK_K,_1)
-#if 0
-            if(threadIdx.x == 0)
-            {
-                for (int bii = 0; bii < shape<0,0,0>(gB); ++bii)
-                for (int bjj = 0; bjj < shape<0,0,1>(gB); ++bjj)
-                for (int bkk = 0; bkk < shape<0,0,2>(gB); ++bkk)
-                    for (int z = 0; z < shape<0,1>(gB); ++z)
-                    for (int p = 0; p < shape<0,2>(gB); ++p)
-                    for (int q = 0; q < shape<0,3>(gB); ++q)
-                        for (int t = 0; t < shape<2,1>(gB); ++t)
-                        for (int r = 0; r < shape<2,2>(gB); ++r)
-                        for (int s = 0; s < shape<2,3>(gB); ++s)
-                {
-                    for (int bc = 0; bc < shape<2,0>(gB); ++bc)
-                    for (int cc = 0; cc < shape<1,0>(gB); ++cc)
-                    {
-                        auto gCoord = make_tuple(make_tuple(make_tuple(  bii,bjj,bkk),z,p,q),make_tuple(cc,0,0,0),make_tuple(bc,t,r,s));
-                        auto mCoord = make_tuple(make_tuple(make_tuple(0,bii,bjj,bkk),z,p,q),make_tuple(cc,0,0,0),make_tuple(bc,t,r,s));
-                        if(&gB(gCoord) != &mB(mCoord))
-                            printf("Inconsistency between &gB and &mB\n");
-                        if(sBIdx(gCoord) != mBIdx(mCoord))
-                            printf("Inconsistency between sBIdx and mBIdx\n");
-                    }
-                        
-                }
-            }
-#endif
-            Tensor mC    = mC_mn   (_,_,m_coord,n_coord);                                      // (BLK_M,BLK_N)
-            Tensor mCIdx = mCIdx_mn(_,_,m_coord,n_coord);                                      // (BLK_M,BLK_N)
+            Tensor gB    = gB_nk   (_,_,n_coord,_);                                            // (BLK_N,BLK_K,_1)
+            Tensor sBIdx = sBIdx_nk(_,_,n_coord,_);                                            // (BLK_N,BLK_K,_1)
+            Tensor gC    = gC_mn   (_,_,m_coord,n_coord);                                      // (BLK_M,BLK_N)
+            Tensor sCIdx = sCIdx_mn(_,_,m_coord,n_coord);                                      // (BLK_M,BLK_N)
             
             // Build gather predicate tensors in SMEM
         
             auto sBPred_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sBPredMatrix[0];
-            auto mBIdx_ptr = mBIdx.data();
-            Tensor sBPred = make_tensor(make_smem_ptr(sBPred_ptr), mBIdx.layout());
-            auto sBPred_cosize = cosize(mBIdx.layout());
+            auto sBIdx_ptr = sBIdx.data();
+            Tensor sBPred = make_tensor(make_smem_ptr(sBPred_ptr), sBIdx.layout());
+            auto sBPred_cosize = cosize(sBIdx.layout());
             for (int i = 0; i < sBPred_cosize; i += MaxThreadsPerBlock)
                 if (i+threadIdx.x < sBPred_cosize)
-                    sBPred_ptr[i+threadIdx.x] = mBIdx_ptr[i+threadIdx.x];
+                    sBPred_ptr[i+threadIdx.x] = sBIdx_ptr[i+threadIdx.x];
             
             auto sCPred_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sCPredMatrix[0];
-            auto mCIdx_ptr = mCIdx.data();
-            auto sCPred_cosize = cosize(mCIdx.layout());
-            Tensor sCPred = make_tensor(make_smem_ptr(sCPred_ptr), mCIdx.layout());
+            auto sCIdx_ptr = sCIdx.data();
+            auto sCPred_cosize = cosize(sCIdx.layout());
+            Tensor sCPred = make_tensor(make_smem_ptr(sCPred_ptr), sCIdx.layout());
             for (int i = 0; i < sCPred_cosize; i += MaxThreadsPerBlock)
                 if (i+threadIdx.x < sCPred_cosize)
-                    sCPred_ptr[i+threadIdx.x] = mCIdx_ptr[i+threadIdx.x];
+                    sCPred_ptr[i+threadIdx.x] = sCIdx_ptr[i+threadIdx.x];
         
             __syncthreads();
         
@@ -599,7 +469,7 @@ struct AmperePredicatedFprop {
             collective_mma(
                 accum,
                 gA,
-                mB,
+                gB,
                 sBPred,
                 accum,
                 k_tile_iter, k_tile_count,
@@ -625,10 +495,9 @@ struct AmperePredicatedFprop {
             GmemTiledCopyOut gmem_tiled_copy_C;
             auto gmem_thr_copy_C = gmem_tiled_copy_C.get_slice(threadIdx.x);
             auto tDsC = gmem_thr_copy_C.partition_S(sC);
-            auto tDmC = gmem_thr_copy_C.partition_D(mC);
+            auto tDgC = gmem_thr_copy_C.partition_D(gC);
             auto tDsCPred = gmem_thr_copy_C.partition_D(sCPred);
-        
-            copy_if(gmem_tiled_copy_C, tDsCPred, tDsC, tDmC);
+            copy_if(gmem_tiled_copy_C, tDsCPred, tDsC, tDgC);
 
             __syncthreads(); // necessary while the predicate tensors are built once per iteration; TODO: revise
         }

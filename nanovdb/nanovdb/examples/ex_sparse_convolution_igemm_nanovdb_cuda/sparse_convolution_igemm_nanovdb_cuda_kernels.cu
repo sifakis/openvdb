@@ -373,7 +373,7 @@ void mainSparseConvolutionIGEMM(
     using ConvOp = AmperePredicatedFprop<IGEMM_Geometry>;
 #ifdef USE_HIERARCHICAL_BLOCK_TRAVERSAL
     auto leafShape = make_shape(Int<IGEMM_Geometry::Bx>{},  Int<IGEMM_Geometry::By>{},  Int<IGEMM_Geometry::Bz>{});
-    auto blockedLeafShape = shape(zipped_divide(make_layout(leafShape), take<1,4>(ConvOp::Tiler_N{})));
+    auto blockedLeafShape = shape(zipped_divide(make_layout(leafShape), ConvOp::Tiler_N{}));
     auto blockedLeafLayout = make_ordered_layout(
         blockedLeafShape,
         make_tuple(make_tuple(_2{},_1{},_0{}),make_tuple(_5{},_4{},_3{})));
@@ -567,8 +567,8 @@ void mainSparseConvolutionIGEMM(
     );
     
     // ((BLK_M, BLK_N), (m', n'))
-    Tensor gOutput_mn = zipped_divide(tXformedOutScatter, typename AmperePredicatedFprop<IGEMM_Geometry>::TilerOut{});
-    print("\n");print("shape(gOutput_mn)=");print(shape(gOutput_mn));print("\n");
+    // Tensor gOutput_mn = zipped_divide(tXformedOutScatter, typename AmperePredicatedFprop<IGEMM_Geometry>::TilerOut{});
+    // print("\n");print("shape(gOutput_mn)=");print(shape(gOutput_mn));print("\n");
     constexpr size_t smem_size = sizeof(typename AmperePredicatedFprop<IGEMM_Geometry>::SharedStorage);
     std::cout << "smem_size = " << smem_size << std::endl;
 
@@ -581,7 +581,7 @@ void mainSparseConvolutionIGEMM(
             smem_size
         ));
 
-    int num_iterations = 1;
+    int num_iterations = 10;
     for (int i = 0; i < num_iterations; ++i) {
         gpuTimer.start("Scatter-Gather Cutlass IGEMM (GPU) execution");
         kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, BuildT,

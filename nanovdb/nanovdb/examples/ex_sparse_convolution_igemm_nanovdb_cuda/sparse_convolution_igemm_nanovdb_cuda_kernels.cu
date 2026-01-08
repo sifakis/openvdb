@@ -41,10 +41,6 @@ struct IGEMM_Geometry
     static constexpr int H = P+R-1; // Y-dimension of input block (inluding halo)
     static constexpr int W = Q+S-1; // Z-dimension of input block (inluding halo)
 
-    static_assert(D==6, "Only convolution geometry supported is 4x2x2 block and 3x3x3 filter size");
-    static_assert(H==4, "Only convolution geometry supported is 4x2x2 block and 3x3x3 filter size");
-    static_assert(W==4, "Only convolution geometry supported is 4x2x2 block and 3x3x3 filter size");
-
     static constexpr int C = 64;    // Input feature dimension
     static constexpr int K = 128;   // Output feature dimension
     
@@ -272,11 +268,11 @@ void mainSparseConvolutionIGEMM(
 {
     using BuildT = nanovdb::ValueOnIndex;
     using BufferT = nanovdb::cuda::UnifiedBuffer;
-    static constexpr int Di = 64;
-    static constexpr int Do = 128;
+    static constexpr int Di = IGEMM_Geometry::C;
+    static constexpr int Do = IGEMM_Geometry::K;
     using inputArrayT = float (&) [][Di];
     using outputArrayT = float (&) [][Do];
-    using filterT = float (&) [3][3][3][Do][Di];
+    using filterT = float (&) [IGEMM_Geometry::T][IGEMM_Geometry::R][IGEMM_Geometry::S][Do][Di];
     
     nanovdb::util::cuda::Timer gpuTimer;
 

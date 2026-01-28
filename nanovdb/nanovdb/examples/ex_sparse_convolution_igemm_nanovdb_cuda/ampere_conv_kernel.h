@@ -230,7 +230,7 @@ struct AmperePredicatedFprop {
     using TiledMma = TiledMMA<
         MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>,
         Layout<Shape<_2,_2,_1>>,
-        Tile<_32,_32,Underscore>>;
+        Tile<_32,_32,_8>>;
 
     static constexpr int MaxThreadsPerBlock = size(TiledMma{});
     static constexpr int MinBlocksPerMultiprocessor = 1;
@@ -331,16 +331,14 @@ struct AmperePredicatedFprop {
     template <class BuildT, class EngineFlt>
     // class ActivationTensor, class ActivationIndexTensor, class OutputTensor, class OutputIndexTensor>
     void __device__
-    operator()(cute::Tensor<EngineFlt, GmemLayoutFlt> mFlt,        // (                   K,           (C,T,R,S))
-        // ActivationTensor                              mAct_,       // (((N,Bx,By,Bz),Z,P,Q),           (C,T,R,S))
-        // ActivationIndexTensor                         mActIdx_,    // (((N,Bx,By,Bz),Z,P,Q),           (C,T,R,S))
-        // OutputTensor                                  mOut_,       // ( K,                  ((N,Bx,By,Bz),Z,P,Q))
-        // OutputIndexTensor                             mOutIdx_,    // ( K,                  ((N,Bx,By,Bz),Z,P,Q))
-        const nanovdb::NanoGrid<BuildT>               *mActGrid,
-        const nanovdb::NanoGrid<BuildT>               *mOutGrid,
-        const float                                   *actData,
-        float                                         *outData,
-        char* smem_buf) const
+    operator()(
+        cute::Tensor<EngineFlt, GmemLayoutFlt> mFlt,      // (K,(C,T,R,S))
+        const nanovdb::NanoGrid<BuildT>        *mActGrid,
+        const nanovdb::NanoGrid<BuildT>        *mOutGrid,
+        const float                            *actData,
+        float                                  *outData,
+        char*                                  smem_buf
+    ) const
     {
         using namespace cute;
         using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveMma<
@@ -472,8 +470,8 @@ struct AmperePredicatedFprop {
             auto tDsCPred = gmem_thr_copy_C.partition_D(sCPred);
             copy_if(gmem_tiled_copy_C, tDsCPred, tDsC, tDgC);
 
-            // __syncthreads(); // necessary if the predicate tensors are built once per leafnode
+            __syncthreads(); // necessary if the predicate tensors are built once per leafnode
         }
-        __syncthreads(); // should be safe to synchronize only here; predicates built at every iteration
+        // __syncthreads(); // should be safe to synchronize only here; predicates built at every iteration
     }
 };

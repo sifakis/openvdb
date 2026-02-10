@@ -230,7 +230,7 @@ struct AmperePredicatedFprop {
     using TiledMma = TiledMMA<
         MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>,
         Layout<Shape<_2,_2,_1>>,
-        Tile<_32,_32,_8>>;
+        Tile<_32,_32,Underscore>>;
 
     static constexpr int MaxThreadsPerBlock = size(TiledMma{});
     static constexpr int MinBlocksPerMultiprocessor = 1;

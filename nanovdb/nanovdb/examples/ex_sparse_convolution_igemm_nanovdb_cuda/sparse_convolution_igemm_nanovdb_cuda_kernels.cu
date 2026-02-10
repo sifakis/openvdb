@@ -565,4 +565,8 @@ void mainSparseConvolutionIGEMM(
         outputReferenceArray
     );
 
+
+}
+void mainTestGEMM(uint32_t benchmark_iters)
+{
 }

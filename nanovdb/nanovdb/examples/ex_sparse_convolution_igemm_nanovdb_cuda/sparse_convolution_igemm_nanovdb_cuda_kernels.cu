@@ -567,6 +567,238 @@ void mainSparseConvolutionIGEMM(
 
 
 }
+
+struct GEMM_Geometry
+{
+    //
+    // Matrix geometry
+    //
+
+    static constexpr int M = 32;
+    static constexpr int N = 32;
+    static constexpr int K = 32;
+};
+
+
+template<class SettingsT>
+struct GEMM_Layouts
+{
+    static constexpr auto M = Int<SettingsT::M>{};
+    static constexpr auto N = Int<SettingsT::N>{};
+    static constexpr auto K = Int<SettingsT::K>{};
+
+    __hostdev__
+    static auto matrixALayout()
+    {
+        return
+            make_ordered_layout(
+                make_shape(M,K),
+                tuple<_1,_0>{}
+            );
+    }
+    __hostdev__
+
+    static auto matrixBLayout()
+    {
+        return
+            make_ordered_layout(
+                make_shape(N,K),
+                tuple<_1,_0>{}
+            );
+    }
+    __hostdev__
+
+    static auto matrixCLayout()
+    {
+        return
+            make_ordered_layout(
+                make_shape(M,N),
+                tuple<_1,_0>{}
+            );
+    }
+};
+
+// #include "cutlass/gemm/collective/collective_mma.hpp"
+// #include "cutlass/gemm/dispatch_policy.hpp"
+// #include "cutlass/gemm/collective/sm80_mma_multistage.hpp"
+
+// -----------------------------------------------------------------------------
+// 1. Configuration: The "Example 59" Machinery adapted for 32x32x32 Float
+// -----------------------------------------------------------------------------
+
+// Define the Tile Size
+using TileShape = Shape<Int<GEMM_Geometry::M>, Int<GEMM_Geometry::N>, Int<GEMM_Geometry::K>>; // M, N, K
+
+    using TiledMma = TiledMMA<
+        MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>,
+        Layout<Shape<_2,_2,_1>>,
+        Tile<_32,_32,Underscore>>;
+
+using GmemCopyA = decltype(make_tiled_copy(
+    Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, float>{},
+    Layout<Shape<_16, _8>, Stride<_8, _1>>{},  // 16x8 threads
+    Layout<Shape< _1, _4>>{}                   // Vectorize 4 along K (Col-Major)
+));
+
+using GmemCopyB = decltype(make_tiled_copy(
+    Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, float>{},
+    Layout<Shape<_16, _8>, Stride<_8, _1>>{},  // 16x8 threads
+    Layout<Shape< _1, _4>>{}                   // Vectorize 4 along K (Col-Major)
+));
+
+#if 0
+
+// Define Copy Engines (Gmem -> Smem)
+// We vectorize loading Floats (128-bit = 4 floats)
+using GmemCopyA = decltype(make_tiled_copy(
+    Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, float>{},
+    Layout<Shape<_16, _8>, Stride<_1, _16>>{}, // 16x8 threads
+    Layout<Shape< _1, _4>>{}                   // Vectorize 4 along K (Col-Major)
+));
+
+using GmemCopyA = decltype(make_tiled_copy(
+    Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, float>{},
+    Layout<Shape<_16, _8>, Stride<_8, _1>>{},  // 16x8 threads
+    Layout<Shape< _1, _4>>{}                   // Vectorize 4 along K (Col-Major)
+));
+
+using GmemCopyB = decltype(make_tiled_copy(
+    Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, float>{},
+    Layout<Shape<_16, _8>, Stride<_8, _1>>{},  // 16x8 threads
+    Layout<Shape< _1, _4>>{}                   // Vectorize 4 along K (Col-Major)
+));
+
+// Define Smem Layouts (Pipeline Stage Storage)
+// Size = 32x32 floats
+using SmemLayoutA = decltype(composition(
+    Swizzle<3, 3, 3>{},
+    Layout<Shape<_32, _32>, Stride<_1, _32>>{}
+));
+
+using SmemLayoutB = decltype(composition(
+    Swizzle<3, 3, 3>{},
+    Layout<Shape<_32, _32>, Stride<_32, _1>>{} // Transposed in Smem to match TN atom
+));
+
+// The Collective Object Type
+using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
+    cutlass::gemm::MainloopSm80CpAsync<
+        1,      // PIPE=1 (As requested)
+        false,  // No Cluster
+        false   // No Cluster
+    >,
+    TileShape,
+    float, cutlass::layout::ColumnMajor, // A Global
+    float, cutlass::layout::RowMajor,    // B Global (Note: RowMajor trick for B^T)
+    TiledMma,
+    GmemCopyA, SmemLayoutA,
+    GmemCopyB, SmemLayoutB
+>;
+
+// -----------------------------------------------------------------------------
+// 2. The Kernel: Driving the Collective manually
+// -----------------------------------------------------------------------------
+__global__ void simpleGemmKernel(float* ptrA, float* ptrB, float* ptrC)
+{
+    // 1. Get Thread ID
+    int thread_idx = threadIdx.x;
+
+    // 2. Instantiate the Collective
+    // We construct the global tensor views here.
+    // Note: B is treated as (K, N) Row Major to match user's (N, K) Col Major
+    Tensor gA = make_tensor(make_gmem_ptr(ptrA), make_shape(32, 32), make_stride(1, 32));
+    Tensor gB = make_tensor(make_gmem_ptr(ptrB), make_shape(32, 32), make_stride(32, 1)); 
+    
+    // Create Shared Memory Buffer
+    extern __shared__ char smem_buf[];
+    CollectiveMainloop collective;
+    
+    // 3. Run the "Producer" (Load) and "Consumer" (Math)
+    // For PIPE=1, we can manually drive the steps or use the built-in logic.
+    // To keep it simple and authentic to "CollectiveMma", we call the method.
+    
+    // Create Accumulators (Register File)
+    TiledMma tiled_mma;
+    auto accumulators = tiled_mma.partition_fragment_C(gA(make_coord(0,0), make_coord(0,0))); // Shape dummy
+    clear(accumulators);
+
+    // Set up the Mainloop Pipeline arguments
+    auto k_tile_iter  = make_coord_iterator(shape<2>(gA), shape<2>(TileShape{}));
+    int k_tile_count  = size(k_tile_iter);
+    
+    // We act as a single block (0,0,0) processing the single 32x32x32 tile
+    auto block_coord = make_coord(0, 0, 0); 
+
+    // CALL THE COLLECTIVE
+    // This function runs the loop: Load -> cp.async -> wait -> mma -> repeat
+    collective(
+        accumulators,
+        gA, gB, accumulators, // gA, gB, (C not used in load)
+        k_tile_iter, k_tile_count,
+        0, // residue
+        thread_idx,
+        reinterpret_cast<char*>(smem_buf)
+    );
+
+    // 4. Epilogue: Store Registers -> Global Memory C
+    // Simple naive store for the test
+    Tensor gC = make_tensor(make_gmem_ptr(ptrC), make_shape(32, 32), make_stride(1, 32));
+    auto tCgC = tiled_mma.partition_C(gC);     // View of C from this thread
+    auto tCrC = make_tensor(accumulators.data(), shape(tCgC)); // View of Registers
+    
+    // Direct register-to-global copy
+    // (Note: In production you would use a coalesced Epilogue)
+    copy(tCrC, tCgC); 
+}
+
+#endif
+
 void mainTestGEMM(uint32_t benchmark_iters)
 {
+    std::random_device rd;
+    // std::mt19937 generator(rd());
+    std::mt19937 generator(12345);
+    std::uniform_int_distribution<int> distribution(-256, 256);
+
+    using BufferT = nanovdb::cuda::UnifiedBuffer;
+    static constexpr int M = GEMM_Geometry::M;
+    static constexpr int N = GEMM_Geometry::N;
+    static constexpr int K = GEMM_Geometry::K;
+
+    auto matAbuffer = thrust::universal_vector<float>(M*K);
+    auto matBbuffer = thrust::universal_vector<float>(N*K);
+    auto matCbuffer = thrust::universal_vector<float>(M*N);
+    auto refCbuffer = thrust::universal_vector<float>(M*N);
+
+    for (int i = 0; i < matAbuffer.size(); ++i)
+        matAbuffer[i] = ((float)distribution(generator))/256.0f; // Use only up to 7 bits in the mantissa
+    for (int i = 0; i < matBbuffer.size(); ++i)
+        matBbuffer[i] = ((float)distribution(generator))/256.0f; // Use only up to 7 bits in the mantissa
+    for (int i = 0; i < matCbuffer.size(); ++i)
+        matCbuffer[i] = ((float)distribution(generator))/256.0f; // Use only up to 7 bits in the mantissa
+    for (int i = 0; i < refCbuffer.size(); ++i)
+        refCbuffer[i] = ((float)distribution(generator))/256.0f; // Use only up to 7 bits in the mantissa
+    
+    using LayoutsT = GEMM_Layouts<GEMM_Geometry>;
+    Tensor gMatA = make_tensor(make_gmem_ptr(matAbuffer.data().get()), LayoutsT::matrixALayout());
+    Tensor gMatB = make_tensor(make_gmem_ptr(matBbuffer.data().get()), LayoutsT::matrixBLayout());
+    Tensor gMatC = make_tensor(make_gmem_ptr(matCbuffer.data().get()), LayoutsT::matrixCLayout());
+    Tensor gRefC = make_tensor(make_gmem_ptr(refCbuffer.data().get()), LayoutsT::matrixCLayout());
+
+    for (int m = 0; m < size<0>(gMatC); ++m)
+    for (int n = 0; n < size<1>(gMatC); ++n)
+    {
+        gRefC(m,n) = 0.f;
+        for (int k = 0; k < size<1>(gMatA); k++)
+            gMatC(m,n) += gMatA(m,k) * gMatB(n,k);
+    }
+
+    float maxDiff = 0.f;
+    for (int m = 0; m < size<0>(gMatC); ++m)
+    for (int n = 0; n < size<1>(gMatC); ++n)
+        maxDiff = std::max(maxDiff, std::fabs(gRefC(m,n)-gMatC(m,n)));
+
+    std::cout << "Difference = " << maxDiff << std::endl;
+    
+    return; 
 }

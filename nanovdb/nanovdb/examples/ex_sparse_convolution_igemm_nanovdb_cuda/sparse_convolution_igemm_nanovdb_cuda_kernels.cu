@@ -753,11 +753,121 @@ __global__ void simpleGemmKernel(float* ptrA, float* ptrB, float* ptrC)
 
 #endif
 
+template <
+    class GmemTiledCopyA_,
+    class GmemTiledCopyB_
+    >
+struct TestGEMM
+{
+    //
+    // Type Aliases
+    //
+    using GmemTiledCopyA = GmemTiledCopyA_;
+    using GmemTiledCopyB = GmemTiledCopyB_;
+
+    
+  struct SharedStorage
+  {
+    cute::array_aligned<tfloat32_t, 32*32> smem_a;
+    cute::array_aligned<tfloat32_t, 32*32> smem_b;
+  };
+
+    template <
+        class TensorA,
+        class TensorB,
+        class TensorC>
+    __device__ void
+    operator() (
+      TensorA gA,
+      TensorB gB,
+      TensorC gC,
+      int thread_idx,
+      char *smem_buf)
+    {
+        SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
+        Tensor sA = make_tensor(make_smem_ptr(storage.smem_a.data()), gA.layout());
+        Tensor sB = make_tensor(make_smem_ptr(storage.smem_b.data()), gB.layout());
+
+        GmemTiledCopyA gmem_tiled_copy_A;
+        GmemTiledCopyB gmem_tiled_copy_B;
+        auto gmem_thr_copy_A = gmem_tiled_copy_A.get_slice(thread_idx);
+        auto gmem_thr_copy_B = gmem_tiled_copy_B.get_slice(thread_idx);
+
+        Tensor tAgA = gmem_thr_copy_A.partition_S(gA);
+        Tensor tAsA = gmem_thr_copy_A.partition_D(sA);
+        Tensor tBgB = gmem_thr_copy_B.partition_S(gB);
+        Tensor tBsB = gmem_thr_copy_B.partition_D(sB);
+
+        copy(gmem_tiled_copy_A, tAgA, tAsA);
+        copy(gmem_tiled_copy_B, tBgB, tBsB);
+        cp_async_fence();
+        cp_async_wait<0>();
+        __syncthreads();
+
+        if (thread0())
+        {
+            for (int m = 0; m < size<0>(gC); ++m)
+            for (int n = 0; n < size<1>(gC); ++n)
+            {
+                gC(m,n) = 0.f;
+                for (int k = 0; k < size<1>(gA); k++)
+                    gC(m,n) += (float)sA(m,k) * (float)sB(n,k);
+            }      
+        }
+        __syncthreads();
+    }
+
+};
+
+template<class SettingsT, class TensorA, class TensorB, class TensorC>
+__global__
+__launch_bounds__(128,1)
+void GEMM_test_launcher(
+    TensorA gA,
+    TensorB gB,
+    TensorC gC
+)
+{
+    extern __shared__ char smem_buf[];
+
+    using GmemTiledCopyA =
+        decltype(
+            make_tiled_copy(
+                Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS_ZFILL<uint128_t>, tfloat32_t>{},
+                Layout<Shape <_16, _8>,
+                Stride< _8, _1>>{},
+                Layout<Shape < _1, _4>>{}
+            )
+        );
+    
+    using GmemTiledCopyB =
+        decltype(
+            make_tiled_copy(
+                Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS_ZFILL<uint128_t>, tfloat32_t>{},
+                Layout<Shape <_16, _8>,
+                Stride< _8, _1>>{},
+                Layout<Shape < _1, _4>>{}
+            )
+        );
+    
+    using GemmT = TestGEMM<GmemTiledCopyA,GmemTiledCopyB>;
+
+    GemmT gemm;
+    gemm(
+        gA,
+        gB,
+        gC,
+        threadIdx.x,
+        smem_buf
+    );
+
+}
+
 void mainTestGEMM(uint32_t benchmark_iters)
 {
     std::random_device rd;
-    // std::mt19937 generator(rd());
-    std::mt19937 generator(12345);
+    std::mt19937 generator(rd());
+    // std::mt19937 generator(12345);
     std::uniform_int_distribution<int> distribution(-256, 256);
 
     using BufferT = nanovdb::cuda::UnifiedBuffer;
@@ -790,8 +900,23 @@ void mainTestGEMM(uint32_t benchmark_iters)
     {
         gRefC(m,n) = 0.f;
         for (int k = 0; k < size<1>(gMatA); k++)
-            gMatC(m,n) += gMatA(m,k) * gMatB(n,k);
+            gRefC(m,n) += gMatA(m,k) * gMatB(n,k);
     }
+
+    constexpr size_t smem_size = sizeof(typename TestGEMM<void,void>::SharedStorage);
+    std::cout << "smem_size = " << smem_size << std::endl;
+
+    cudaCheck(
+        cudaFuncSetAttribute(
+            GEMM_test_launcher<GEMM_Geometry,decltype(gMatA),decltype(gMatB),decltype(gMatC)>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_size
+        ));
+
+    GEMM_test_launcher<GEMM_Geometry>
+        <<<1,128,smem_size>>>
+        (gMatA,gMatB,gMatC);
+    cudaDeviceSynchronize();
 
     float maxDiff = 0.f;
     for (int m = 0; m < size<0>(gMatC); ++m)

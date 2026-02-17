@@ -804,6 +804,54 @@ struct TestGEMM
         cp_async_wait<0>();
         __syncthreads();
 
+        using TiledMma = TiledMMA<
+            MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>,
+            Layout<Shape<_2,_2,_1>>,
+            Tile<_32,_32,Underscore>>;
+        using CopyAtomA = Copy_Atom<SM75_U32x4_LDSM_N, tfloat32_t>;
+        using CopyAtomB = Copy_Atom<SM75_U32x4_LDSM_N, tfloat32_t>;
+
+        // =================================================================================
+        // 1. SETUP: Define the Tools
+        // =================================================================================
+
+        // Instantiate the Math Engine (TiledMMA)
+        TiledMma tiled_mma;
+
+        // Define the "Loader" (Smem -> Registers)
+        // We ask the MMA: "What data layout do you need?" -> It builds the copy pattern.
+        auto smem_tiled_copy_A = make_tiled_copy_A(CopyAtomA{}, tiled_mma);
+        auto smem_tiled_copy_B = make_tiled_copy_B(CopyAtomB{}, tiled_mma);
+
+        // Get this specific thread's worker objects
+        auto smem_thr_copy_A = smem_tiled_copy_A.get_thread_slice(thread_idx);
+        auto smem_thr_copy_B = smem_tiled_copy_B.get_thread_slice(thread_idx);
+        auto thr_mma         = tiled_mma.get_thread_slice(thread_idx);
+
+
+        // Prepare Registers
+        Tensor tCrA = thr_mma.partition_fragment_A(sA);
+        Tensor tCrB = thr_mma.partition_fragment_B(sB);
+        Tensor tCrC = thr_mma.partition_fragment_C(gC);
+        clear(tCrC);
+
+        // Load and Compute
+        Tensor tCrA_copy = smem_thr_copy_A.retile_D(tCrA);
+        Tensor tCsA      = smem_thr_copy_A.partition_S(sA);
+
+        Tensor tCrB_copy = smem_thr_copy_B.retile_D(tCrB);
+        Tensor tCsB      = smem_thr_copy_B.partition_S(sB);
+
+        copy(smem_tiled_copy_A, tCsA, tCrA_copy);
+        copy(smem_tiled_copy_B, tCsB, tCrB_copy);
+        gemm(tiled_mma, tCrA, tCrB, tCrC);
+
+        // Store (Naive) 
+        auto tCgC = thr_mma.partition_C(gC);
+        copy(tCrC, tCgC);
+
+
+#if 0
         if (thread0())
         {
             for (int m = 0; m < size<0>(gC); ++m)
@@ -814,6 +862,7 @@ struct TestGEMM
                     gC(m,n) += (float)sA(m,k) * (float)sB(n,k);
             }      
         }
+#endif
         __syncthreads();
     }
 
@@ -927,3 +976,4 @@ void mainTestGEMM(uint32_t benchmark_iters)
     
     return; 
 }
+

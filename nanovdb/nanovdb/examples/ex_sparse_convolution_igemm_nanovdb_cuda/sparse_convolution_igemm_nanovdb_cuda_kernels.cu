@@ -593,7 +593,7 @@ struct GEMM_Layouts
         return
             make_ordered_layout(
                 make_shape(M,K),
-                tuple<_1,_0>{}
+                tuple<_0,_1>{}
             );
     }
     __hostdev__
@@ -603,7 +603,7 @@ struct GEMM_Layouts
         return
             make_ordered_layout(
                 make_shape(N,K),
-                tuple<_1,_0>{}
+                tuple<_0,_1>{}
             );
     }
     __hostdev__
@@ -613,7 +613,7 @@ struct GEMM_Layouts
         return
             make_ordered_layout(
                 make_shape(M,N),
-                tuple<_1,_0>{}
+                tuple<_0,_1>{}
             );
     }
 };
@@ -650,7 +650,12 @@ struct TestGEMM
       char *smem_buf)
     {
         SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
-        Tensor sA = make_tensor(make_smem_ptr(storage.smem_a.data()), gA.layout());
+        using SmemLayoutA =
+            Layout<
+                Shape <_32,Shape < _4,  _8>>,
+                Stride< _1,Stride<_32,_128>>
+            >;
+        Tensor sA = make_tensor(make_smem_ptr(storage.smem_a.data()), SmemLayoutA{});
         Tensor sB = make_tensor(make_smem_ptr(storage.smem_b.data()), gB.layout());
 
         GmemTiledCopyA gmem_tiled_copy_A;
@@ -673,8 +678,10 @@ struct TestGEMM
             MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>,
             Layout<Shape<_2,_2,_1>>,
             Tile<_32,_32,Underscore>>;
-        using CopyAtomA = Copy_Atom<SM75_U32x4_LDSM_N, tfloat32_t>;
-        using CopyAtomB = Copy_Atom<SM75_U32x4_LDSM_N, tfloat32_t>;
+        // using CopyAtomA = Copy_Atom<SM75_U32x4_LDSM_N, tfloat32_t>;
+        using CopyAtomA = Copy_Atom<UniversalCopy<uint32_t>, tfloat32_t>;
+        // using CopyAtomB = Copy_Atom<SM75_U32x4_LDSM_N, tfloat32_t>;
+        using CopyAtomB = Copy_Atom<UniversalCopy<uint32_t>, tfloat32_t>;
 
         // =================================================================================
         // 1. SETUP: Define the Tools
@@ -748,9 +755,9 @@ void GEMM_test_launcher(
         decltype(
             make_tiled_copy(
                 Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS_ZFILL<uint128_t>, tfloat32_t>{},
-                Layout<Shape <_16, _8>,
-                Stride< _8, _1>>{},
-                Layout<Shape < _1, _4>>{}
+                Layout<Shape <_8, _16>,
+                Stride< _1, _8>>{},
+                Layout<Shape < _4, _1>>{}
             )
         );
     
@@ -758,9 +765,9 @@ void GEMM_test_launcher(
         decltype(
             make_tiled_copy(
                 Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS_ZFILL<uint128_t>, tfloat32_t>{},
-                Layout<Shape <_16, _8>,
-                Stride< _8, _1>>{},
-                Layout<Shape < _1, _4>>{}
+                Layout<Shape <_8, _16>,
+                Stride< _1, _8>>{},
+                Layout<Shape < _4, _1>>{}
             )
         );
     
@@ -805,7 +812,15 @@ void mainTestGEMM(uint32_t benchmark_iters)
     
     using LayoutsT = GEMM_Layouts<GEMM_Geometry>;
     Tensor gMatA = make_tensor(make_gmem_ptr(matAbuffer.data().get()), LayoutsT::matrixALayout());
+    for (int m = 0; m < size<0>(gMatA); ++m)
+    for (int k = 0; k < size<1>(gMatA); ++k)
+        gMatA(m,k) = (float) m + 0.01f*(float) k;
     Tensor gMatB = make_tensor(make_gmem_ptr(matBbuffer.data().get()), LayoutsT::matrixBLayout());
+    for (int n = 0; n < size<0>(gMatB); ++n)
+    for (int k = 0; k < size<1>(gMatB); ++k)
+        gMatB(n,k) = 0.f;
+    for (int n = 0; n < size<0>(gMatB); ++n)
+        gMatB(n,n) = 1.f;
     Tensor gMatC = make_tensor(make_gmem_ptr(matCbuffer.data().get()), LayoutsT::matrixCLayout());
     Tensor gRefC = make_tensor(make_gmem_ptr(refCbuffer.data().get()), LayoutsT::matrixCLayout());
 
@@ -831,6 +846,7 @@ void mainTestGEMM(uint32_t benchmark_iters)
         <<<1,128,smem_size>>>
         (gMatA,gMatB,gMatC);
     cudaDeviceSynchronize();
+    print_tensor(gMatC);
 
     float maxDiff = 0.f;
     for (int m = 0; m < size<0>(gMatC); ++m)

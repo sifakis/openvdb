@@ -37,10 +37,6 @@ int main(int argc, char *argv[])
     int benchmark_iters = 10;
     if (argc > 2) sscanf(argv[2], "%d", &benchmark_iters);
 
-    // Just a GEMM test
-    mainTestGEMM(benchmark_iters);
-    return 0;
-
     std::random_device rd;
     // std::mt19937 generator(rd());
     std::mt19937 generator(12345);

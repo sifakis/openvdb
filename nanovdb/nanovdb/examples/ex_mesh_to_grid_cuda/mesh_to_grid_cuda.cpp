@@ -13,11 +13,19 @@
 
 #include <thrust/universal_vector.h>
 
+template<typename BuildT>
+void mainMeshToGrid(
+    const nanovdb::Vec3f *devicePoints,
+    const int pointCount,
+    const nanovdb::Vec3i *deviceTriangles,
+    const int triangleCount,
+    const nanovdb::Map map);
+
 void readOBJ(const std::string& filename,
-             std::vector<openvdb::Vec3s>& points,
-             std::vector<openvdb::Vec3I>& triangles,
-             std::vector<openvdb::Vec4I>& quads) {
-             
+    std::vector<openvdb::Vec3s>& points,
+    std::vector<openvdb::Vec3I>& triangles,
+    std::vector<openvdb::Vec4I>& quads)
+{             
     std::ifstream file(filename);
     if (!file.is_open()) {
         OPENVDB_THROW(openvdb::IoError, "Failed to open OBJ file: " + filename);
@@ -142,13 +150,26 @@ int main(int argc, char *argv[])
         file.write(grids);
         file.close();
 
-        // 1. Cast the raw pointers from the std::vector data
+        // Cast the raw pointers from the std::vector data
         const auto* nano_pts_data = reinterpret_cast<const nanovdb::Vec3f*>(openvdb_points.data());
         const auto* nano_tris_data = reinterpret_cast<const nanovdb::Vec3i*>(openvdb_triangles.data());
         
-        // 2. Initialize the thrust vectors using the casted pointer ranges
+        // Initialize the thrust vectors using the casted pointer ranges
         thrust::universal_vector<nanovdb::Vec3f> nanovdb_points(nano_pts_data, nano_pts_data + openvdb_points.size());
         thrust::universal_vector<nanovdb::Vec3i> nanovdb_triangles(nano_tris_data, nano_tris_data + openvdb_triangles.size());
+
+        // Convert OpenVDB transform to nanovdb::Map
+
+        const auto openvdb_mat4 = transform->baseMap()->getAffineMap()->getMat4();
+        nanovdb::Map map;
+        map.set(openvdb_mat4, openvdb_mat4.inverse());
+
+        mainMeshToGrid<BuildT>(
+            nanovdb_points.data().get(),
+            nanovdb_points.size(),
+            nanovdb_triangles.data().get(),
+            nanovdb_triangles.size(),
+            map);
 
         return 0;
     }

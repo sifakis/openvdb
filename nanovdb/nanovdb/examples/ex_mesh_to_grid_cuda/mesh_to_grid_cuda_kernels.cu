@@ -1,6 +1,12 @@
 // Copyright Contributors to the OpenVDB Project
 // SPDX-License-Identifier: Apache-2.0
 
+
+#include <nanovdb/NanoVDB.h>
+
+#include <nanovdb/tools/cuda/MeshToGrid.cuh>
+
+#if 0
 #include <nanovdb/tools/cuda/DilateGrid.cuh>
 #include <nanovdb/tools/cuda/PruneGrid.cuh>
 #include <nanovdb/util/cuda/Injection.cuh>
@@ -8,26 +14,27 @@
 template<typename T>
 bool bufferCheck(const T* deviceBuffer, const T* hostBuffer, size_t elem_count) {
     T* tmpBuffer = new T[elem_count];
-    cudaCheck(cudaMemcpy(tmpBuffer, deviceBuffer, elem_count * sizeof(T), cudaMemcpyDeviceToHost));
+    cudaCheck(cudaMemcpy(tmpBuffer, deviceBuffer, elem_count * sizeof(T), cudaMemcpyDeviceToHost));!em
     bool same = true;
     for (int i=0; same && i< elem_count; ++i) { same = (tmpBuffer[i] == hostBuffer[i]); }
     delete [] tmpBuffer;
     return same;
 }
+#endif
 
 template<typename BuildT>
-void mainDilateGrid(
-    nanovdb::NanoGrid<BuildT> *deviceGridOriginal,
-    nanovdb::NanoGrid<BuildT> *deviceGridDilated,
-    nanovdb::NanoGrid<BuildT> *indexGridOriginal,
-    nanovdb::NanoGrid<BuildT> *indexGridDilated,
-    uint32_t nnType,
-    uint32_t benchmark_iters)
+void mainMeshToGrid(
+    const nanovdb::Vec3f *devicePoints,
+    const int pointCount,
+    const nanovdb::Vec3i *deviceTriangles,
+    const int triangleCount,
+    const nanovdb::Map map)
 {
     nanovdb::util::cuda::Timer gpuTimer;
 
-    // Initialize dilator
-    nanovdb::tools::cuda::DilateGrid<BuildT> dilator( deviceGridOriginal );
+    // Initialize mesh-to-grid converter
+    nanovdb::tools::cuda::MeshToGrid<BuildT> converter( devicePoints, pointCount, deviceTriangles, triangleCount, map );
+#if 0
     dilator.setOperation(nanovdb::tools::morphology::NearestNeighbors(nnType));
     dilator.setChecksum(nanovdb::CheckMode::Default);
     dilator.setVerbose(1);
@@ -88,15 +95,13 @@ void mainDilateGrid(
         auto dummyHandle = pruner.getHandle();
         gpuTimer.stop();
     }
-
+#endif
 }
 
 template
-void mainDilateGrid(
-    nanovdb::NanoGrid<nanovdb::ValueOnIndex> *deviceGridOriginal,
-    nanovdb::NanoGrid<nanovdb::ValueOnIndex> *deviceGridDilated,
-    nanovdb::NanoGrid<nanovdb::ValueOnIndex> *indexGridOriginal,
-    nanovdb::NanoGrid<nanovdb::ValueOnIndex> *indexGridDilated,
-    uint32_t nnType,
-    uint32_t benchmark_iters
-);
+void mainMeshToGrid<nanovdb::ValueOnIndex>(
+    const nanovdb::Vec3f *devicePoints,
+    const int pointCount,
+    const nanovdb::Vec3i *deviceTriangles,
+    const int triangleCount,
+    const nanovdb::Map map);

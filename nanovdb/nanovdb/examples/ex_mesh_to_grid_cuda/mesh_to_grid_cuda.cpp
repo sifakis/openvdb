@@ -106,15 +106,15 @@ int main(int argc, char *argv[])
         if (argc > 3)
             voxelSize = atof(argv[3]);
 
-        std::vector<openvdb::Vec3s> points;
-        std::vector<openvdb::Vec3I> triangles;
+        std::vector<openvdb::Vec3s> openvdb_points;
+        std::vector<openvdb::Vec3I> openvdb_triangles;
         std::vector<openvdb::Vec4I> quads;
 
         // Read the OBJ file
         std::cout << "Reading " << inputFile << "..." << std::endl;
-        readOBJ(inputFile, points, triangles, quads);
-        std::cout << "Loaded " << points.size() << " vertices, " 
-                  << triangles.size() << " triangles, and " 
+        readOBJ(inputFile, openvdb_points, openvdb_triangles, quads);
+        std::cout << "Loaded " << openvdb_points.size() << " vertices, " 
+                  << openvdb_triangles.size() << " openvdb_triangles, and " 
                   << quads.size() << " quads." << std::endl;
 
         // Initialize OpenVDB
@@ -129,7 +129,7 @@ int main(int argc, char *argv[])
         float halfband = 3.0f; 
         cpuTimer.start("Converting mesh to OpenVDB level set");
         openvdb::FloatGrid::Ptr grid = openvdb::tools::meshToLevelSet<openvdb::FloatGrid>(
-        *transform, points, triangles, quads, halfband);
+        *transform, openvdb_points, openvdb_triangles, quads, halfband);
         cpuTimer.stop();
 
 
@@ -141,6 +141,14 @@ int main(int argc, char *argv[])
         openvdb::io::File file(outputFile);
         file.write(grids);
         file.close();
+
+        // 1. Cast the raw pointers from the std::vector data
+        const auto* nano_pts_data = reinterpret_cast<const nanovdb::Vec3f*>(openvdb_points.data());
+        const auto* nano_tris_data = reinterpret_cast<const nanovdb::Vec3i*>(openvdb_triangles.data());
+        
+        // 2. Initialize the thrust vectors using the casted pointer ranges
+        thrust::universal_vector<nanovdb::Vec3f> nanovdb_points(nano_pts_data, nano_pts_data + openvdb_points.size());
+        thrust::universal_vector<nanovdb::Vec3i> nanovdb_triangles(nano_tris_data, nano_tris_data + openvdb_triangles.size());
 
         return 0;
     }

@@ -143,6 +143,7 @@ int main(int argc, char *argv[])
 
         // Write the Grid to a VDB File
         grid->setName("LevelSet");
+        grid->print(std::cout, 2);
         std::cout << "Writing to " << outputFile << "..." << std::endl;
         openvdb::GridPtrVec grids;
         grids.push_back(grid);

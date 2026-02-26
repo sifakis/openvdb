@@ -34,10 +34,11 @@ void mainMeshToGrid(
 
     // Initialize mesh-to-grid converter
     nanovdb::tools::cuda::MeshToGrid<BuildT> converter( devicePoints, pointCount, deviceTriangles, triangleCount, map );
+    converter.setVerbose(1);
+    converter.getHandle();
 #if 0
     dilator.setOperation(nanovdb::tools::morphology::NearestNeighbors(nnType));
     dilator.setChecksum(nanovdb::CheckMode::Default);
-    dilator.setVerbose(1);
 
     auto handle = dilator.getHandle();
     auto dstGrid = handle.template deviceGrid<BuildT>();

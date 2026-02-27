@@ -38,7 +38,12 @@ class MeshToGrid
     // using RootT  = NanoRoot<BuildT>;
     // using UpperT = NanoUpper<BuildT>;
 
+    using PointT = nanovdb::Vec3f;
+    using TriangleIndexT = nanovdb::Vec3i;
+    using TriangleT = std::array<PointT,3>;
+
 public:
+
 
     /// @brief Constructor
     /// @param devicePoints Vertex list for input triangle surface
@@ -90,8 +95,8 @@ private:
 
     // void dilateLeafNodes();
 
-    // static constexpr unsigned int mNumThreads = 128;// for kernels spawned via lambdaKernel (others may specialize)
-    // static unsigned int numBlocks(unsigned int n) {return (n + mNumThreads - 1) / mNumThreads;}
+    static constexpr unsigned int mNumThreads = 128;// for kernels spawned via lambdaKernel (others may specialize)
+    static unsigned int numBlocks(unsigned int n) {return (n + mNumThreads - 1) / mNumThreads;}
 
     // TopologyBuilder<BuildT>      mBuilder;
     cudaStream_t                 mStream{0};
@@ -107,6 +112,10 @@ private:
     // const GridT                  *mDeviceSrcGrid;
     // morphology::NearestNeighbors mOp{morphology::NN_FACE_EDGE_VERTEX};
     // TreeData                     mSrcTreeData;
+
+    auto deviceXformedTriangles() { return static_cast<TriangleT*>(mXformedTriangles.deviceData()); }
+    auto hostXformedTriangles() { return static_cast<TriangleT*>(mXformedTriangles.data()); }
+
 };// tools::cuda::MeshToGrid<BuildT>
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -124,6 +133,19 @@ MeshToGrid<BuildT>::getHandle(const BufferT &pool)
     transformTriangles();
     if (mVerbose==1) mTimer.stop();
 
+    // int device = 0;
+    // cudaGetDevice(&device);
+    // mXformedTriangles.deviceDownload(device, mStream, false);
+    // while(1) {
+    //     int tri;
+    //     std::cin >> tri;
+    //     for (int v = 0; v < 3; v++) {
+    //         for (int w = 0; w < 3; w++)
+    //             std::cout << hostXformedTriangles()[tri][v][w] << " ";
+    //         std::cout << std::endl;
+    //     }
+    // }
+    
 #if 0
     // Copy TreeData from GPU -> CPU
     mSrcTreeData = util::cuda::DeviceGridTraits<BuildT>::getTreeData(mDeviceSrcGrid);
@@ -187,6 +209,23 @@ MeshToGrid<BuildT>::getHandle(const BufferT &pool)
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
+namespace topology::detail {
+
+template <typename BuildT>
+struct TransformTrianglesFunctor
+{
+    template <class PointT, class TriangleIndexT, class TriangleT>
+    __device__
+    void operator()(size_t triangleID, PointT* dPoints, TriangleIndexT *dTriangleIndices,
+        TriangleT *dXformedTriangles, const nanovdb::Map& map)
+    {
+        for (int v = 0; v < 3; ++v)
+            dXformedTriangles[triangleID][v] = map.applyInverseMap(dPoints[dTriangleIndices[triangleID][v]]);
+    }
+};
+
+}// namespace topology::detail
+
 template<typename BuildT>
 void MeshToGrid<BuildT>::transformTriangles()
 {
@@ -198,67 +237,12 @@ void MeshToGrid<BuildT>::transformTriangles()
     mXformedTriangles = nanovdb::cuda::DeviceBuffer::create(3*mTriangleCount*sizeof(VertexT), nullptr, device, mStream);
     if (mXformedTriangles.deviceData() == nullptr) throw std::runtime_error("Failed to allocate transofmed upper mask buffer on device");
 
-#if 0
-    // This method conservatively and speculatively dilates the root tiles, to accommodate
-    // any new root nodes that might be introduced by the dilation operation.
-    // The index-space bounding box of each tile is examined, and if it is within a 1-pixel of
-    // intersecting any of the 26-connected neighboring root tiles, those are preemptively
-    // introduced into the root topology.
-    // (As of the present implementation this presumes a maximum of 1-voxel radius in dilation)
-    // Root tiles that were preemptively introduced, but end up having no active contents will
-    // be pruned in later stages of processing.
-
-
-    std::map<uint64_t, typename RootT::DataType::Tile> dilatedTiles;
-
-    // This encoding scheme mirrors the one used in PointsToGrid; note that it is different from Tile::key
-    auto coordToKey = [](const Coord &ijk)->uint64_t{
-        // Note: int32_t has a range of -2^31 to 2^31 - 1 whereas uint32_t has a range of 0 to 2^32 - 1
-        static constexpr int64_t kOffset = 1 << 31;
-        return (uint64_t(uint32_t(int64_t(ijk[2]) + kOffset) >> 12)      ) | // z is the lower 21 bits
-            (uint64_t(uint32_t(int64_t(ijk[1]) + kOffset) >> 12) << 21) | // y is the middle 21 bits
-            (uint64_t(uint32_t(int64_t(ijk[0]) + kOffset) >> 12) << 42); //  x is the upper 21 bits
-    };// coordToKey lambda functor
-
-    if (mSrcTreeData.mVoxelCount) { // If the input grid is not empty
-        // Make a host copy of the source topology RootNode *and* the Upper Nodes (needed for BBox'es)
-        // TODO: Consider avoiding to copy the entire set of upper nodes
-        auto deviceSrcRoot = static_cast<const RootT*>(util::PtrAdd(mDeviceSrcGrid, GridT::memUsage() + mSrcTreeData.mNodeOffset[3]));
-        uint64_t rootAndUpperSize = mSrcTreeData.mNodeOffset[1] - mSrcTreeData.mNodeOffset[3];
-        auto srcRootAndUpperBuffer = nanovdb::HostBuffer::create(rootAndUpperSize);
-        cudaCheck(cudaMemcpyAsync(srcRootAndUpperBuffer.data(), deviceSrcRoot, rootAndUpperSize, cudaMemcpyDeviceToHost, mStream));
-        auto srcRootAndUpper = static_cast<RootT*>(srcRootAndUpperBuffer.data());
-
-        // For each original root tile, consider adding those tiles in its 26-connected neighborhood
-        for (uint32_t t = 0; t < srcRootAndUpper->tileCount(); t++) {
-            auto srcUpper = srcRootAndUpper->getChild(srcRootAndUpper->tile(t));
-            const auto dilatedBBox = srcUpper->bbox().expandBy(1); // TODO: update/specialize if larger dilation neighborhoods are used
-
-            static constexpr int32_t rootTileDim = UpperT::DIM; // 4096
-            for (int di = -rootTileDim; di <= rootTileDim; di += rootTileDim)
-            for (int dj = -rootTileDim; dj <= rootTileDim; dj += rootTileDim)
-            for (int dk = -rootTileDim; dk <= rootTileDim; dk += rootTileDim) {
-                auto testBBox = nanovdb::CoordBBox::createCube(srcUpper->origin().offsetBy(di,dj,dk), rootTileDim);
-                auto sortKey = coordToKey(testBBox.min()); // key used in the radix sort, in accordance with PointsToGrid
-                auto tileKey = RootT::CoordToKey(testBBox.min()); // encoding used in the NanoVDB tile
-                if (testBBox.hasOverlap(dilatedBBox) & (dilatedTiles.count(sortKey) == 0)) {
-                    typename RootT::Tile neighborTile{tileKey}; // Only the key value is needed; child pointer & value will be unused
-                    dilatedTiles.emplace(sortKey, neighborTile);
-                }
-            }
-        }
-    }
-
-    // Package the new root topology into a RootNode plus Tile list; upload to the GPU
-    uint64_t rootSize = RootT::memUsage(dilatedTiles.size());
-    mBuilder.mProcessedRoot = nanovdb::cuda::DeviceBuffer::create(rootSize);
-    auto dilatedRootPtr = static_cast<RootT*>(mBuilder.mProcessedRoot.data());
-    dilatedRootPtr->mTableSize = dilatedTiles.size();
-    uint32_t t = 0;
-    for (const auto& [key, tile] : dilatedTiles)
-        *dilatedRootPtr->tile(t++) = tile;
-    mBuilder.mProcessedRoot.deviceUpload(device, mStream, false);
-#endif
+    util::cuda::lambdaKernel<<<numBlocks(mTriangleCount), mNumThreads, 0, mStream>>>
+        (mTriangleCount, topology::detail::TransformTrianglesFunctor<BuildT>(),
+            mDevicePoints,
+            mDeviceTriangles,
+            deviceXformedTriangles(),
+            mMap);
 }// MeshToGrid<BuildT>::transformTriangles
 
 #if 0

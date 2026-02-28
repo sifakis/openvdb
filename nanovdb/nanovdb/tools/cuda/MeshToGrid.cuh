@@ -19,6 +19,7 @@
 
 #include <nanovdb/NanoVDB.h>
 #include <nanovdb/GridHandle.h>
+#include <nanovdb/cuda/TempPool.h>
 // #include <nanovdb/tools/cuda/TopologyBuilder.cuh>
 // #include <nanovdb/util/cuda/DeviceGridTraits.cuh>
 // #include <nanovdb/util/cuda/Morphology.cuh>
@@ -87,6 +88,8 @@ public:
 private:
     void transformTriangles();
 
+    void processRootTrianglePairs();
+
     // void dilateRoot();
 
     // void dilateInternalNodes();
@@ -116,7 +119,25 @@ private:
     auto deviceXformedTriangles() { return static_cast<TriangleT*>(mXformedTriangles.deviceData()); }
     auto hostXformedTriangles() { return static_cast<TriangleT*>(mXformedTriangles.data()); }
 
-};// tools::cuda::MeshToGrid<BuildT>
+    nanovdb::cuda::TempDevicePool mTempDevicePool;
+}; // tools::cuda::MeshToGrid<BuildT>
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+// Define utility macro used to call cub functions that use dynamic temporary storage
+#ifndef CALL_CUBS
+#ifdef _WIN32
+#define CALL_CUBS(func, ...) \
+    cudaCheck(cub::func(nullptr, mTempDevicePool.requestedSize(), __VA_ARGS__, mStream)); \
+    mTempDevicePool.reallocate(mStream); \
+    cudaCheck(cub::func(mTempDevicePool.data(), mTempDevicePool.size(), __VA_ARGS__, mStream));
+#else// ndef _WIN32
+#define CALL_CUBS(func, args...) \
+    cudaCheck(cub::func(nullptr, mTempDevicePool.requestedSize(), args, mStream)); \
+    mTempDevicePool.reallocate(mStream); \
+    cudaCheck(cub::func(mTempDevicePool.data(), mTempDevicePool.size(), args, mStream));
+#endif// ifdef _WIN32
+#endif// ifndef CALL_CUBS
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -131,6 +152,11 @@ MeshToGrid<BuildT>::getHandle(const BufferT &pool)
     // Transform triangle data to (floating-point) index space
     if (mVerbose==1) mTimer.start("Transforming triangles to grid index space");
     transformTriangles();
+    if (mVerbose==1) mTimer.stop();
+
+    // Process Root-Triangle pairs
+    if (mVerbose==1) mTimer.start("Computing candidate RootTile-Triangle intersection pairs");
+    processRootTrianglePairs();
     if (mVerbose==1) mTimer.stop();
 
     // int device = 0;
@@ -205,7 +231,7 @@ MeshToGrid<BuildT>::getHandle(const BufferT &pool)
 
     return GridHandle<BufferT>(std::move(buffer));
 #endif
-}// MeshToGrid<BuildT>::getHandle
+} // MeshToGrid<BuildT>::getHandle
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -214,17 +240,21 @@ namespace topology::detail {
 template <typename BuildT>
 struct TransformTrianglesFunctor
 {
-    template <class PointT, class TriangleIndexT, class TriangleT>
+    const nanovdb::Vec3f* dPoints;
+    const nanovdb::Vec3i* dTriangleIndices;
+    std::array<nanovdb::Vec3f, 3>* dXformedTriangles;
+    nanovdb::Map map; 
+
     __device__
-    void operator()(size_t triangleID, PointT* dPoints, TriangleIndexT *dTriangleIndices,
-        TriangleT *dXformedTriangles, const nanovdb::Map& map)
+    void operator()(size_t triangleID) const
     {
-        for (int v = 0; v < 3; ++v)
+        for (int v = 0; v < 3; ++v) {
             dXformedTriangles[triangleID][v] = map.applyInverseMap(dPoints[dTriangleIndices[triangleID][v]]);
+        }
     }
 };
 
-}// namespace topology::detail
+} // namespace topology::detail
 
 template<typename BuildT>
 void MeshToGrid<BuildT>::transformTriangles()
@@ -232,19 +262,139 @@ void MeshToGrid<BuildT>::transformTriangles()
     int device = 0;
     cudaGetDevice(&device);
 
-    using VertexT = nanovdb::Vec3d;
-
-    mXformedTriangles = nanovdb::cuda::DeviceBuffer::create(3*mTriangleCount*sizeof(VertexT), nullptr, device, mStream);
+    mXformedTriangles = nanovdb::cuda::DeviceBuffer::create(mTriangleCount*sizeof(TriangleT), nullptr, device, mStream);
     if (mXformedTriangles.deviceData() == nullptr) throw std::runtime_error("Failed to allocate transofmed upper mask buffer on device");
 
-    util::cuda::lambdaKernel<<<numBlocks(mTriangleCount), mNumThreads, 0, mStream>>>
-        (mTriangleCount, topology::detail::TransformTrianglesFunctor<BuildT>(),
-            mDevicePoints,
-            mDeviceTriangles,
-            deviceXformedTriangles(),
-            mMap);
-}// MeshToGrid<BuildT>::transformTriangles
+    if (mVerbose == 1) mTimer.restart("[In MeshToGrid::transformTriangles()] Launching TransformTrianglesFunctor");
+    util::cuda::lambdaKernel<<<numBlocks(mTriangleCount), mNumThreads, 0, mStream>>>(
+        mTriangleCount,
+        topology::detail::TransformTrianglesFunctor<BuildT>{
+            mDevicePoints, mDeviceTriangles, deviceXformedTriangles(), mMap
+        }
+    );
 
+    cudaCheckError();
+
+} // MeshToGrid<BuildT>::transformTriangles
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+namespace topology::detail {
+
+template <typename BuildT>
+struct CountRootBoxesFunctor
+{
+    const std::array<nanovdb::Vec3f, 3>* dXformedTriangles;
+    uint64_t* dCounts;
+    float mPadding{0.5f}; // sqrt(3)/2-0.5 should suffice for including the circumsphere of each voxel, but being conservative for safety
+
+    __device__
+    void operator()(size_t triangleID) const
+    {
+        const auto& tri = dXformedTriangles[triangleID];
+
+        // Compute the strict AABB of the triangle in (cell-centered) index space
+        float min_x = fminf(tri[0][0], fminf(tri[1][0], tri[2][0]));
+        float min_y = fminf(tri[0][1], fminf(tri[1][1], tri[2][1]));
+        float min_z = fminf(tri[0][2], fminf(tri[1][2], tri[2][2]));
+
+        float max_x = fmaxf(tri[0][0], fmaxf(tri[1][0], tri[2][0]));
+        float max_y = fmaxf(tri[0][1], fmaxf(tri[1][1], tri[2][1]));
+        float max_z = fmaxf(tri[0][2], fmaxf(tri[1][2], tri[2][2]));
+
+        // Apply geometric expansion (mPadding) and cell-center alignment shift (+0.5f)
+        float adj_min_x = min_x - mPadding + 0.5f;
+        float adj_min_y = min_y - mPadding + 0.5f;
+        float adj_min_z = min_z - mPadding + 0.5f;
+        
+        float adj_max_x = max_x + mPadding + 0.5f;
+        float adj_max_y = max_y + mPadding + 0.5f;
+        float adj_max_z = max_z + mPadding + 0.5f;
+
+        // Convert padded continuous bounds to discrete Root Tile index space
+        // A NanoVDB Upper node (Root tile) spans exactly 4096^3 voxels
+        const float invRootDim = 1.0f / 4096.0f;
+
+        // floorf safely maps negative/positive coordinates to the correct integer index
+        int min_i = static_cast<int>(floorf(adj_min_x * invRootDim));
+        int min_j = static_cast<int>(floorf(adj_min_y * invRootDim));
+        int min_k = static_cast<int>(floorf(adj_min_z * invRootDim));
+
+        int max_i = static_cast<int>(floorf(adj_max_x * invRootDim));
+        int max_j = static_cast<int>(floorf(adj_max_y * invRootDim));
+        int max_k = static_cast<int>(floorf(adj_max_z * invRootDim));
+
+        // Compute the 3D grid dimensions of overlapping root boxes
+        uint64_t count_x = max_i - min_i + 1;
+        uint64_t count_y = max_j - min_j + 1;
+        uint64_t count_z = max_k - min_k + 1;
+
+        // 5. Write the total count of root boxes this triangle touches
+        dCounts[triangleID] = count_x * count_y * count_z;
+    }
+};
+
+} // namespace topology::detail
+
+template<typename BuildT>
+void MeshToGrid<BuildT>::processRootTrianglePairs()
+{
+    int device = 0;
+    cudaGetDevice(&device);
+
+    // Allocate the counts array
+    nanovdb::cuda::DeviceBuffer
+        rootBoxCounts = nanovdb::cuda::DeviceBuffer::create(mTriangleCount * sizeof(uint64_t), nullptr, device, mStream);
+    if (rootBoxCounts.deviceData() == nullptr) throw std::runtime_error("Failed to allocate root box counts buffer");
+    
+    // Pass 1: Count intersecting root boxes per triangle
+    if (mVerbose == 1) mTimer.restart("[In MeshToGrid::processRootTrianglePairs()] Launching processRootTrianglePairs");
+    
+    util::cuda::lambdaKernel<<<numBlocks(mTriangleCount), mNumThreads, 0, mStream>>>(
+        mTriangleCount, 
+        topology::detail::CountRootBoxesFunctor<BuildT>{
+            deviceXformedTriangles(),
+            static_cast<uint64_t*>(rootBoxCounts.deviceData())
+        }
+    );
+
+    cudaCheckError();
+
+    // Pass 2: Inclusive Scan to compute offsets and total allocations
+    
+    if (mVerbose == 1) mTimer.restart("[In MeshToGrid::processRootTrianglePairs()] Prefix sum");
+    
+    // Allocate offsets array of size mTriangleCount + 1
+    nanovdb::cuda::DeviceBuffer rootBoxOffsets = nanovdb::cuda::DeviceBuffer::create(
+        (mTriangleCount + 1) * sizeof(uint64_t), nullptr, device, mStream);
+    if (rootBoxOffsets.deviceData() == nullptr) throw std::runtime_error("Failed to allocate root box offsets buffer");
+
+    uint64_t* dCounts = static_cast<uint64_t*>(rootBoxCounts.deviceData());
+    uint64_t* dOffsets = static_cast<uint64_t*>(rootBoxOffsets.deviceData());
+
+    // Explicitly set the very first offset to 0
+    cudaMemsetAsync(dOffsets, 0, sizeof(uint64_t), mStream);
+
+    // Run inclusive prefix sum using the newly integrated CALL_CUBS macro
+    CALL_CUBS(DeviceScan::InclusiveSum, dCounts, dOffsets + 1, mTriangleCount);
+
+    // Read back the grand total of pairs from the very last element
+    uint64_t totalPairs = 0;
+    cudaMemcpyAsync(&totalPairs, dOffsets + mTriangleCount, sizeof(uint64_t), 
+                    cudaMemcpyDeviceToHost, mStream);
+
+    // We MUST synchronize here because the CPU needs 'totalPairs' to allocate memory for Pass 3
+    cudaStreamSynchronize(mStream);
+
+    if (mVerbose == 1) {
+        printf("Total Root/Triangle pairs to generate: %d\n", totalPairs);
+    }
+
+
+} // MeshToGrid<BuildT>::transformTriangles
+
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 #if 0
 template<typename BuildT>
 void MeshToGrid<BuildT>::dilateRoot()
@@ -310,7 +460,7 @@ void MeshToGrid<BuildT>::dilateRoot()
     for (const auto& [key, tile] : dilatedTiles)
         *dilatedRootPtr->tile(t++) = tile;
     mBuilder.mProcessedRoot.deviceUpload(device, mStream, false);
-}// MeshToGrid<BuildT>::dilateRoot
+} // MeshToGrid<BuildT>::dilateRoot
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -337,7 +487,7 @@ void MeshToGrid<BuildT>::dilateInternalNodes()
                 <<<dim3(mSrcTreeData.mNodeCount[1],Op::SlicesPerLowerNode,1), Op::MaxThreadsPerBlock, 0, mStream>>>
                 (mDeviceSrcGrid, mBuilder.deviceProcessedRoot(), mBuilder.deviceUpperMasks(), mBuilder.deviceLowerMasks()); }
     }
-}// MeshToGrid<BuildT>::dilateInternalNodes
+} // MeshToGrid<BuildT>::dilateInternalNodes
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -349,7 +499,7 @@ void MeshToGrid<BuildT>::processGridTreeRoot()
     cudaCheck(cudaMemcpyAsync(&mBuilder.data()->getGrid(), mDeviceSrcGrid->data(), GridT::memUsage(), cudaMemcpyDeviceToDevice, mStream));
     util::cuda::lambdaKernel<<<1, 1, 0, mStream>>>(1, topology::detail::BuildGridTreeRootFunctor<BuildT>(), mBuilder.deviceData());
     cudaCheckError();
-}// MeshToGrid<BuildT>::processGridTreeRoot
+} // MeshToGrid<BuildT>::processGridTreeRoot
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -375,13 +525,13 @@ void MeshToGrid<BuildT>::dilateLeafNodes()
 
     // Update leaf offsets and prefix sums
     mBuilder.processLeafOffsets(mStream);
-}// MeshToGrid<BuildT>::dilateLeafNodes
+} // MeshToGrid<BuildT>::dilateLeafNodes
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 #endif
 
-}// namespace tools::cuda
+} // namespace tools::cuda
 
-}// namespace nanovdb
+} // namespace nanovdb
 
 #endif // NVIDIA_TOOLS_CUDA_MESHTOGRID_CUH_HAS_BEEN_INCLUDED

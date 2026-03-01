@@ -122,6 +122,7 @@ private:
 
     nanovdb::cuda::DeviceBuffer  mXformedTriangles;
     nanovdb::cuda::DeviceBuffer  mBoxTrianglePairsBuffer;
+    uint64_t                     mBoxTrianglePairCount{0};
     // const GridT                  *mDeviceSrcGrid;
     // morphology::NearestNeighbors mOp{morphology::NN_FACE_EDGE_VERTEX};
     // TreeData                     mSrcTreeData;
@@ -340,8 +341,64 @@ struct CountRootBoxesFunctor
         uint64_t count_y = max_j - min_j + 1;
         uint64_t count_z = max_k - min_k + 1;
 
-        // 5. Write the total count of root boxes this triangle touches
+        // Write the total count of root boxes this triangle touches
         dCounts[triangleID] = count_x * count_y * count_z;
+    }
+};
+
+template <typename BuildT>
+struct ScatterRootTrianglePairsFunctor
+{
+    using PairT = typename MeshToGrid<BuildT>::BoxTrianglePair;
+
+    const std::array<nanovdb::Vec3f, 3>* dXformedTriangles;
+    const uint64_t* dOffsets;
+    PairT* dPairs;
+    float mPadding;
+
+    __device__
+    void operator()(size_t triangleID) const
+    {
+        const auto& tri = dXformedTriangles[triangleID];
+
+        // Recompute the strict AABB
+        float min_x = fminf(tri[0][0], fminf(tri[1][0], tri[2][0]));
+        float min_y = fminf(tri[0][1], fminf(tri[1][1], tri[2][1]));
+        float min_z = fminf(tri[0][2], fminf(tri[1][2], tri[2][2]));
+
+        float max_x = fmaxf(tri[0][0], fmaxf(tri[1][0], tri[2][0]));
+        float max_y = fmaxf(tri[0][1], fmaxf(tri[1][1], tri[2][1]));
+        float max_z = fmaxf(tri[0][2], fmaxf(tri[1][2], tri[2][2]));
+
+        // Apply geometric expansion and cell-center alignment shift
+        float adj_min_x = min_x - mPadding + 0.5f;
+        float adj_min_y = min_y - mPadding + 0.5f;
+        float adj_min_z = min_z - mPadding + 0.5f;
+        
+        float adj_max_x = max_x + mPadding + 0.5f;
+        float adj_max_y = max_y + mPadding + 0.5f;
+        float adj_max_z = max_z + mPadding + 0.5f;
+
+        // Convert padded continuous bounds to discrete root index space
+        const float invRootDim = 1.0f / 4096.0f;
+        int min_i = static_cast<int>(floorf(adj_min_x * invRootDim));
+        int min_j = static_cast<int>(floorf(adj_min_y * invRootDim));
+        int min_k = static_cast<int>(floorf(adj_min_z * invRootDim));
+
+        int max_i = static_cast<int>(floorf(adj_max_x * invRootDim));
+        int max_j = static_cast<int>(floorf(adj_max_y * invRootDim));
+        int max_k = static_cast<int>(floorf(adj_max_z * invRootDim));
+
+        // Scatter the pairs into the global array
+        uint64_t write_idx = dOffsets[triangleID];
+        for (int k = min_k; k <= max_k; ++k)
+        for (int j = min_j; j <= max_j; ++j)
+        for (int i = min_i; i <= max_i; ++i) {
+            // Multiply back by 4096 to get the true NanoVDB index-space origin
+            dPairs[write_idx].origin = nanovdb::Coord(i * 4096, j * 4096, k * 4096);
+            dPairs[write_idx].triangleID = static_cast<uint32_t>(triangleID);
+            write_idx++;
+        }
     }
 };
 
@@ -384,15 +441,28 @@ void MeshToGrid<BuildT>::processRootTrianglePairs()
         static_cast<uint64_t*>(rootBoxCounts.deviceData()),
         static_cast<uint64_t*>(rootBoxOffsets.deviceData())+1,
         mTriangleCount);
-    uint64_t totalPairs = 0;
-    cudaCheck(cudaMemcpyAsync(&totalPairs, static_cast<uint64_t*>(rootBoxOffsets.deviceData())+mTriangleCount, sizeof(uint64_t), cudaMemcpyDeviceToHost, mStream));
+    cudaCheck(cudaMemcpyAsync(&mBoxTrianglePairCount, static_cast<uint64_t*>(rootBoxOffsets.deviceData())+mTriangleCount, sizeof(uint64_t), cudaMemcpyDeviceToHost, mStream));
     cudaStreamSynchronize(mStream);
 
-    // We MUST synchronize here because the CPU needs 'totalPairs' to allocate memory for Pass 3
-    if (mVerbose == 1) {
-        printf("Total Root/Triangle pairs to generate: %d\n", (int)totalPairs);
-    }
+    if (mVerbose == 1) printf("Total Root/Triangle pairs to generate: %d\n", (int)mBoxTrianglePairCount);
 
+    // Pass 3: Re-enumerate intersections of (padded) root boxes and triangles, and scatter to allocated list
+
+    if (mVerbose == 1) mTimer.restart("[In MeshToGrid::processRootTrianglePairs()] Scatter pairs");
+
+    mBoxTrianglePairsBuffer = nanovdb::cuda::DeviceBuffer::create(
+        mBoxTrianglePairCount * sizeof(typename MeshToGrid<BuildT>::BoxTrianglePair), nullptr, device, mStream);
+    if (mBoxTrianglePairsBuffer.deviceData() == nullptr) throw std::runtime_error("Failed to allocate pairs buffer");
+
+    util::cuda::lambdaKernel<<<numBlocks(mTriangleCount), mNumThreads, 0, mStream>>>(
+        mTriangleCount, 
+        topology::detail::ScatterRootTrianglePairsFunctor<BuildT>{
+            deviceXformedTriangles(),
+            static_cast<uint64_t*>(rootBoxOffsets.deviceData()),
+            deviceBoxTrianglePairs(),
+            mBandWidth - 0.5f // Explicitly passed here!
+        }
+    );
 
 } // MeshToGrid<BuildT>::processRootTrianglePairs
 

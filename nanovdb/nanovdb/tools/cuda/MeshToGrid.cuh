@@ -45,6 +45,10 @@ class MeshToGrid
 
 public:
 
+    struct alignas(16) BoxTrianglePair { // sizeof(BoxTrianglePair) = 16B
+        nanovdb::Coord origin; // 12B
+        uint32_t triangleID;   // 4B
+    };
 
     /// @brief Constructor
     /// @param devicePoints Vertex list for input triangle surface
@@ -54,9 +58,9 @@ public:
     /// @param map Affine map to be used in the conversion
     MeshToGrid(
         const nanovdb::Vec3f *devicePoints,
-        const int pointCount,
+        const uint32_t pointCount,
         const nanovdb::Vec3i *deviceTriangles,
-        const int triangleCount,
+        const uint32_t triangleCount,
         const nanovdb::Map map = nanovdb::Map(),
         cudaStream_t stream = 0
     )
@@ -67,6 +71,10 @@ public:
     /// @brief Toggle on and off verbose mode
     /// @param level Verbose level: 0=quiet, 1=timing, 2=benchmarking
     void setVerbose(int level = 1) { mVerbose = level; }
+
+    /// @brief Set desired width of narrow band
+    /// @param bandWidth Narrow band width in cell units
+    void setNarrowBandWidth(float bandWidth = 3.f) { mBandWidth = bandWidth; }
 
     /// @brief Set the mode for checksum computation, which is disabled by default
     /// @param mode Mode of checksum computation
@@ -105,19 +113,22 @@ private:
     cudaStream_t                 mStream{0};
     util::cuda::Timer            mTimer;
     int                          mVerbose{0};
+    float                        mBandWidth{3.f};
     const nanovdb::Vec3f         *mDevicePoints;
-    const int                    mPointCount;
+    const uint32_t               mPointCount;
     const nanovdb::Vec3i         *mDeviceTriangles;
-    const int                    mTriangleCount;
+    const uint32_t               mTriangleCount;
     const nanovdb::Map           mMap;
 
     nanovdb::cuda::DeviceBuffer  mXformedTriangles;
+    nanovdb::cuda::DeviceBuffer  mBoxTrianglePairsBuffer;
     // const GridT                  *mDeviceSrcGrid;
     // morphology::NearestNeighbors mOp{morphology::NN_FACE_EDGE_VERTEX};
     // TreeData                     mSrcTreeData;
 
     auto deviceXformedTriangles() { return static_cast<TriangleT*>(mXformedTriangles.deviceData()); }
-    auto hostXformedTriangles() { return static_cast<TriangleT*>(mXformedTriangles.data()); }
+    // auto hostXformedTriangles() { return static_cast<TriangleT*>(mXformedTriangles.data()); }
+    auto deviceBoxTrianglePairs() { return static_cast<BoxTrianglePair*>(mBoxTrianglePairsBuffer.deviceData()); }
 
     nanovdb::cuda::TempDevicePool mTempDevicePool;
 }; // tools::cuda::MeshToGrid<BuildT>
@@ -286,7 +297,7 @@ struct CountRootBoxesFunctor
 {
     const std::array<nanovdb::Vec3f, 3>* dXformedTriangles;
     uint64_t* dCounts;
-    float mPadding{0.5f}; // sqrt(3)/2-0.5 should suffice for including the circumsphere of each voxel, but being conservative for safety
+    float mPadding; // typically 2.5f for a 3-cell-width narrowband
 
     __device__
     void operator()(size_t triangleID) const
@@ -342,56 +353,48 @@ void MeshToGrid<BuildT>::processRootTrianglePairs()
     int device = 0;
     cudaGetDevice(&device);
 
-    // Allocate the counts array
+    // Pass 1: Count intersecting root boxes per triangle
+    
+    if (mVerbose == 1) mTimer.restart("[In MeshToGrid::processRootTrianglePairs()] Launching processRootTrianglePairs");
+
     nanovdb::cuda::DeviceBuffer
         rootBoxCounts = nanovdb::cuda::DeviceBuffer::create(mTriangleCount * sizeof(uint64_t), nullptr, device, mStream);
     if (rootBoxCounts.deviceData() == nullptr) throw std::runtime_error("Failed to allocate root box counts buffer");
-    
-    // Pass 1: Count intersecting root boxes per triangle
-    if (mVerbose == 1) mTimer.restart("[In MeshToGrid::processRootTrianglePairs()] Launching processRootTrianglePairs");
-    
+
     util::cuda::lambdaKernel<<<numBlocks(mTriangleCount), mNumThreads, 0, mStream>>>(
         mTriangleCount, 
         topology::detail::CountRootBoxesFunctor<BuildT>{
             deviceXformedTriangles(),
-            static_cast<uint64_t*>(rootBoxCounts.deviceData())
+            static_cast<uint64_t*>(rootBoxCounts.deviceData()),
+            mBandWidth-.5f // Due to level set values being cell-centered
         }
     );
-
     cudaCheckError();
 
-    // Pass 2: Inclusive Scan to compute offsets and total allocations
+    // Pass 2: InclusiveSum Scan to compute offsets and total allocations
     
     if (mVerbose == 1) mTimer.restart("[In MeshToGrid::processRootTrianglePairs()] Prefix sum");
     
-    // Allocate offsets array of size mTriangleCount + 1
-    nanovdb::cuda::DeviceBuffer rootBoxOffsets = nanovdb::cuda::DeviceBuffer::create(
-        (mTriangleCount + 1) * sizeof(uint64_t), nullptr, device, mStream);
+    nanovdb::cuda::DeviceBuffer rootBoxOffsets =
+        nanovdb::cuda::DeviceBuffer::create((mTriangleCount+1)*sizeof(uint64_t), nullptr, device, mStream);
     if (rootBoxOffsets.deviceData() == nullptr) throw std::runtime_error("Failed to allocate root box offsets buffer");
 
-    uint64_t* dCounts = static_cast<uint64_t*>(rootBoxCounts.deviceData());
-    uint64_t* dOffsets = static_cast<uint64_t*>(rootBoxOffsets.deviceData());
-
-    // Explicitly set the very first offset to 0
-    cudaMemsetAsync(dOffsets, 0, sizeof(uint64_t), mStream);
-
-    // Run inclusive prefix sum using the newly integrated CALL_CUBS macro
-    CALL_CUBS(DeviceScan::InclusiveSum, dCounts, dOffsets + 1, mTriangleCount);
-
-    // Read back the grand total of pairs from the very last element
+    cudaCheck(cudaMemsetAsync(rootBoxOffsets.deviceData(), 0, sizeof(uint64_t), mStream));
+    CALL_CUBS(DeviceScan::InclusiveSum,
+        static_cast<uint64_t*>(rootBoxCounts.deviceData()),
+        static_cast<uint64_t*>(rootBoxOffsets.deviceData())+1,
+        mTriangleCount);
     uint64_t totalPairs = 0;
-    cudaMemcpyAsync(&totalPairs, dOffsets + mTriangleCount, sizeof(uint64_t), 
-                    cudaMemcpyDeviceToHost, mStream);
-
-    // We MUST synchronize here because the CPU needs 'totalPairs' to allocate memory for Pass 3
+    cudaCheck(cudaMemcpyAsync(&totalPairs, static_cast<uint64_t*>(rootBoxOffsets.deviceData())+mTriangleCount, sizeof(uint64_t), cudaMemcpyDeviceToHost, mStream));
     cudaStreamSynchronize(mStream);
 
+    // We MUST synchronize here because the CPU needs 'totalPairs' to allocate memory for Pass 3
     if (mVerbose == 1) {
-        printf("Total Root/Triangle pairs to generate: %d\n", totalPairs);
+        printf("Total Root/Triangle pairs to generate: %d\n", (int)totalPairs);
     }
 
 
-} // MeshToGrid<BuildT>::transformTriangles
+} // MeshToGrid<BuildT>::processRootTrianglePairs
 
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------

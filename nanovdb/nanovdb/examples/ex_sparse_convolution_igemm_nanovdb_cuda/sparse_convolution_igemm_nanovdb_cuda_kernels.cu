@@ -30,8 +30,16 @@ struct IGEMM_Geometry
     //
 
     static constexpr int T = 3;     // X-dimension of convolution filter
+    int t{T};
+    __hostdev__ int T_() const { return t;}
+
     static constexpr int R = 3;     // Y-dimension of convolution filter
+    int r{R};
+    __hostdev__ int R_() const { return r;}
+
     static constexpr int S = 3;     // Z-dimension of convolution filter
+    int s{S};
+    __hostdev__ int S_() const { return s;}
     
     static constexpr int Z = 4;     // X-dimension of output block
     static constexpr int P = 2;     // Y-dimension of output block
@@ -95,7 +103,8 @@ void SparseConvolveCPUReference(
     nanovdb::NanoGrid<nanovdb::ValueOnIndex> *dstGrid,
     const ValueType (*filter)[GeometryT::R][GeometryT::S][Do][Di],
     const ValueType (*inputArray)[Di],
-    ValueType (*outputArray)[Do])
+    ValueType (*outputArray)[Do],
+    const GeometryT& geometry)
 {
     auto dstLeafCount = dstGrid->nodeCount<0>();
     auto srcAcc = srcGrid->getAccessor();
@@ -108,9 +117,9 @@ void SparseConvolveCPUReference(
             const auto dstCoord = dstLeafIt.getCoord();
             for ( int i = 0; i < Do; ++i )
                 outputArray[dstIndex][i] = 0.f;
-            for ( int di = 0; di < GeometryT::T; ++di )
-            for ( int dj = 0; dj < GeometryT::R; ++dj )
-            for ( int dk = 0; dk < GeometryT::S; ++dk )
+            for ( int di = 0; di < geometry.T_(); ++di )
+            for ( int dj = 0; dj < geometry.R_(); ++dj )
+            for ( int dk = 0; dk < geometry.S_(); ++dk )
             {
                 const auto srcCoord = dstCoord.offsetBy(di+GeometryT::Dx, dj+GeometryT::Dy, dk+GeometryT::Dz);
                 const auto srcIndex = srcAcc.getValue(srcCoord);
@@ -133,7 +142,8 @@ void SparseConvolveCudaReference(
     nanovdb::NanoGrid<nanovdb::ValueOnIndex> *dstGrid,
     const ValueType (*filter)[GeometryT::R][GeometryT::S][Do][Di],
     const ValueType (*inputArray)[Di],
-    ValueType (*outputArray)[Do])
+    ValueType (*outputArray)[Do],
+    const GeometryT geometry)
 {
     auto dstLeafCount = dstGrid->nodeCount<0>();
 
@@ -145,9 +155,9 @@ void SparseConvolveCudaReference(
             const auto dstIndex = *dstLeafIt;
             const auto dstCoord = dstLeafIt.getCoord();
             outputArray[dstIndex][out] = 0.f;
-            for ( int di = 0; di < GeometryT::T; ++di )
-            for ( int dj = 0; dj < GeometryT::R; ++dj )
-            for ( int dk = 0; dk < GeometryT::S; ++dk )
+            for ( int di = 0; di < geometry.T_(); ++di )
+            for ( int dj = 0; dj < geometry.R_(); ++dj )
+            for ( int dk = 0; dk < geometry.S_(); ++dk )
             {
                 const auto srcCoord = dstCoord.offsetBy(di+GeometryT::Dx, dj+GeometryT::Dy, dk+GeometryT::Dz);
                 const auto srcIndex = srcGrid->tree().getValue(srcCoord);
@@ -168,7 +178,8 @@ void SparseConvolveScatterGatherMapsReference(
     const std::size_t blockCount,
     const ValueType (*filter)[GeometryT::R][GeometryT::S][Do][Di],
     const ValueType (*inputArray)[Di],
-    ValueType (*outputArray)[Do])
+    ValueType (*outputArray)[Do],
+    const GeometryT geometry)
 {
     auto convolver = [=] __device__ () {
         int blockID = blockIdx.x;
@@ -182,9 +193,9 @@ void SparseConvolveScatterGatherMapsReference(
             const auto dstIndex = scatterIndices[i][j][k];
             if (dstIndex) {
                 outputArray[dstIndex][out] = 0.f;
-                for ( int di = 0; di < GeometryT::T; ++di )
-                for ( int dj = 0; dj < GeometryT::R; ++dj )
-                for ( int dk = 0; dk < GeometryT::S; ++dk ) {
+                for ( int di = 0; di < geometry.T_(); ++di )
+                for ( int dj = 0; dj < geometry.R_(); ++dj )
+                for ( int dk = 0; dk < geometry.S_(); ++dk ) {
                     const auto srcIndex = gatherIndices[i+di][j+dj][k+dk];
                     if (srcIndex)
                         for ( int in = 0; in < Di; ++in )
@@ -274,6 +285,8 @@ void mainSparseConvolutionIGEMM(
     using outputArrayT = float (&) [][Do];
     using filterT = float (&) [IGEMM_Geometry::T][IGEMM_Geometry::R][IGEMM_Geometry::S][Do][Di];
     
+    IGEMM_Geometry geometry;
+
     nanovdb::util::cuda::Timer gpuTimer;
 
     gpuTimer.start("Building input grid");
@@ -345,7 +358,7 @@ void mainSparseConvolutionIGEMM(
     gpuTimer.stop();
 
     gpuTimer.start("Initializing filter data");
-    auto filterData = thrust::universal_vector<float>(3*3*3*Do*Di);
+    auto filterData = thrust::universal_vector<float>(geometry.T_()*geometry.R_()*geometry.S_()*Do*Di);
     auto filter = reinterpret_cast<filterT>(*filterData.data().get());
 #pragma omp parallel for
     for (int i = 0; i < filterData.size(); i++)
@@ -488,7 +501,8 @@ void mainSparseConvolutionIGEMM(
         outputGrid,
         filter,
         inputArray,
-        outputReferenceArray
+        outputReferenceArray,
+        geometry
     );
     gpuTimer.stop();
 
@@ -501,7 +515,8 @@ void mainSparseConvolutionIGEMM(
         outputGrid,
         filter,
         inputArray,
-        outputArray
+        outputArray,
+        geometry
     );
     gpuTimer.stop();
 #endif
@@ -514,7 +529,8 @@ void mainSparseConvolutionIGEMM(
         blockCount,
         filter,
         inputArray,
-        outputArray
+        outputArray,
+        geometry
     );
     gpuTimer.stop();
 

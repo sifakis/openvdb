@@ -14,7 +14,7 @@
 template<typename T>
 bool bufferCheck(const T* deviceBuffer, const T* hostBuffer, size_t elem_count) {
     T* tmpBuffer = new T[elem_count];
-    cudaCheck(cudaMemcpy(tmpBuffer, deviceBuffer, elem_count * sizeof(T), cudaMemcpyDeviceToHost));!em
+    cudaCheck(cudaMemcpy(tmpBuffer, deviceBuffer, elem_count * sizeof(T), cudaMemcpyDeviceToHost));
     bool same = true;
     for (int i=0; same && i< elem_count; ++i) { same = (tmpBuffer[i] == hostBuffer[i]); }
     delete [] tmpBuffer;
@@ -36,6 +36,53 @@ void mainMeshToGrid(
     nanovdb::tools::cuda::MeshToGrid<BuildT> converter( devicePoints, pointCount, deviceTriangles, triangleCount, map );
     converter.setVerbose(1);
     converter.getHandle();
+
+
+    // --- DIAGNOSTIC CHECK 1: The Modulus & Bounds Test ---
+    uint64_t pairCount = converter.getPairCount();
+    if (pairCount > 0) {
+        std::cout << "\n--- Running GPU Diagnostics ---" << std::endl;
+        
+        // Allocate host memory and download the pairs
+        std::vector<typename nanovdb::tools::cuda::MeshToGrid<BuildT>::BoxTrianglePair> hostPairs(pairCount);
+        cudaMemcpy(hostPairs.data(), converter.getDevicePairs(), 
+                   pairCount * sizeof(typename nanovdb::tools::cuda::MeshToGrid<BuildT>::BoxTrianglePair), 
+                   cudaMemcpyDeviceToHost);
+        cudaDeviceSynchronize();
+
+        bool passed = true;
+        for (uint64_t i = 0; i < pairCount; ++i) {
+            const auto& pair = hostPairs[i];
+            
+            // 1. Verify Modulo 4096 (Strict Root Tile Alignment)
+            if (pair.origin[0] % 4096 != 0 || 
+                pair.origin[1] % 4096 != 0 || 
+                pair.origin[2] % 4096 != 0) {
+                std::cerr << "FAIL: Misaligned Root Origin at index " << i 
+                          << " (" << pair.origin[0] << ", " << pair.origin[1] << ", " << pair.origin[2] << ")\n";
+                passed = false;
+                break;
+            }
+
+            // 2. Verify Triangle ID bounds
+            if (pair.triangleID >= triangleCount) {
+                std::cerr << "FAIL: Out-of-bounds TriangleID " << pair.triangleID << " at index " << i << "\n";
+                passed = false;
+                break;
+            }
+        }
+        
+        if (passed) {
+            std::cout << "SUCCESS: All " << pairCount << " pairs are perfectly 4096-aligned and bounded!" << std::endl;
+            // Print a sample to visually inspect
+            std::cout << "Sample Pair [0]: Origin(" << hostPairs[0].origin[0] << ", " 
+                      << hostPairs[0].origin[1] << ", " << hostPairs[0].origin[2] << ") - TriID: " 
+                      << hostPairs[0].triangleID << std::endl;
+        }
+    }
+
+
+
 #if 0
     dilator.setOperation(nanovdb::tools::morphology::NearestNeighbors(nnType));
     dilator.setChecksum(nanovdb::CheckMode::Default);

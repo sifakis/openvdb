@@ -20,12 +20,7 @@
 #include <nanovdb/NanoVDB.h>
 #include <nanovdb/GridHandle.h>
 #include <nanovdb/cuda/TempPool.h>
-// #include <nanovdb/tools/cuda/TopologyBuilder.cuh>
-// #include <nanovdb/util/cuda/DeviceGridTraits.cuh>
-// #include <nanovdb/util/cuda/Morphology.cuh>
 #include <nanovdb/util/cuda/Timer.h>
-// #include <nanovdb/util/cuda/Util.h>
-
 
 namespace nanovdb {
 
@@ -34,17 +29,11 @@ namespace tools::cuda {
 template <typename BuildT>
 class MeshToGrid
 {
-    // using GridT  = NanoGrid<BuildT>;
-    // using TreeT  = NanoTree<BuildT>;
-    // using RootT  = NanoRoot<BuildT>;
-    // using UpperT = NanoUpper<BuildT>;
-
     using PointT = nanovdb::Vec3f;
     using TriangleIndexT = nanovdb::Vec3i;
     using TriangleT = std::array<PointT,3>;
 
 public:
-
     struct alignas(16) BoxTrianglePair { // sizeof(BoxTrianglePair) = 16B
         nanovdb::Coord origin; // 12B
         uint32_t triangleID;   // 4B
@@ -80,10 +69,6 @@ public:
     /// @param mode Mode of checksum computation
     // void setChecksum(CheckMode mode = CheckMode::Disable){mBuilder.mChecksum = mode;}
 
-    /// @brief Set type of dilation operation
-    /// @param op: NN_FACE=face neighbors, NN_FACE_EDGE=face and edge neibhros, NN_FACE_EDGE_VERTEX=26-connected neighbors
-    // void setOperation(morphology::NearestNeighbors op) { mOp = op; }
-
     /// @brief Creates a handle to the output grid
     /// @tparam BufferT Buffer type used for allocation of the grid handle
     /// @param buffer optional buffer (currently ignored)
@@ -98,13 +83,8 @@ private:
 
     void processRootTrianglePairs();
 
-    // void dilateRoot();
+    void processLeafTrianglePairs();
 
-    // void dilateInternalNodes();
-
-    // void processGridTreeRoot();
-
-    // void dilateLeafNodes();
 
     static constexpr unsigned int mNumThreads = 128;// for kernels spawned via lambdaKernel (others may specialize)
     static unsigned int numBlocks(unsigned int n) {return (n + mNumThreads - 1) / mNumThreads;}
@@ -123,15 +103,17 @@ private:
     nanovdb::cuda::DeviceBuffer  mXformedTriangles;
     nanovdb::cuda::DeviceBuffer  mBoxTrianglePairsBuffer;
     uint64_t                     mBoxTrianglePairCount{0};
-    // const GridT                  *mDeviceSrcGrid;
-    // morphology::NearestNeighbors mOp{morphology::NN_FACE_EDGE_VERTEX};
-    // TreeData                     mSrcTreeData;
 
     auto deviceXformedTriangles() { return static_cast<TriangleT*>(mXformedTriangles.deviceData()); }
     // auto hostXformedTriangles() { return static_cast<TriangleT*>(mXformedTriangles.data()); }
     auto deviceBoxTrianglePairs() { return static_cast<BoxTrianglePair*>(mBoxTrianglePairsBuffer.deviceData()); }
 
     nanovdb::cuda::TempDevicePool mTempDevicePool;
+
+    // For diagnostic purposes
+public:
+    uint64_t getPairCount() const { return mBoxTrianglePairCount; }
+    const BoxTrianglePair* getDevicePairs() const { return static_cast<const BoxTrianglePair*>(mBoxTrianglePairsBuffer.deviceData()); }
 }; // tools::cuda::MeshToGrid<BuildT>
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -169,6 +151,11 @@ MeshToGrid<BuildT>::getHandle(const BufferT &pool)
     // Process Root-Triangle pairs
     if (mVerbose==1) mTimer.start("Computing candidate RootTile-Triangle intersection pairs");
     processRootTrianglePairs();
+    if (mVerbose==1) mTimer.stop();
+
+    // Process Leaf-Triangle pairs
+    if (mVerbose==1) mTimer.start("Computing candidate LeafNode-Triangle intersection pairs");
+    processLeafTrianglePairs();
     if (mVerbose==1) mTimer.stop();
 
     // int device = 0;
@@ -271,6 +258,10 @@ struct TransformTrianglesFunctor
 template<typename BuildT>
 void MeshToGrid<BuildT>::transformTriangles()
 {
+    // TODO: Handle null input case
+    if (mTriangleCount == 0)
+        throw std::runtime_error("MeshToGrid currently requires mTriangleCount > 0 (Holistic zero-handling pending).");
+
     int device = 0;
     cudaGetDevice(&device);
 
@@ -407,6 +398,10 @@ struct ScatterRootTrianglePairsFunctor
 template<typename BuildT>
 void MeshToGrid<BuildT>::processRootTrianglePairs()
 {
+    // TODO: Handle null input case
+    if (mTriangleCount == 0)
+        throw std::runtime_error("MeshToGrid currently requires mTriangleCount > 0 (Holistic zero-handling pending).");
+
     int device = 0;
     cudaGetDevice(&device);
 
@@ -460,148 +455,227 @@ void MeshToGrid<BuildT>::processRootTrianglePairs()
             deviceXformedTriangles(),
             static_cast<uint64_t*>(rootBoxOffsets.deviceData()),
             deviceBoxTrianglePairs(),
-            mBandWidth - 0.5f // Explicitly passed here!
+            mBandWidth - 0.5f
         }
     );
 
 } // MeshToGrid<BuildT>::processRootTrianglePairs
 
-
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-#if 0
-template<typename BuildT>
-void MeshToGrid<BuildT>::dilateRoot()
+
+namespace topology::detail {
+
+/// @brief Tests if a Triangle intersects an Axis-Aligned Bounding Box.
+template <bool OnlyUseAABB>
+__device__ inline bool testTriangleAABB(
+    const nanovdb::Vec3f& boxCenter,
+    const nanovdb::Vec3f& boxHalfExtents,
+    const nanovdb::Vec3f& V0,
+    const nanovdb::Vec3f& V1,
+    const nanovdb::Vec3f& V2)
 {
-    // This method conservatively and speculatively dilates the root tiles, to accommodate
-    // any new root nodes that might be introduced by the dilation operation.
-    // The index-space bounding box of each tile is examined, and if it is within a 1-pixel of
-    // intersecting any of the 26-connected neighboring root tiles, those are preemptively
-    // introduced into the root topology.
-    // (As of the present implementation this presumes a maximum of 1-voxel radius in dilation)
-    // Root tiles that were preemptively introduced, but end up having no active contents will
-    // be pruned in later stages of processing.
+    // Translate the triangle as if the AABB is centered at the origin
+    nanovdb::Vec3f v0 = V0 - boxCenter;
+    nanovdb::Vec3f v1 = V1 - boxCenter;
+    nanovdb::Vec3f v2 = V2 - boxCenter;
+
+    // --- PHASE 1: AABB OVERLAP (3 Axes) ---
+    float minX = fminf(v0[0], fminf(v1[0], v2[0]));
+    float maxX = fmaxf(v0[0], fmaxf(v1[0], v2[0]));
+    if (minX > boxHalfExtents[0] || maxX < -boxHalfExtents[0]) return false;
+
+    float minY = fminf(v0[1], fminf(v1[1], v2[1]));
+    float maxY = fmaxf(v0[1], fmaxf(v1[1], v2[1]));
+    if (minY > boxHalfExtents[1] || maxY < -boxHalfExtents[1]) return false;
+
+    float minZ = fminf(v0[2], fminf(v1[2], v2[2]));
+    float maxZ = fmaxf(v0[2], fmaxf(v1[2], v2[2]));
+    if (minZ > boxHalfExtents[2] || maxZ < -boxHalfExtents[2]) return false;
+
+    if constexpr (OnlyUseAABB) return true; 
+
+    // --- PHASE 2: SEPARATING AXIS THEOREM (SAT) (10 additional axes) ---
+    nanovdb::Vec3f f0 = v1 - v0, f1 = v2 - v1, f2 = v0 - v2;
+    float r, p0, p1, p2;
+
+    // Axis 00, 01, 02 (X-axis cross products)
+    p0 = v0[2]*f0[1] - v0[1]*f0[2]; p2 = v2[2]*f0[1] - v2[1]*f0[2];
+    r = boxHalfExtents[1]*fabsf(f0[2]) + boxHalfExtents[2]*fabsf(f0[1]);
+    if (fminf(p0, p2) > r || fmaxf(p0, p2) < -r) return false;
+
+    p0 = v0[2]*f1[1] - v0[1]*f1[2]; p1 = v1[2]*f1[1] - v1[1]*f1[2];
+    r = boxHalfExtents[1]*fabsf(f1[2]) + boxHalfExtents[2]*fabsf(f1[1]);
+    if (fminf(p0, p1) > r || fmaxf(p0, p1) < -r) return false;
+
+    p0 = v0[2]*f2[1] - v0[1]*f2[2]; p1 = v1[2]*f2[1] - v1[1]*f2[2];
+    r = boxHalfExtents[1]*fabsf(f2[2]) + boxHalfExtents[2]*fabsf(f2[1]);
+    if (fminf(p0, p1) > r || fmaxf(p0, p1) < -r) return false;
+
+    // Axis 10, 11, 12 (Y-axis cross products)
+    p0 = v0[0]*f0[2] - v0[2]*f0[0]; p2 = v2[0]*f0[2] - v2[2]*f0[0];
+    r = boxHalfExtents[0]*fabsf(f0[2]) + boxHalfExtents[2]*fabsf(f0[0]);
+    if (fminf(p0, p2) > r || fmaxf(p0, p2) < -r) return false;
+
+    p0 = v0[0]*f1[2] - v0[2]*f1[0]; p1 = v1[0]*f1[2] - v1[2]*f1[0];
+    r = boxHalfExtents[0]*fabsf(f1[2]) + boxHalfExtents[2]*fabsf(f1[0]);
+    if (fminf(p0, p1) > r || fmaxf(p0, p1) < -r) return false;
+
+    p0 = v0[0]*f2[2] - v0[2]*f2[0]; p1 = v1[0]*f2[2] - v1[2]*f2[0];
+    r = boxHalfExtents[0]*fabsf(f2[2]) + boxHalfExtents[2]*fabsf(f2[0]);
+    if (fminf(p0, p1) > r || fmaxf(p0, p1) < -r) return false;
+
+    // Axis 20, 21, 22 (Z-axis cross products)
+    p0 = v0[1]*f0[0] - v0[0]*f0[1]; p2 = v2[1]*f0[0] - v2[0]*f0[1];
+    r = boxHalfExtents[0]*fabsf(f0[1]) + boxHalfExtents[1]*fabsf(f0[0]);
+    if (fminf(p0, p2) > r || fmaxf(p0, p2) < -r) return false;
+
+    p0 = v0[1]*f1[0] - v0[0]*f1[1]; p1 = v1[1]*f1[0] - v1[0]*f1[1];
+    r = boxHalfExtents[0]*fabsf(f1[1]) + boxHalfExtents[1]*fabsf(f1[0]);
+    if (fminf(p0, p1) > r || fmaxf(p0, p1) < -r) return false;
+
+    p0 = v0[1]*f2[0] - v0[0]*f2[1]; p1 = v1[1]*f2[0] - v1[0]*f2[1];
+    r = boxHalfExtents[0]*fabsf(f2[1]) + boxHalfExtents[1]*fabsf(f2[0]);
+    if (fminf(p0, p1) > r || fmaxf(p0, p1) < -r) return false;
+
+    // Face normal test
+    nanovdb::Vec3f n(f0[1]*f1[2] - f0[2]*f1[1], f0[2]*f1[0] - f0[0]*f1[2], f0[0]*f1[1] - f0[1]*f1[0]);
+    float d = n[0]*v0[0] + n[1]*v0[1] + n[2]*v0[2];
+    r = boxHalfExtents[0]*fabsf(n[0]) + boxHalfExtents[1]*fabsf(n[1]) + boxHalfExtents[2]*fabsf(n[2]);
+    if (fabsf(d) > r) return false;
+
+    return true;
+}
+
+template <typename BuildT, bool OnlyUseAABB>
+__global__ void evaluateAndCountSubBoxesKernel(
+    const typename MeshToGrid<BuildT>::BoxTrianglePair* dParents,
+    const std::array<nanovdb::Vec3f, 3>* dXformedTriangles,
+    nanovdb::Mask<3>* dMasks,
+    uint64_t* dCounts,
+    int parentScale,
+    float padding)
+{
+    // 1 CTA perfectly evaluates 1 Parent Pair
+    uint64_t parentID = blockIdx.x;
+    int threadID = threadIdx.x; // 0 to 511
+
+    const auto& parentPair = dParents[parentID];
+    const auto& tri = dXformedTriangles[parentPair.triangleID];
+
+    int subScale = parentScale / 8;
+
+    // 1. Thread to 3D sub-box index mapping
+    int i = threadID & 7;           // % 8
+    int j = (threadID >> 3) & 7;    // (/ 8) % 8
+    int k = (threadID >> 6) & 7;    // / 64
+
+    // 2. Mathematically exact bounding box for this sub-domain
+    // Voxel bounds are [origin - 0.5, origin + subScale - 0.5]
+    float centerX = parentPair.origin[0] + i * subScale + (subScale * 0.5f) - 0.5f;
+    float centerY = parentPair.origin[1] + j * subScale + (subScale * 0.5f) - 0.5f;
+    float centerZ = parentPair.origin[2] + k * subScale + (subScale * 0.5f) - 0.5f;
+    
+    nanovdb::Vec3f boxCenter(centerX, centerY, centerZ);
+    float halfExt = (subScale * 0.5f) + padding;
+    nanovdb::Vec3f boxHalfExtents(halfExt, halfExt, halfExt);
+
+    // 3. Evaluate intersection
+    bool hit = testTriangleAABB<OnlyUseAABB>(boxCenter, boxHalfExtents, tri[0], tri[1], tri[2]);
+
+    // 4. ZERO-ATOMIC Mask Building using Warp Voting
+    // Each warp (32 threads) creates a 32-bit mask of its hits.
+    __shared__ uint32_t s_words_32[16]; // 16 warps * 32 bits = 512 bits total
+    
+    unsigned int ballot = __ballot_sync(0xFFFFFFFF, hit);
+    if ((threadID & 31) == 0) {
+        // The first thread of each warp writes the warp's result into shared memory
+        s_words_32[threadID >> 5] = ballot;
+    }
+
+    // 5. CUB Block-wide Reduction to get the total hit count
+    using BlockReduce = cub::BlockReduce<int, 512>;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
+    
+    int aggregate_hits = BlockReduce(temp_storage).Sum(hit ? 1 : 0);
+
+    __syncthreads();
+
+    // 6. Thread 0 safely formats and flushes the data to global memory
+    if (threadID == 0) {
+        nanovdb::Mask<3> outMask;
+        // Stitch the 32-bit words into NanoVDB's expected 64-bit words
+        for (int w = 0; w < 8; ++w) {
+            uint64_t low = s_words_32[w * 2];
+            uint64_t high = s_words_32[w * 2 + 1];
+            outMask.words()[w] = low | (high << 32);
+        }
+        
+        dMasks[parentID] = outMask;
+        dCounts[parentID] = aggregate_hits;
+    }
+}
+
+} // namespace topology::detail
+
+template<typename BuildT>
+void MeshToGrid<BuildT>::processLeafTrianglePairs()
+{
+    // TODO: Handle null input case
+    if (mTriangleCount == 0)
+        throw std::runtime_error("MeshToGrid currently requires mTriangleCount > 0 (Holistic zero-handling pending).");
 
     int device = 0;
     cudaGetDevice(&device);
 
-    std::map<uint64_t, typename RootT::DataType::Tile> dilatedTiles;
+    int scale = 4096; // Start at Root node scale
 
-    // This encoding scheme mirrors the one used in PointsToGrid; note that it is different from Tile::key
-    auto coordToKey = [](const Coord &ijk)->uint64_t{
-        // Note: int32_t has a range of -2^31 to 2^31 - 1 whereas uint32_t has a range of 0 to 2^32 - 1
-        static constexpr int64_t kOffset = 1 << 31;
-        return (uint64_t(uint32_t(int64_t(ijk[2]) + kOffset) >> 12)      ) | // z is the lower 21 bits
-            (uint64_t(uint32_t(int64_t(ijk[1]) + kOffset) >> 12) << 21) | // y is the middle 21 bits
-            (uint64_t(uint32_t(int64_t(ijk[0]) + kOffset) >> 12) << 42); //  x is the upper 21 bits
-    };// coordToKey lambda functor
-
-    if (mSrcTreeData.mVoxelCount) { // If the input grid is not empty
-        // Make a host copy of the source topology RootNode *and* the Upper Nodes (needed for BBox'es)
-        // TODO: Consider avoiding to copy the entire set of upper nodes
-        auto deviceSrcRoot = static_cast<const RootT*>(util::PtrAdd(mDeviceSrcGrid, GridT::memUsage() + mSrcTreeData.mNodeOffset[3]));
-        uint64_t rootAndUpperSize = mSrcTreeData.mNodeOffset[1] - mSrcTreeData.mNodeOffset[3];
-        auto srcRootAndUpperBuffer = nanovdb::HostBuffer::create(rootAndUpperSize);
-        cudaCheck(cudaMemcpyAsync(srcRootAndUpperBuffer.data(), deviceSrcRoot, rootAndUpperSize, cudaMemcpyDeviceToHost, mStream));
-        auto srcRootAndUpper = static_cast<RootT*>(srcRootAndUpperBuffer.data());
-
-        // For each original root tile, consider adding those tiles in its 26-connected neighborhood
-        for (uint32_t t = 0; t < srcRootAndUpper->tileCount(); t++) {
-            auto srcUpper = srcRootAndUpper->getChild(srcRootAndUpper->tile(t));
-            const auto dilatedBBox = srcUpper->bbox().expandBy(1); // TODO: update/specialize if larger dilation neighborhoods are used
-
-            static constexpr int32_t rootTileDim = UpperT::DIM; // 4096
-            for (int di = -rootTileDim; di <= rootTileDim; di += rootTileDim)
-            for (int dj = -rootTileDim; dj <= rootTileDim; dj += rootTileDim)
-            for (int dk = -rootTileDim; dk <= rootTileDim; dk += rootTileDim) {
-                auto testBBox = nanovdb::CoordBBox::createCube(srcUpper->origin().offsetBy(di,dj,dk), rootTileDim);
-                auto sortKey = coordToKey(testBBox.min()); // key used in the radix sort, in accordance with PointsToGrid
-                auto tileKey = RootT::CoordToKey(testBBox.min()); // encoding used in the NanoVDB tile
-                if (testBBox.hasOverlap(dilatedBBox) & (dilatedTiles.count(sortKey) == 0)) {
-                    typename RootT::Tile neighborTile{tileKey}; // Only the key value is needed; child pointer & value will be unused
-                    dilatedTiles.emplace(sortKey, neighborTile);
-                }
-            }
+    for (int pass = 0; pass < 3; ++pass) {
+        if (mVerbose == 1) {
+            printf("\n--- Subdivision Pass %d (Scale: %d -> %d) ---\n", 
+                   pass, scale, scale / 8);
         }
+
+         // 1. Allocate Mask<3> buffer for the CTA hit results
+        //    Size: mBoxTrianglePairCount * sizeof(nanovdb::Mask<3>)
+        nanovdb::cuda::DeviceBuffer maskBuffer = nanovdb::cuda::DeviceBuffer::create(
+            mBoxTrianglePairCount * sizeof(nanovdb::Mask<3>), nullptr, device, mStream);
+        if (maskBuffer.deviceData() == nullptr) {
+            throw std::runtime_error("Failed to allocate mask buffer for subdivision pass");
+        }
+        auto* dMasks = static_cast<nanovdb::Mask<3>*>(maskBuffer.deviceData());
+
+        // 2. Allocate Counts buffer for Prefix Sum
+        //    Size: mBoxTrianglePairCount * sizeof(uint64_t)
+        nanovdb::cuda::DeviceBuffer countsBuffer = nanovdb::cuda::DeviceBuffer::create(
+            mBoxTrianglePairCount * sizeof(uint64_t), nullptr, device, mStream);
+        if (countsBuffer.deviceData() == nullptr) {
+            throw std::runtime_error("Failed to allocate counts buffer for subdivision pass");
+        }
+        auto* dCounts = static_cast<uint64_t*>(countsBuffer.deviceData());
+
+        // 3. Evaluate & Count Kernel (Grid: mBoxTrianglePairCount blocks, Block: 512 threads)
+        //    Action: Threads do AABB/SAT tests, write to Mask, block reduces count.
+
+        // 4. Prefix Sum (CUB InclusiveScan)
+        //    Action: Computes global offsets and newTotalChildPairs
+
+        // 5. Allocate New Child Pair Buffer
+        //    Size: newTotalChildPairs * sizeof(BoxTrianglePair)
+
+        // 6. Scatter Kernel
+        //    Action: Reads the Mask<3> and writes surviving sub-boxes to the new buffer
+
+        // 7. The std::move Ping-Pong!
+        // mBoxTrianglePairsBuffer = std::move(newChildPairsBuffer);
+        // mBoxTrianglePairCount = newTotalChildPairs; 
+        
+        // Prepare for the next subdivision tier
+        scale /= 8; 
     }
 
-    // Package the new root topology into a RootNode plus Tile list; upload to the GPU
-    uint64_t rootSize = RootT::memUsage(dilatedTiles.size());
-    mBuilder.mProcessedRoot = nanovdb::cuda::DeviceBuffer::create(rootSize);
-    auto dilatedRootPtr = static_cast<RootT*>(mBuilder.mProcessedRoot.data());
-    dilatedRootPtr->mTableSize = dilatedTiles.size();
-    uint32_t t = 0;
-    for (const auto& [key, tile] : dilatedTiles)
-        *dilatedRootPtr->tile(t++) = tile;
-    mBuilder.mProcessedRoot.deviceUpload(device, mStream, false);
-} // MeshToGrid<BuildT>::dilateRoot
+} // MeshToGrid<BuildT>::processLeafTrianglePairs
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-
-template<typename BuildT>
-void MeshToGrid<BuildT>::dilateInternalNodes()
-{
-    // Computes the masks of upper and (densified) lower internal nodes, as a result of the dilation operation
-    // Masks of lower internal nodes are densified in the sense that a serialized array of them is allocated,
-    // as if every upper node had a full set of 32^3 lower children
-    if (mSrcTreeData.mNodeCount[1]) { // Unless it's an empty grid
-        if (mOp == morphology::NN_FACE) {
-            using Op = util::morphology::cuda::DilateInternalNodesFunctor<BuildT, morphology::NN_FACE>;
-            util::cuda::operatorKernel<Op>
-                <<<dim3(mSrcTreeData.mNodeCount[1],Op::SlicesPerLowerNode,1), Op::MaxThreadsPerBlock, 0, mStream>>>
-                (mDeviceSrcGrid, mBuilder.deviceProcessedRoot(), mBuilder.deviceUpperMasks(), mBuilder.deviceLowerMasks()); }
-        else if (mOp == morphology::NN_FACE_EDGE) {
-            using Op = util::morphology::cuda::DilateInternalNodesFunctor<BuildT, morphology::NN_FACE_EDGE>;
-            util::cuda::operatorKernel<Op>
-                <<<dim3(mSrcTreeData.mNodeCount[1],Op::SlicesPerLowerNode,1), Op::MaxThreadsPerBlock, 0, mStream>>>
-                (mDeviceSrcGrid, mBuilder.deviceProcessedRoot(), mBuilder.deviceUpperMasks(), mBuilder.deviceLowerMasks()); }
-        else if (mOp == morphology::NN_FACE_EDGE_VERTEX) {
-            using Op = util::morphology::cuda::DilateInternalNodesFunctor<BuildT, morphology::NN_FACE_EDGE_VERTEX>;
-            util::cuda::operatorKernel<Op>
-                <<<dim3(mSrcTreeData.mNodeCount[1],Op::SlicesPerLowerNode,1), Op::MaxThreadsPerBlock, 0, mStream>>>
-                (mDeviceSrcGrid, mBuilder.deviceProcessedRoot(), mBuilder.deviceUpperMasks(), mBuilder.deviceLowerMasks()); }
-    }
-} // MeshToGrid<BuildT>::dilateInternalNodes
-
-//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-
-template <typename BuildT>
-void MeshToGrid<BuildT>::processGridTreeRoot()
-{
-    // Copy GridData from source grid
-    // By convention: this will duplicate grid name and map. Others will be reset later
-    cudaCheck(cudaMemcpyAsync(&mBuilder.data()->getGrid(), mDeviceSrcGrid->data(), GridT::memUsage(), cudaMemcpyDeviceToDevice, mStream));
-    util::cuda::lambdaKernel<<<1, 1, 0, mStream>>>(1, topology::detail::BuildGridTreeRootFunctor<BuildT>(), mBuilder.deviceData());
-    cudaCheckError();
-} // MeshToGrid<BuildT>::processGridTreeRoot
-
-//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-
-template<typename BuildT>
-void MeshToGrid<BuildT>::dilateLeafNodes()
-{
-    // Dilates the active masks of the source grid (as indicated at the leaf level), into a new grid that
-    // has been already topologically dilated to include all necessary leaf nodes.
-    if (mBuilder.data()->nodeCount[1]) { // Unless output grid is empty
-        if (mOp == morphology::NN_FACE) {
-            using Op = util::morphology::cuda::DilateLeafNodesFunctor<BuildT, morphology::NN_FACE>;
-            util::cuda::operatorKernel<Op>
-                <<<dim3(mBuilder.data()->nodeCount[1],Op::SlicesPerLowerNode,1), Op::MaxThreadsPerBlock, 0, mStream>>>
-                (mDeviceSrcGrid, static_cast<GridT*>(mBuilder.data()->d_bufferPtr)); }
-        else if (mOp == morphology::NN_FACE_EDGE)
-            throw std::runtime_error("dilateLeafNodes() not implemented for NN_FACE_EDGE stencil");
-        else if (mOp == morphology::NN_FACE_EDGE_VERTEX) {
-            using Op = util::morphology::cuda::DilateLeafNodesFunctor<BuildT, morphology::NN_FACE_EDGE_VERTEX>;
-            util::cuda::operatorKernel<Op>
-                <<<dim3(mBuilder.data()->nodeCount[1],Op::SlicesPerLowerNode,1), Op::MaxThreadsPerBlock>>>
-                (mDeviceSrcGrid, static_cast<GridT*>(mBuilder.data()->d_bufferPtr)); }
-    }
-
-    // Update leaf offsets and prefix sums
-    mBuilder.processLeafOffsets(mStream);
-} // MeshToGrid<BuildT>::dilateLeafNodes
-
-//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-#endif
 
 } // namespace tools::cuda
 

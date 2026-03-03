@@ -69,12 +69,18 @@ struct IGEMM_Geometry
     static constexpr int Cz = 8/(QQ*Q);  // Cluster count along Z-dimension of leaf node
 
     static constexpr int Hx = T+7;       // X-dimension of leaf node domain, enlarged by the necessary halo for convolution
+    __hostdev__ int Hx_() const { return t+7;}
     static constexpr int Hy = R+7;       // Y-dimension of leaf node domain, enlarged by the necessary halo for convolution
+    __hostdev__ int Hy_() const { return r+7;}
     static constexpr int Hz = S+7;       // Z-dimension of leaf node domain, enlarged by the necessary halo for convolution
+    __hostdev__ int Hz_() const { return s+7;}
 
     static constexpr int CHx = ZZ*Z+T-1; // Cluster halo (voxel width, plus halo of one cluster) count along X-dimension
+    __hostdev__ int CHx_() const { return ZZ*Z+t-1;}
     static constexpr int CHy = PP*P+R-1; // Cluster halo (voxel width, plus halo of one cluster) count along Y-dimension
+    __hostdev__ int CHy_() const { return PP*P+r-1;}
     static constexpr int CHz = QQ*Q+S-1; // Cluster halo (voxel width, plus halo of one cluster) count along Z-dimension
+    __hostdev__ int CHz_() const { return QQ*Q+s-1;}
 
     static constexpr int CVx = ZZ*Z;     // Voxel count per cluster along X-dimension
     static constexpr int CVy = PP*P;     // Voxel count per cluster along Y-dimension
@@ -231,10 +237,10 @@ __launch_bounds__(Operator::MaxThreadsPerBlock, Operator::MinBlocksPerMultiproce
       const nanovdb::NanoGrid<BuildT>* inputGrid,
       const nanovdb::NanoGrid<BuildT>* outputGrid,
       const float *inputData,
-      float *outputData
+      float *outputData,
+      Operator op
   ) {
   extern __shared__ char smem_buf[];
-  Operator op;
   op(
       mFlt,
       inputGrid,
@@ -541,12 +547,14 @@ void mainSparseConvolutionIGEMM(
     );
 #endif
 
-    IGEMM_Layouts<IGEMM_Geometry> layouts;
+    IGEMM_Layouts<IGEMM_Geometry> layouts(geometry);
 
     Tensor tFilter = make_tensor(
         make_gmem_ptr(filterData.data().get()),
         layouts.filterLayout()
     );
+
+    AmperePredicatedFprop<IGEMM_Geometry> op(geometry);
 
     constexpr size_t smem_size = sizeof(typename AmperePredicatedFprop<IGEMM_Geometry>::SharedStorage);
     std::cout << "smem_size = " << smem_size << std::endl;
@@ -558,7 +566,7 @@ void mainSparseConvolutionIGEMM(
             smem_size
         ));
 
-    int num_iterations = 10;
+    int num_iterations = 20;
     for (int i = 0; i < num_iterations; ++i) {
         gpuTimer.start("Scatter-Gather Cutlass IGEMM (GPU) execution");
         kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, BuildT, decltype(tFilter)>
@@ -567,7 +575,8 @@ void mainSparseConvolutionIGEMM(
                 inputGrid,
                 outputGrid,
                 inputData.data().get(),
-                outputData.data().get()
+                outputData.data().get(),
+                op
             );
         gpuTimer.stop();
     }

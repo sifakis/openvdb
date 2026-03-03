@@ -50,9 +50,9 @@ using namespace cute;
 template<class SettingsT>
 struct IGEMM_Layouts
 {
-    static constexpr auto T = Int<SettingsT::T>{};
-    static constexpr auto R = Int<SettingsT::R>{};
-    static constexpr auto S = Int<SettingsT::S>{};
+    // static constexpr auto T = Int<SettingsT::T>{};
+    // static constexpr auto R = Int<SettingsT::R>{};
+    // static constexpr auto S = Int<SettingsT::S>{};
     static constexpr auto Z = Int<SettingsT::Z>{};
     static constexpr auto P = Int<SettingsT::P>{};
     static constexpr auto Q = Int<SettingsT::Q>{};
@@ -61,32 +61,46 @@ struct IGEMM_Layouts
     static constexpr auto Bx = Int<SettingsT::Bx>{};
     static constexpr auto By = Int<SettingsT::By>{};
     static constexpr auto Bz = Int<SettingsT::Bz>{};
-    static constexpr auto Hx = Int<SettingsT::Hx>{};
-    static constexpr auto Hy = Int<SettingsT::Hy>{};
-    static constexpr auto Hz = Int<SettingsT::Hz>{};
-    static constexpr auto CHx = Int<SettingsT::CHx>{};
-    static constexpr auto CHy = Int<SettingsT::CHy>{};
-    static constexpr auto CHz = Int<SettingsT::CHz>{};
+    // static constexpr auto Hx = Int<SettingsT::Hx>{};
+    // static constexpr auto Hy = Int<SettingsT::Hy>{};
+    // static constexpr auto Hz = Int<SettingsT::Hz>{};
+    // static constexpr auto CHx = Int<SettingsT::CHx>{};
+    // static constexpr auto CHy = Int<SettingsT::CHy>{};
+    // static constexpr auto CHz = Int<SettingsT::CHz>{};
     static constexpr auto CVx = Int<SettingsT::CVx>{};
     static constexpr auto CVy = Int<SettingsT::CVy>{};
     static constexpr auto CVz = Int<SettingsT::CVz>{};
 
+    SettingsT geometry{};
+
+    __hostdev__ IGEMM_Layouts(SettingsT g = {}) : geometry(g) {}
+
     __hostdev__
-    static auto activationComposedGatherLayout(const uint64_t* gather_idx_buf)
+    auto activationComposedGatherLayout(const uint64_t* gather_idx_buf)
     {
         // Input gather layout
         // inner_layout(make_coord((nzpq), (csrt))) => (idx_buffer_idx, dense_c_idx)
-        auto EG = E<0>{};  // Gather basis     (1,0) (idx_buffer_idx) 
-        auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)    
+        auto EG = E<0>{};  // Gather basis     (1,0) (idx_buffer_idx)
+        auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)
+        auto C_ = Int<SettingsT::C>{};
+        auto T_ = geometry.T_();
+        auto R_ = geometry.R_();
+        auto S_ = geometry.S_();
+        auto Hy_ = geometry.Hy_();
+        auto Hz_ = geometry.Hz_();
+        auto Z_ = Int<SettingsT::Z>{};
+        auto P_ = Int<SettingsT::P>{};
+        auto Q_ = Int<SettingsT::Q>{};
+
         auto xformed_act_logical_inner = make_layout(
-            make_shape (make_shape (make_shape (        Bx,      By,   Bz),        Z,     P,  Q), make_shape ( C,        T,     R,  S)),
-            make_stride(make_stride(make_stride(Hy*Hz*Z*EG, Hz*P*EG, Q*EG), Hy*Hz*EG, Hz*EG, EG), make_stride(EC, Hy*Hz*EG, Hz*EG, EG)));
+            make_shape (make_shape (make_shape (           Bx,        By,   Bz),           Z_,       P_,   Q_), make_shape (C_,          T_,      R_, S_)),
+            make_stride(make_stride(make_stride(Hy_*Hz_*Z_*EG, Hz_*P_*EG, Q_*EG), Hy_*Hz_*EG, Hz_*EG, EG), make_stride(EC, Hy_*Hz_*EG, Hz_*EG, EG)));
 
         // outer_layout(make_coord(idx_buffer_idx, dense_c_idx)) => idx
         // IndexedGather obtains idx by applying (gmem_base_ptr + gather_idx_buf[idx_buffer_idx] + dense_offset)
         auto xformed_act_gather_outer = make_layout(
             make_shape(_1{},_1{}),
-            make_stride(example::CustomStride{example::IndexedGather{gather_idx_buf}, Int<SettingsT::C>{}}, _1{}));
+            make_stride(example::CustomStride{example::IndexedGather{gather_idx_buf}, C_}, _1{}));
 
         // Compose the inner and outer layouts
         // gather_composed(make_coord((nzpq), (csrt))) => idx
@@ -97,35 +111,55 @@ struct IGEMM_Layouts
     }
 
     __hostdev__
-    static auto activationIndexLayout()
+    auto activationIndexLayout()
     {
+        auto C_ = Int<SettingsT::C>{};
+        auto T_ = geometry.T_();
+        auto R_ = geometry.R_();
+        auto S_ = geometry.S_();
+        auto Hy_ = geometry.Hy_();
+        auto Hz_ = geometry.Hz_();
+        auto Z_ = Int<SettingsT::Z>{};
+        auto P_ = Int<SettingsT::P>{};
+        auto Q_ = Int<SettingsT::Q>{};
+
         // Input gather index layout
         // gather_layout_index(make_coord((ndhw), c)) => buffer_idx
         return make_layout(
-            make_shape (make_shape (make_shape (     Bx,   By, Bz),     Z,  P,    Q), make_shape (   C,     T,  R,    S)),
-            make_stride(make_stride(make_stride(Hy*Hz*Z, Hz*P,  Q), Hy*Hz, Hz, _1{}), make_stride(_0{}, Hy*Hz, Hz, _1{})));
+            make_shape (make_shape (make_shape (       Bx,    By,  Bz),       Z_,   P_,    Q_), make_shape (  C_,      T_,  R_,   S_)),
+            make_stride(make_stride(make_stride(Hy_*Hz_*Z_, Hz_*P_,  Q_), Hy_*Hz_, Hz_, _1{}), make_stride(_0{}, Hy_*Hz_, Hz_, _1{})));
     }
 
     __hostdev__
-    static auto clusterActivationPredicateStride()
+    auto clusterActivationPredicateStride()
     {
         // Input gather index layout
         // gather_layout_index(make_coord((ndhw), c)) => buffer_idx
         //     make_shape (make_shape (make_shape (       Bx,    By, Bz),       Z,   P,    Q), make_shape (  KK,  _1,  _1,  _1), make_shape (  BC,       T,   R,    S)),
-        return make_stride(make_stride(make_stride(CHy*CHz*Z, CHz*P,  Q), CHy*CHz, CHz, _1{}), make_stride(_0{},_0{},_0{},_0{}), make_stride(_0{}, CHy*CHz, CHz, _1{}));
+        auto CHy_ = geometry.CHy_();
+        auto CHz_ = geometry.CHz_();
+        auto Z_ = Int<SettingsT::Z>{};
+        auto P_ = Int<SettingsT::P>{};
+        auto Q_ = Int<SettingsT::Q>{};
+        return make_stride(make_stride(make_stride(CHy_*CHz_*Z_, CHz_*P_,  Q_), CHy_*CHz_, CHz_, _1{}), make_stride(_0{},_0{},_0{},_0{}), make_stride(_0{}, CHy_*CHz_, CHz_, _1{}));
     }
 
     __hostdev__
-    static auto filterLayout()
+    auto filterLayout()
     {
+        auto C_ = Int<SettingsT::C>{};
+        auto K_ = Int<SettingsT::K>{};
+        auto T_ = geometry.T_();
+        auto R_ = geometry.R_();
+        auto S_ = geometry.S_();
         return make_ordered_layout(
-            make_shape(K, make_shape(C, T, R, S)),
+            make_shape(K_, make_shape(C_, T_, R_, S_)),
             tuple<_1, tuple<_0,_4,_3,_2>>{}
         );
     }
 
     __hostdev__
-    static auto outputComposedScatterLayout(const uint64_t* scatter_idx_buf)
+    auto outputComposedScatterLayout(const uint64_t* scatter_idx_buf)
     {
         // Output scatter layout
         // scatter_layout_index(k, make_coord((nzpq))) => buffer_idx
@@ -144,7 +178,7 @@ struct IGEMM_Layouts
     }
 
     __hostdev__
-    static auto outputIndexLayout()
+    auto outputIndexLayout()
     {
         // Output scatter index layout
         // scatter_layout_index(k, make_coord((nzpq))) => buffer_idx
@@ -154,7 +188,7 @@ struct IGEMM_Layouts
     }
 
     __hostdev__
-    static auto clusterOutputPredicateStride()
+    auto clusterOutputPredicateStride()
     {
         // Output scatter index layout
         // scatter_layout_index(k, make_coord((nzpq))) => buffer_idx
@@ -326,13 +360,20 @@ struct AmperePredicatedFprop {
     using SmemLayoutOut       = Layout<Shape<TileSizeM, TileSizeN>>;
 
     //
+    // Instance data
+    //
+    SettingsT geometry{};
+
+    __hostdev__ AmperePredicatedFprop(SettingsT g = {}) : geometry(g) {}
+
+    //
     // Conv functor (predicated IGEMM)
     //
-    template <class BuildT, class EngineFlt>
+    template <class BuildT, class EngineFlt, class LayoutFlt>
     // class ActivationTensor, class ActivationIndexTensor, class OutputTensor, class OutputIndexTensor>
     void __device__
     operator()(
-        cute::Tensor<EngineFlt, GmemLayoutFlt> mFlt,      // (K,(C,T,R,S))
+        cute::Tensor<EngineFlt, LayoutFlt> mFlt,          // (K,(C,T,R,S))
         const nanovdb::NanoGrid<BuildT>        *mActGrid,
         const nanovdb::NanoGrid<BuildT>        *mOutGrid,
         const float                            *actData,
@@ -377,10 +418,11 @@ struct AmperePredicatedFprop {
 
         __syncthreads();
 
-        Tensor gAct    = make_tensor(make_gmem_ptr(actData),IGEMM_Layouts<SettingsT>::activationComposedGatherLayout(sBIdx_ptr));
-        Tensor sActIdx = make_tensor(make_smem_ptr(sBIdx_ptr),IGEMM_Layouts<SettingsT>::activationIndexLayout());
-        Tensor gOut    = make_tensor(make_gmem_ptr(outData),IGEMM_Layouts<SettingsT>::outputComposedScatterLayout(sCIdx_ptr));
-        Tensor sOutIdx = make_tensor(make_smem_ptr(sCIdx_ptr),IGEMM_Layouts<SettingsT>::outputIndexLayout());
+        IGEMM_Layouts<SettingsT> layouts(geometry);
+        Tensor gAct    = make_tensor(make_gmem_ptr(actData),layouts.activationComposedGatherLayout(sBIdx_ptr));
+        Tensor sActIdx = make_tensor(make_smem_ptr(sBIdx_ptr),layouts.activationIndexLayout());
+        Tensor gOut    = make_tensor(make_gmem_ptr(outData),layouts.outputComposedScatterLayout(sCIdx_ptr));
+        Tensor sOutIdx = make_tensor(make_smem_ptr(sCIdx_ptr),layouts.outputIndexLayout());
 
         TiledMma tiled_mma;
         Tensor accum = partition_fragment_C(tiled_mma, TilerOut{});
@@ -411,7 +453,7 @@ struct AmperePredicatedFprop {
         
             auto sBPred_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sBPredMatrix[0];
             Tensor sBPred = make_tensor(make_smem_ptr(sBPred_ptr), shape(sBIdx),
-                IGEMM_Layouts<SettingsT>::clusterActivationPredicateStride());
+                layouts.clusterActivationPredicateStride());
             for (int v = 0; v < SettingsT::VoxelsPerClusterWithHalo(); v += MaxThreadsPerBlock)
                 if (v+threadIdx.x < SettingsT::VoxelsPerClusterWithHalo())
                 {
@@ -422,7 +464,7 @@ struct AmperePredicatedFprop {
 
             auto sCPred_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sCPredMatrix[0];
             Tensor sCPred = make_tensor(make_smem_ptr(sCPred_ptr), shape(sCIdx),
-                IGEMM_Layouts<SettingsT>::clusterOutputPredicateStride());
+                layouts.clusterOutputPredicateStride());
             for (int v = 0; v < SettingsT::VoxelsPerClusterNoHalo(); v += MaxThreadsPerBlock)
                 if (v+threadIdx.x < SettingsT::VoxelsPerClusterNoHalo())
                 {

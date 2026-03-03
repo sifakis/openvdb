@@ -45,9 +45,12 @@ struct IGEMM_Geometry
     static constexpr int P = 2;     // Y-dimension of output block
     static constexpr int Q = 2;     // Z-dimension of output block
 
-    static constexpr int D = Z+T_-1; // X-dimension of input block (including halo)
-    static constexpr int H = P+R_-1; // Y-dimension of input block (including halo)
-    static constexpr int W = Q+S_-1; // Z-dimension of input block (including halo)
+    static constexpr int D_ = Z+T_-1; // X-dimension of input block (including halo, compile-time default)
+    __hostdev__ int D() const { return Z+T()-1; }
+    static constexpr int H_ = P+R_-1; // Y-dimension of input block (including halo, compile-time default)
+    __hostdev__ int H() const { return P+R()-1; }
+    static constexpr int W_ = Q+S_-1; // Z-dimension of input block (including halo, compile-time default)
+    __hostdev__ int W() const { return Q+S()-1; }
 
     static constexpr int C = 64;    // Input feature dimension
     static constexpr int K = 128;   // Output feature dimension
@@ -186,7 +189,7 @@ void SparseConvolveCudaReference(
 
 template<class GeometryT, int Di, int Do, class ValueType>
 void SparseConvolveScatterGatherMapsReference(
-    uint64_t (*gather_idx_buf) [GeometryT::D][GeometryT::H][GeometryT::W],
+    uint64_t (*gather_idx_buf) [GeometryT::D_][GeometryT::H_][GeometryT::W_],
     uint64_t (*scatter_idx_buf)[GeometryT::Z][GeometryT::P][GeometryT::Q],
     const std::size_t blockCount,
     const ValueType (*filter)[Do][Di],
@@ -449,8 +452,8 @@ void mainSparseConvolutionIGEMM(
     gpuTimer.stop();
 
     gpuTimer.start("Initializing gather indices");
-    auto inputVoxelsPerBlock = IGEMM_Geometry::D * IGEMM_Geometry::H * IGEMM_Geometry::W;
-    using GatherIndexLegacyT = uint64_t [IGEMM_Geometry::D][IGEMM_Geometry::H][IGEMM_Geometry::W];
+    auto inputVoxelsPerBlock = geometry.D() * geometry.H() * geometry.W();
+    using GatherIndexLegacyT = uint64_t [IGEMM_Geometry::D_][IGEMM_Geometry::H_][IGEMM_Geometry::W_];
 #ifndef USE_HIERARCHICAL_BLOCK_TRAVERSAL
     using GatherIndexArrayLegacyT = GatherIndexLegacyT [IGEMM_Geometry::Bx][IGEMM_Geometry::By][IGEMM_Geometry::Bz];
 #else
@@ -485,9 +488,9 @@ void mainSparseConvolutionIGEMM(
         int bk = bbk * shape<0,2>(blockedLeafLayout) + bkk;
 #endif
             nanovdb::Coord blockOffset(bi*IGEMM_Geometry::Z, bj*IGEMM_Geometry::P, bk*IGEMM_Geometry::Q);
-            for (int i = 0; i < IGEMM_Geometry::D; i++)
-            for (int j = 0; j < IGEMM_Geometry::H; j++)
-            for (int k = 0; k < IGEMM_Geometry::W; k++) {
+            for (int i = 0; i < geometry.D(); i++)
+            for (int j = 0; j < geometry.H(); j++)
+            for (int k = 0; k < geometry.W(); k++) {
                 auto localCoord = blockOffset.offsetBy(i+IGEMM_Geometry::Dx,j+IGEMM_Geometry::Dy,k+IGEMM_Geometry::Dz);
                 auto globalCoord = origin+localCoord;
 #ifndef USE_HIERARCHICAL_BLOCK_TRAVERSAL

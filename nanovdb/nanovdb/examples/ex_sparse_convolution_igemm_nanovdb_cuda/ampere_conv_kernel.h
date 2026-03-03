@@ -74,11 +74,11 @@ struct IGEMM_Layouts
         auto EG = E<0>{};  // Gather basis     (1,0) (idx_buffer_idx)
         auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)
         auto C_ = Int<SettingsT::C>{};
-        auto T_ = geometry.T_();
-        auto R_ = geometry.R_();
-        auto S_ = geometry.S_();
-        auto Hy_ = geometry.Hy_();
-        auto Hz_ = geometry.Hz_();
+        auto T_ = geometry.T();
+        auto R_ = geometry.R();
+        auto S_ = geometry.S();
+        auto Hy_ = geometry.Hy();
+        auto Hz_ = geometry.Hz();
         auto Z_ = Int<SettingsT::Z>{};
         auto P_ = Int<SettingsT::P>{};
         auto Q_ = Int<SettingsT::Q>{};
@@ -105,11 +105,11 @@ struct IGEMM_Layouts
     auto activationIndexLayout()
     {
         auto C_ = Int<SettingsT::C>{};
-        auto T_ = geometry.T_();
-        auto R_ = geometry.R_();
-        auto S_ = geometry.S_();
-        auto Hy_ = geometry.Hy_();
-        auto Hz_ = geometry.Hz_();
+        auto T_ = geometry.T();
+        auto R_ = geometry.R();
+        auto S_ = geometry.S();
+        auto Hy_ = geometry.Hy();
+        auto Hz_ = geometry.Hz();
         auto Z_ = Int<SettingsT::Z>{};
         auto P_ = Int<SettingsT::P>{};
         auto Q_ = Int<SettingsT::Q>{};
@@ -127,8 +127,8 @@ struct IGEMM_Layouts
         // Input gather index layout
         // gather_layout_index(make_coord((ndhw), c)) => buffer_idx
         //     make_shape (make_shape (make_shape (       Bx,    By, Bz),       Z,   P,    Q), make_shape (  KK,  _1,  _1,  _1), make_shape (  BC,       T,   R,    S)),
-        auto CHy_ = geometry.CHy_();
-        auto CHz_ = geometry.CHz_();
+        auto CHy_ = geometry.CHy();
+        auto CHz_ = geometry.CHz();
         auto Z_ = Int<SettingsT::Z>{};
         auto P_ = Int<SettingsT::P>{};
         auto Q_ = Int<SettingsT::Q>{};
@@ -140,9 +140,9 @@ struct IGEMM_Layouts
     {
         auto C_ = Int<SettingsT::C>{};
         auto K_ = Int<SettingsT::K>{};
-        auto T_ = geometry.T_();
-        auto R_ = geometry.R_();
-        auto S_ = geometry.S_();
+        auto T_ = geometry.T();
+        auto R_ = geometry.R();
+        auto S_ = geometry.S();
         return make_ordered_layout(
             make_shape(K_, make_shape(C_, T_, R_, S_)),
             tuple<_1, tuple<_0,_4,_3,_2>>{}
@@ -382,7 +382,7 @@ struct AmperePredicatedFprop {
         const auto& actTree = mActGrid->tree();
         auto sBIdx_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sBIdxMatrix[0];
         const auto filterOrigin = outLeaf.origin().offsetBy(SettingsT::Dx,SettingsT::Dy,SettingsT::Dz);
-        auto haloLayout = make_layout(make_shape(geometry.Hx_(), geometry.Hy_(), geometry.Hz_()), GenRowMajor{});
+        auto haloLayout = make_layout(make_shape(geometry.Hx(), geometry.Hy(), geometry.Hz()), GenRowMajor{});
         for (int v = 0; v < size(haloLayout); v += MaxThreadsPerBlock)
             if ((v+threadIdx.x) < size(haloLayout))
             {
@@ -428,7 +428,7 @@ struct AmperePredicatedFprop {
             auto sBPred_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sBPredMatrix[0];
             Tensor sBPred = make_tensor(make_smem_ptr(sBPred_ptr), shape(sBIdx),
                 layouts.clusterActivationPredicateStride());
-            auto clusterHaloLayout = make_layout(make_shape(geometry.CHx_(), geometry.CHy_(), geometry.CHz_()), GenRowMajor{});
+            auto clusterHaloLayout = make_layout(make_shape(geometry.CHx(), geometry.CHy(), geometry.CHz()), GenRowMajor{});
             for (int v = 0; v < size(clusterHaloLayout); v += MaxThreadsPerBlock)
                 if (v+threadIdx.x < size(clusterHaloLayout))
                 {

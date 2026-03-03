@@ -29,25 +29,25 @@ struct IGEMM_Geometry
     // Convolution geometry
     //
 
-    static constexpr int T = 3;     // X-dimension of convolution filter
-    int t{T};
-    __hostdev__ int T_() const { return t;}
+    static constexpr int T_ = 3;    // X-dimension of convolution filter (compile-time default)
+    int t{T_};
+    __hostdev__ int T() const { return t;}
 
-    static constexpr int R = 3;     // Y-dimension of convolution filter
-    int r{R};
-    __hostdev__ int R_() const { return r;}
+    static constexpr int R_ = 3;    // Y-dimension of convolution filter (compile-time default)
+    int r{R_};
+    __hostdev__ int R() const { return r;}
 
-    static constexpr int S = 3;     // Z-dimension of convolution filter
-    int s{S};
-    __hostdev__ int S_() const { return s;}
-    
+    static constexpr int S_ = 3;    // Z-dimension of convolution filter (compile-time default)
+    int s{S_};
+    __hostdev__ int S() const { return s;}
+
     static constexpr int Z = 4;     // X-dimension of output block
     static constexpr int P = 2;     // Y-dimension of output block
     static constexpr int Q = 2;     // Z-dimension of output block
 
-    static constexpr int D = Z+T-1; // X-dimension of input block (inluding halo)
-    static constexpr int H = P+R-1; // Y-dimension of input block (inluding halo)
-    static constexpr int W = Q+S-1; // Z-dimension of input block (inluding halo)
+    static constexpr int D = Z+T_-1; // X-dimension of input block (including halo)
+    static constexpr int H = P+R_-1; // Y-dimension of input block (including halo)
+    static constexpr int W = Q+S_-1; // Z-dimension of input block (including halo)
 
     static constexpr int C = 64;    // Input feature dimension
     static constexpr int K = 128;   // Output feature dimension
@@ -68,29 +68,36 @@ struct IGEMM_Geometry
     static constexpr int Cy = 8/(PP*P);  // Cluster count along Y-dimension of leaf node
     static constexpr int Cz = 8/(QQ*Q);  // Cluster count along Z-dimension of leaf node
 
-    static constexpr int Hx = T+7;       // X-dimension of leaf node domain, enlarged by the necessary halo for convolution
-    __hostdev__ int Hx_() const { return t+7;}
-    static constexpr int Hy = R+7;       // Y-dimension of leaf node domain, enlarged by the necessary halo for convolution
-    __hostdev__ int Hy_() const { return r+7;}
-    static constexpr int Hz = S+7;       // Z-dimension of leaf node domain, enlarged by the necessary halo for convolution
-    __hostdev__ int Hz_() const { return s+7;}
+    static constexpr int Hx_ = T_+7;     // X-dimension of leaf node domain, enlarged by the necessary halo for convolution (compile-time default)
+    __hostdev__ int Hx() const { return t+7;}
+    static constexpr int Hy_ = R_+7;     // Y-dimension of leaf node domain, enlarged by the necessary halo for convolution (compile-time default)
+    __hostdev__ int Hy() const { return r+7;}
+    static constexpr int Hz_ = S_+7;     // Z-dimension of leaf node domain, enlarged by the necessary halo for convolution (compile-time default)
+    __hostdev__ int Hz() const { return s+7;}
 
-    static constexpr int CHx = ZZ*Z+T-1; // Cluster halo (voxel width, plus halo of one cluster) count along X-dimension
-    __hostdev__ int CHx_() const { return ZZ*Z+t-1;}
-    static constexpr int CHy = PP*P+R-1; // Cluster halo (voxel width, plus halo of one cluster) count along Y-dimension
-    __hostdev__ int CHy_() const { return PP*P+r-1;}
-    static constexpr int CHz = QQ*Q+S-1; // Cluster halo (voxel width, plus halo of one cluster) count along Z-dimension
-    __hostdev__ int CHz_() const { return QQ*Q+s-1;}
+    static constexpr int CHx_ = ZZ*Z+T_-1; // Cluster halo count along X-dimension (compile-time default)
+    __hostdev__ int CHx() const { return ZZ*Z+t-1;}
+    static constexpr int CHy_ = PP*P+R_-1; // Cluster halo count along Y-dimension (compile-time default)
+    __hostdev__ int CHy() const { return PP*P+r-1;}
+    static constexpr int CHz_ = QQ*Q+S_-1; // Cluster halo count along Z-dimension (compile-time default)
+    __hostdev__ int CHz() const { return QQ*Q+s-1;}
+
+    __hostdev__ auto filterSpatialLayout() const {
+        return make_layout(make_shape(t, r, s), GenRowMajor{});
+    }
+    __hostdev__ auto haloSpatialLayout() const {
+        return make_layout(make_shape(Hx(), Hy(), Hz()), GenRowMajor{});
+    }
 
     static constexpr int CVx = ZZ*Z;     // Voxel count per cluster along X-dimension
     static constexpr int CVy = PP*P;     // Voxel count per cluster along Y-dimension
     static constexpr int CVz = QQ*Q;     // Voxel count per cluster along Z-dimension
 
     static constexpr int VoxelsPerLeafnodeNoHalo() { return 512; }
-    static constexpr int VoxelsPerLeafnodeWithHalo() { return Hx*Hy*Hz; }
+    static constexpr int VoxelsPerLeafnodeWithHalo() { return Hx_*Hy_*Hz_; }
 
     static constexpr int VoxelsPerClusterNoHalo() { return CVx*CVy*CVz; }
-    static constexpr int VoxelsPerClusterWithHalo() { return CHx*CHy*CHz; }
+    static constexpr int VoxelsPerClusterWithHalo() { return CHx_*CHy_*CHz_; }
 
     //
     // Filter offset (coordinate offset in the input domain that the [0,0,0] filter spoke corresponds to)
@@ -107,7 +114,7 @@ template<class GeometryT, int Di, int Do, class ValueType>
 void SparseConvolveCPUReference(
     nanovdb::NanoGrid<nanovdb::ValueOnIndex> *srcGrid,
     nanovdb::NanoGrid<nanovdb::ValueOnIndex> *dstGrid,
-    const ValueType (*filter)[GeometryT::R][GeometryT::S][Do][Di],
+    const ValueType (*filter)[Do][Di],
     const ValueType (*inputArray)[Di],
     ValueType (*outputArray)[Do],
     const GeometryT& geometry)
@@ -123,16 +130,16 @@ void SparseConvolveCPUReference(
             const auto dstCoord = dstLeafIt.getCoord();
             for ( int i = 0; i < Do; ++i )
                 outputArray[dstIndex][i] = 0.f;
-            for ( int di = 0; di < geometry.T_(); ++di )
-            for ( int dj = 0; dj < geometry.R_(); ++dj )
-            for ( int dk = 0; dk < geometry.S_(); ++dk )
+            for ( int di = 0; di < geometry.T(); ++di )
+            for ( int dj = 0; dj < geometry.R(); ++dj )
+            for ( int dk = 0; dk < geometry.S(); ++dk )
             {
                 const auto srcCoord = dstCoord.offsetBy(di+GeometryT::Dx, dj+GeometryT::Dy, dk+GeometryT::Dz);
                 const auto srcIndex = srcAcc.getValue(srcCoord);
                 if (srcIndex)
                     for ( int out = 0; out < Do; ++out )
                     for ( int in  = 0; in  < Di; ++in  )
-                        outputArray[dstIndex][out] += filter[di][dj][dk][out][in] * inputArray[srcIndex][in];
+                        outputArray[dstIndex][out] += filter[crd2idx(make_coord(di,dj,dk), geometry.filterSpatialLayout())][out][in] * inputArray[srcIndex][in];
             }
         }
     }
@@ -146,7 +153,7 @@ template<class GeometryT, int Di, int Do, class ValueType>
 void SparseConvolveCudaReference(
     nanovdb::NanoGrid<nanovdb::ValueOnIndex> *srcGrid,
     nanovdb::NanoGrid<nanovdb::ValueOnIndex> *dstGrid,
-    const ValueType (*filter)[GeometryT::R][GeometryT::S][Do][Di],
+    const ValueType (*filter)[Do][Di],
     const ValueType (*inputArray)[Di],
     ValueType (*outputArray)[Do],
     const GeometryT geometry)
@@ -161,15 +168,15 @@ void SparseConvolveCudaReference(
             const auto dstIndex = *dstLeafIt;
             const auto dstCoord = dstLeafIt.getCoord();
             outputArray[dstIndex][out] = 0.f;
-            for ( int di = 0; di < geometry.T_(); ++di )
-            for ( int dj = 0; dj < geometry.R_(); ++dj )
-            for ( int dk = 0; dk < geometry.S_(); ++dk )
+            for ( int di = 0; di < geometry.T(); ++di )
+            for ( int dj = 0; dj < geometry.R(); ++dj )
+            for ( int dk = 0; dk < geometry.S(); ++dk )
             {
                 const auto srcCoord = dstCoord.offsetBy(di+GeometryT::Dx, dj+GeometryT::Dy, dk+GeometryT::Dz);
                 const auto srcIndex = srcGrid->tree().getValue(srcCoord);
                 if (srcIndex)
                     for ( int in = 0; in < Di; ++in )
-                        outputArray[dstIndex][out] += filter[di][dj][dk][out][in] * inputArray[srcIndex][in];
+                        outputArray[dstIndex][out] += filter[crd2idx(make_coord(di,dj,dk), geometry.filterSpatialLayout())][out][in] * inputArray[srcIndex][in];
             }
         }
     };
@@ -182,7 +189,7 @@ void SparseConvolveScatterGatherMapsReference(
     uint64_t (*gather_idx_buf) [GeometryT::D][GeometryT::H][GeometryT::W],
     uint64_t (*scatter_idx_buf)[GeometryT::Z][GeometryT::P][GeometryT::Q],
     const std::size_t blockCount,
-    const ValueType (*filter)[GeometryT::R][GeometryT::S][Do][Di],
+    const ValueType (*filter)[Do][Di],
     const ValueType (*inputArray)[Di],
     ValueType (*outputArray)[Do],
     const GeometryT geometry)
@@ -199,13 +206,13 @@ void SparseConvolveScatterGatherMapsReference(
             const auto dstIndex = scatterIndices[i][j][k];
             if (dstIndex) {
                 outputArray[dstIndex][out] = 0.f;
-                for ( int di = 0; di < geometry.T_(); ++di )
-                for ( int dj = 0; dj < geometry.R_(); ++dj )
-                for ( int dk = 0; dk < geometry.S_(); ++dk ) {
+                for ( int di = 0; di < geometry.T(); ++di )
+                for ( int dj = 0; dj < geometry.R(); ++dj )
+                for ( int dk = 0; dk < geometry.S(); ++dk ) {
                     const auto srcIndex = gatherIndices[i+di][j+dj][k+dk];
                     if (srcIndex)
                         for ( int in = 0; in < Di; ++in )
-                            outputArray[dstIndex][out] += filter[di][dj][dk][out][in] * inputArray[srcIndex][in];
+                            outputArray[dstIndex][out] += filter[crd2idx(make_coord(di,dj,dk), geometry.filterSpatialLayout())][out][in] * inputArray[srcIndex][in];
                 }
             }
         }
@@ -289,7 +296,7 @@ void mainSparseConvolutionIGEMM(
     static constexpr int Do = IGEMM_Geometry::K;
     using inputArrayT = float (&) [][Di];
     using outputArrayT = float (&) [][Do];
-    using filterT = float (&) [IGEMM_Geometry::T][IGEMM_Geometry::R][IGEMM_Geometry::S][Do][Di];
+    using filterT = float (*)[Do][Di];
     
     IGEMM_Geometry geometry;
 
@@ -364,8 +371,8 @@ void mainSparseConvolutionIGEMM(
     gpuTimer.stop();
 
     gpuTimer.start("Initializing filter data");
-    auto filterData = thrust::universal_vector<float>(geometry.T_()*geometry.R_()*geometry.S_()*Do*Di);
-    auto filter = reinterpret_cast<filterT>(*filterData.data().get());
+    auto filterData = thrust::universal_vector<float>(geometry.T()*geometry.R()*geometry.S()*Do*Di);
+    auto filter = reinterpret_cast<filterT>(filterData.data().get());
 #pragma omp parallel for
     for (int i = 0; i < filterData.size(); i++)
         filterData[i] = ((float)distribution(generator))/256.0f; // Use only up to 7 bits in the mantissa
@@ -453,9 +460,9 @@ void mainSparseConvolutionIGEMM(
     auto gatherIndexArrayLegacy = reinterpret_cast<GatherIndexArrayLegacyT*>(gatherIndexDataLegacy.data().get());
 
     // Per-leaf halo index map
-    using GatherIndexArrayT = uint64_t [IGEMM_Geometry::Hx][IGEMM_Geometry::Hy][IGEMM_Geometry::Hz];
-    auto gatherIndexData = thrust::universal_vector<uint64_t>(outputLeafCount*IGEMM_Geometry::Hx*IGEMM_Geometry::Hy*IGEMM_Geometry::Hz);
-    auto gatherIndexArray = reinterpret_cast<GatherIndexArrayT*>(gatherIndexData.data().get());
+    auto haloLayout = geometry.haloSpatialLayout();
+    auto gatherIndexData = thrust::universal_vector<uint64_t>(outputLeafCount*size(haloLayout));
+    auto gatherIndexArray = gatherIndexData.data().get();
 
 #pragma omp parallel for
     for (int l = 0; l < outputLeafCount; l++) {
@@ -494,10 +501,10 @@ void mainSparseConvolutionIGEMM(
         }
 
         auto offsetOrigin = origin.offsetBy(IGEMM_Geometry::Dx, IGEMM_Geometry::Dy, IGEMM_Geometry::Dz);
-        for (int i = 0; i < IGEMM_Geometry::Hx; ++i)
-        for (int j = 0; j < IGEMM_Geometry::Hy; ++j)
-        for (int k = 0; k < IGEMM_Geometry::Hz; ++k)
-            gatherIndexArray[l][i][j][k] = inputGrid->tree().getValue(offsetOrigin+nanovdb::Coord(i,j,k));
+        for (int i = 0; i < geometry.Hx(); ++i)
+        for (int j = 0; j < geometry.Hy(); ++j)
+        for (int k = 0; k < geometry.Hz(); ++k)
+            gatherIndexArray[l * size(haloLayout) + crd2idx(make_coord(i,j,k), haloLayout)] = inputGrid->tree().getValue(offsetOrigin+nanovdb::Coord(i,j,k));
     }
     gpuTimer.stop();
     

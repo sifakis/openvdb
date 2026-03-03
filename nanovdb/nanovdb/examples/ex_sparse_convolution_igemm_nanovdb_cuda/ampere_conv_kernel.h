@@ -50,9 +50,6 @@ using namespace cute;
 template<class SettingsT>
 struct IGEMM_Layouts
 {
-    // static constexpr auto T = Int<SettingsT::T>{};
-    // static constexpr auto R = Int<SettingsT::R>{};
-    // static constexpr auto S = Int<SettingsT::S>{};
     static constexpr auto Z = Int<SettingsT::Z>{};
     static constexpr auto P = Int<SettingsT::P>{};
     static constexpr auto Q = Int<SettingsT::Q>{};
@@ -61,12 +58,6 @@ struct IGEMM_Layouts
     static constexpr auto Bx = Int<SettingsT::Bx>{};
     static constexpr auto By = Int<SettingsT::By>{};
     static constexpr auto Bz = Int<SettingsT::Bz>{};
-    // static constexpr auto Hx = Int<SettingsT::Hx>{};
-    // static constexpr auto Hy = Int<SettingsT::Hy>{};
-    // static constexpr auto Hz = Int<SettingsT::Hz>{};
-    // static constexpr auto CHx = Int<SettingsT::CHx>{};
-    // static constexpr auto CHy = Int<SettingsT::CHy>{};
-    // static constexpr auto CHz = Int<SettingsT::CHz>{};
     static constexpr auto CVx = Int<SettingsT::CVx>{};
     static constexpr auto CVy = Int<SettingsT::CVy>{};
     static constexpr auto CVz = Int<SettingsT::CVz>{};
@@ -204,10 +195,6 @@ struct AmperePredicatedFprop {
     // Static config for conv problem shape
     //
 
-    using T = Int<SettingsT::T>;
-    using R = Int<SettingsT::R>;
-    using S = Int<SettingsT::S>;
-
     using Z = Int<SettingsT::Z>;
     using P = Int<SettingsT::P>;
     using Q = Int<SettingsT::Q>;
@@ -219,14 +206,6 @@ struct AmperePredicatedFprop {
     using Cx = Int<SettingsT::Cx>;
     using Cy = Int<SettingsT::Cy>;
     using Cz = Int<SettingsT::Cz>;
-
-    using Hx = Int<SettingsT::Hx>;
-    using Hy = Int<SettingsT::Hy>;
-    using Hz = Int<SettingsT::Hz>;
-
-    using CHx = Int<SettingsT::CHx>;
-    using CHy = Int<SettingsT::CHy>;
-    using CHz = Int<SettingsT::CHz>;
 
     using CVx = Int<SettingsT::CVx>;
     using CVy = Int<SettingsT::CVy>;
@@ -257,8 +236,6 @@ struct AmperePredicatedFprop {
     using ElementOut = float;
 
     using ClusterShape = Shape<Cx,Cy,Cz>;
-    using HaloLayout = decltype(make_layout(Shape<Hx,Hy,Hz>{},GenRowMajor{}));
-    using ClusterHaloLayout = decltype(make_layout(Shape<CHx,CHy,CHz>{},GenRowMajor{}));
     using ClusterVoxelLayout = decltype(make_layout(Shape<CVx,CVy,CVz>{},GenRowMajor{}));
 
     using TiledMma = TiledMMA<
@@ -290,10 +267,6 @@ struct AmperePredicatedFprop {
     //
     // Stencil tensor
     //
-
-    using GmemLayoutFlt = decltype(make_ordered_layout(
-            Shape< K, Shape< C, T, R, S>>{},
-            tuple<_1, tuple<_0,_4,_3,_2>>{}));
 
     // We have 64 elements * 32b each in the major mode that we can vectorize
     // Max vector size is 128b, so lay 16 threads along the major mode with a vector size of 4
@@ -409,10 +382,11 @@ struct AmperePredicatedFprop {
         const auto& actTree = mActGrid->tree();
         auto sBIdx_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sBIdxMatrix[0];
         const auto filterOrigin = outLeaf.origin().offsetBy(SettingsT::Dx,SettingsT::Dy,SettingsT::Dz);
-        for (int v = 0; v < SettingsT::VoxelsPerLeafnodeWithHalo(); v += MaxThreadsPerBlock)
-            if ((v+threadIdx.x) < SettingsT::VoxelsPerLeafnodeWithHalo())
+        auto haloLayout = make_layout(make_shape(geometry.Hx_(), geometry.Hy_(), geometry.Hz_()), GenRowMajor{});
+        for (int v = 0; v < size(haloLayout); v += MaxThreadsPerBlock)
+            if ((v+threadIdx.x) < size(haloLayout))
             {
-                auto [i,j,k] = idx2crd(v+threadIdx.x, shape(HaloLayout{}), stride(HaloLayout{}));
+                auto [i,j,k] = idx2crd(v+threadIdx.x, shape(haloLayout), stride(haloLayout));
                 sBIdx_ptr[v+threadIdx.x] = actTree.getValue(filterOrigin.offsetBy(i,j,k));
             }
 
@@ -454,10 +428,11 @@ struct AmperePredicatedFprop {
             auto sBPred_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sBPredMatrix[0];
             Tensor sBPred = make_tensor(make_smem_ptr(sBPred_ptr), shape(sBIdx),
                 layouts.clusterActivationPredicateStride());
-            for (int v = 0; v < SettingsT::VoxelsPerClusterWithHalo(); v += MaxThreadsPerBlock)
-                if (v+threadIdx.x < SettingsT::VoxelsPerClusterWithHalo())
+            auto clusterHaloLayout = make_layout(make_shape(geometry.CHx_(), geometry.CHy_(), geometry.CHz_()), GenRowMajor{});
+            for (int v = 0; v < size(clusterHaloLayout); v += MaxThreadsPerBlock)
+                if (v+threadIdx.x < size(clusterHaloLayout))
                 {
-                    auto [i,j,k] = idx2crd(v+threadIdx.x, shape(ClusterHaloLayout{}), stride(ClusterHaloLayout{}));
+                    auto [i,j,k] = idx2crd(v+threadIdx.x, shape(clusterHaloLayout), stride(clusterHaloLayout));
                     auto coord = make_tuple(make_tuple(make_tuple(0,0,0),i,j,k),make_tuple(0,0,0,0),make_tuple(0,0,0,0));
                     sBPred(coord) = sBIdx(coord);
                 }

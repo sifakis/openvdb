@@ -40,9 +40,13 @@ struct IGEMM_Geometry
     static constexpr int P = 2;     // Y-dimension of output block
     static constexpr int Q = 2;     // Z-dimension of output block
 
-    int c, k;  // Input/output feature dimensions (runtime)
-    __hostdev__ int C() const { return c; }
-    __hostdev__ int K() const { return k; }
+    int c, k;   // Input/output feature dimensions (runtime)
+    int dx, dy, dz; // Filter offset (runtime)
+    __hostdev__ int C()  const { return c;  }
+    __hostdev__ int K()  const { return k;  }
+    __hostdev__ int Dx() const { return dx; }
+    __hostdev__ int Dy() const { return dy; }
+    __hostdev__ int Dz() const { return dz; }
 
     static constexpr int TC = 32;   // Tile size along C (input feature) dimension
     static constexpr int TK = 128;  // Tile size along K (output feature) dimension
@@ -76,14 +80,6 @@ struct IGEMM_Geometry
     static constexpr int VoxelsPerClusterNoHalo() { return CVx*CVy*CVz; }
     static constexpr int VoxelsPerClusterWithHalo() { return CHx*CHy*CHz; }
 
-    //
-    // Filter offset (coordinate offset in the input domain that the [0,0,0] filter spoke corresponds to)
-    //
-
-    static constexpr int Dx = -1; // X-coordinate offset of the minimum corner of the convolution filter
-    static constexpr int Dy = -1; // Y-coordinate offset of the minimum corner of the convolution filter
-    static constexpr int Dz = -1; // Z-coordinate offset of the minimum corner of the convolution filter
-
 };
 
 // Derived geometry with compile-time default C/K values, used for test setup
@@ -97,7 +93,7 @@ struct Test_Geometry : IGEMM_Geometry {
     static constexpr int Hy = (By*P-1)*STy+R; // Y-dimension of leaf node domain, enlarged by the necessary halo for convolution
     static constexpr int Hz = (Bz*Q-1)*STz+S; // Z-dimension of leaf node domain, enlarged by the necessary halo for convolution
     static constexpr int VoxelsPerLeafnodeWithHalo() { return Hx*Hy*Hz; }
-    Test_Geometry() : IGEMM_Geometry{C_, K_} {}
+    Test_Geometry() : IGEMM_Geometry{C_, K_, -1, -1, -1} {}
 };
 
 
@@ -107,7 +103,8 @@ void SparseConvolveCPUReference(
     nanovdb::NanoGrid<nanovdb::ValueOnIndex> *dstGrid,
     const ValueType (*filter)[GeometryT::R][GeometryT::S][Do][Di],
     const ValueType (*inputArray)[Di],
-    ValueType (*outputArray)[Do])
+    ValueType (*outputArray)[Do],
+    GeometryT geometry = {})
 {
     auto dstLeafCount = dstGrid->nodeCount<0>();
     auto srcAcc = srcGrid->getAccessor();
@@ -125,9 +122,9 @@ void SparseConvolveCPUReference(
             for ( int dk = 0; dk < GeometryT::S; ++dk )
             {
                 const auto srcCoord = nanovdb::Coord(
-                    dstCoord[0]*GeometryT::STx + di + GeometryT::Dx,
-                    dstCoord[1]*GeometryT::STy + dj + GeometryT::Dy,
-                    dstCoord[2]*GeometryT::STz + dk + GeometryT::Dz);
+                    dstCoord[0]*GeometryT::STx + di + geometry.Dx(),
+                    dstCoord[1]*GeometryT::STy + dj + geometry.Dy(),
+                    dstCoord[2]*GeometryT::STz + dk + geometry.Dz());
                 const auto srcIndex = srcAcc.getValue(srcCoord);
                 if (srcIndex)
                     for ( int out = 0; out < Do; ++out )
@@ -148,7 +145,8 @@ void SparseConvolveCudaReference(
     nanovdb::NanoGrid<nanovdb::ValueOnIndex> *dstGrid,
     const ValueType (*filter)[GeometryT::R][GeometryT::S][Do][Di],
     const ValueType (*inputArray)[Di],
-    ValueType (*outputArray)[Do])
+    ValueType (*outputArray)[Do],
+    GeometryT geometry = {})
 {
     auto dstLeafCount = dstGrid->nodeCount<0>();
 
@@ -165,9 +163,9 @@ void SparseConvolveCudaReference(
             for ( int dk = 0; dk < GeometryT::S; ++dk )
             {
                 const auto srcCoord = nanovdb::Coord(
-                    dstCoord[0]*GeometryT::STx + di + GeometryT::Dx,
-                    dstCoord[1]*GeometryT::STy + dj + GeometryT::Dy,
-                    dstCoord[2]*GeometryT::STz + dk + GeometryT::Dz);
+                    dstCoord[0]*GeometryT::STx + di + geometry.Dx(),
+                    dstCoord[1]*GeometryT::STy + dj + geometry.Dy(),
+                    dstCoord[2]*GeometryT::STz + dk + geometry.Dz());
                 const auto srcIndex = srcGrid->tree().getValue(srcCoord);
                 if (srcIndex)
                     for ( int in = 0; in < Di; ++in )
@@ -289,6 +287,8 @@ void mainSparseConvolutionIGEMM(
 {
     validateClusterActivationLayout();
 
+    Test_Geometry geometry;
+
     using BuildT = nanovdb::ValueOnIndex;
     using BufferT = nanovdb::cuda::UnifiedBuffer;
     static constexpr int Di = Test_Geometry::Di;
@@ -383,7 +383,8 @@ void mainSparseConvolutionIGEMM(
         outputGrid,
         filter,
         inputArray,
-        outputReferenceArray
+        outputReferenceArray,
+        geometry
     );
     gpuTimer.stop();
 
@@ -400,8 +401,6 @@ void mainSparseConvolutionIGEMM(
     );
     gpuTimer.stop();
 #endif
-
-    Test_Geometry geometry;
 
     IGEMM_Layouts<IGEMM_Geometry> layouts(geometry);
 

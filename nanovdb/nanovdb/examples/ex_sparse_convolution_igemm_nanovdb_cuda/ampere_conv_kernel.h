@@ -388,9 +388,9 @@ struct AmperePredicatedFprop {
 
             // Fill cluster-halo-sized sBIdx buffer for this cluster
             const auto clusterFilterOrigin = actLeafOrigin.offsetBy(
-                get<0>(clusterCoord) * SettingsT::ZZ * SettingsT::Z * SettingsT::STx + SettingsT::Dx,
-                get<1>(clusterCoord) * SettingsT::PP * SettingsT::P * SettingsT::STy + SettingsT::Dy,
-                get<2>(clusterCoord) * SettingsT::QQ * SettingsT::Q * SettingsT::STz + SettingsT::Dz);
+                get<0>(clusterCoord) * SettingsT::ZZ * SettingsT::Z * SettingsT::STx + geometry.Dx(),
+                get<1>(clusterCoord) * SettingsT::PP * SettingsT::P * SettingsT::STy + geometry.Dy(),
+                get<2>(clusterCoord) * SettingsT::QQ * SettingsT::Q * SettingsT::STz + geometry.Dz());
             for (int v = 0; v < SettingsT::VoxelsPerClusterWithHalo(); v += MaxThreadsPerBlock)
                 if ((v+threadIdx.x) < SettingsT::VoxelsPerClusterWithHalo())
                 {

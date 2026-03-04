@@ -314,13 +314,6 @@ struct AmperePredicatedFprop {
             Stride< _8, _1>>{},
             Layout<Shape < _1, _4>>{}));
 
-    // Following layout is also correct, but trades off dynamic strides in the slice for bank conflict free accesses
-    // using SmemLayoutFlt = decltype(
-    //     composition(Swizzle<3,2,3>{},
-    //                 make_ordered_layout(
-    //                     Shape<TileSizeM,TileSizeK,PIPE>{},
-    //                     tuple<       _1,       _0,  _2>{})));
-
     using SmemLayoutAtomFlt = decltype(
         composition(Swizzle<1,2,3>{},
             Layout<Shape <_8,Shape <_4, _2>>,
@@ -339,13 +332,6 @@ struct AmperePredicatedFprop {
             Layout<Shape <_16, _8>,
             Stride< _8, _1>>{},
             Layout<Shape < _1, _4>>{}));
-
-    // Following layout is also correct, but trades off dynamic strides in the slice for bank conflict free accesses
-    // using SmemLayoutAct = decltype(
-    //     composition(Swizzle<3,2,3>{},
-    //                 make_ordered_layout(
-    //                     Shape<TileSizeN,TileSizeK,PIPE>{},
-    //                     tuple<       _1,       _0,  _2>{})));
 
     using SmemLayoutAtomAct = decltype(
         composition(Swizzle<1,2,3>{},

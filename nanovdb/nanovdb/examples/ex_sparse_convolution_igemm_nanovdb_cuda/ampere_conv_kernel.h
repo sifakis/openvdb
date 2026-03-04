@@ -63,51 +63,6 @@ struct IGEMM_Layouts
     __hostdev__ IGEMM_Layouts(SettingsT g = {}) : geometry(g) {}
 
     __hostdev__
-    auto activationComposedGatherLayout(const uint64_t* gather_idx_buf)
-    {
-        // Input gather layout
-        // inner_layout(make_coord((nzpq), (csrt))) => (idx_buffer_idx, dense_c_idx)
-        auto EG = E<0>{};  // Gather basis     (1,0) (idx_buffer_idx)
-        auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)
-        auto C = geometry.C();
-        auto T = Int<SettingsT::T>{}; auto R = Int<SettingsT::R>{}; auto S = Int<SettingsT::S>{};
-        auto Bx = Int<SettingsT::Bx>{}; auto By = Int<SettingsT::By>{}; auto Bz = Int<SettingsT::Bz>{};
-        auto Z = Int<SettingsT::Z>{}; auto P = Int<SettingsT::P>{}; auto Q = Int<SettingsT::Q>{};
-        auto Hy = Int<SettingsT::Hy>{}; auto Hz = Int<SettingsT::Hz>{};
-        auto xformed_act_logical_inner = make_layout(
-            make_shape (make_shape (make_shape (        Bx,      By,  Bz),        Z,    P,  Q), make_shape (C,        T,    R, S)),
-            make_stride(make_stride(make_stride(Hy*Hz*Z*EG, Hz*P*EG, Q*EG), Hy*Hz*EG, Hz*EG, EG), make_stride(EC, Hy*Hz*EG, Hz*EG, EG)));
-
-        // outer_layout(make_coord(idx_buffer_idx, dense_c_idx)) => idx
-        // IndexedGather obtains idx by applying (gmem_base_ptr + gather_idx_buf[idx_buffer_idx] + dense_offset)
-        auto xformed_act_gather_outer = make_layout(
-            make_shape(_1{},_1{}),
-            make_stride(example::CustomStride{example::IndexedGather{gather_idx_buf}, C}, _1{}));
-
-        // Compose the inner and outer layouts
-        // gather_composed(make_coord((nzpq), (csrt))) => idx
-        return composition(
-            xformed_act_gather_outer,
-            make_arithmetic_tuple(_0{}, _0{}),
-            xformed_act_logical_inner);
-    }
-
-    __hostdev__
-    auto activationIndexLayout()
-    {
-        // Input gather index layout
-        // gather_layout_index(make_coord((ndhw), c)) => buffer_idx
-        auto C = geometry.C();
-        auto T = Int<SettingsT::T>{}; auto R = Int<SettingsT::R>{}; auto S = Int<SettingsT::S>{};
-        auto Bx = Int<SettingsT::Bx>{}; auto By = Int<SettingsT::By>{}; auto Bz = Int<SettingsT::Bz>{};
-        auto Z = Int<SettingsT::Z>{}; auto P = Int<SettingsT::P>{}; auto Q = Int<SettingsT::Q>{};
-        auto Hy = Int<SettingsT::Hy>{}; auto Hz = Int<SettingsT::Hz>{};
-        return make_layout(
-            make_shape (make_shape (make_shape (    Bx,  By, Bz),     Z,  P,   Q), make_shape (C,    T,  R,   S)),
-            make_stride(make_stride(make_stride(Hy*Hz*Z, Hz*P,  Q), Hy*Hz, Hz, _1{}), make_stride(_0{}, Hy*Hz, Hz, _1{})));
-    }
-
-    __hostdev__
     auto clusterActivationComposedGatherLayout(const uint64_t* gather_idx_buf)
     {
         // Per-cluster input gather layout (indexes into cluster-halo-sized sBIdx buffer)
@@ -237,10 +192,6 @@ struct AmperePredicatedFprop {
     using Cy = Int<SettingsT::Cy>;
     using Cz = Int<SettingsT::Cz>;
 
-    using Hx = Int<SettingsT::Hx>;
-    using Hy = Int<SettingsT::Hy>;
-    using Hz = Int<SettingsT::Hz>;
-
     using CHx = Int<SettingsT::CHx>;
     using CHy = Int<SettingsT::CHy>;
     using CHz = Int<SettingsT::CHz>;
@@ -271,7 +222,6 @@ struct AmperePredicatedFprop {
     using ElementOut = float;
 
     using ClusterShape = Shape<Cx,Cy,Cz>;
-    using HaloLayout = decltype(make_layout(Shape<Hx,Hy,Hz>{},GenRowMajor{}));
     using ClusterHaloLayout = decltype(make_layout(Shape<CHx,CHy,CHz>{},GenRowMajor{}));
     using ClusterVoxelLayout = decltype(make_layout(Shape<CVx,CVy,CVz>{},GenRowMajor{}));
 

@@ -11,7 +11,6 @@
 
 #include "ampere_conv_kernel.h"
 
-#define USE_HIERARCHICAL_BLOCK_TRAVERSAL
 
 template<typename T>
 bool bufferCheck(const T* deviceBuffer, const T* hostBuffer, size_t elem_count) {
@@ -32,14 +31,12 @@ struct IGEMM_Geometry
     static constexpr int T = 3;     // X-dimension of convolution filter
     static constexpr int R = 3;     // Y-dimension of convolution filter
     static constexpr int S = 3;     // Z-dimension of convolution filter
-    
+
+    static constexpr int St = 1;    // Convolution stride (isotropic)
+
     static constexpr int Z = 4;     // X-dimension of output block
     static constexpr int P = 2;     // Y-dimension of output block
     static constexpr int Q = 2;     // Z-dimension of output block
-
-    static constexpr int D = Z+T-1; // X-dimension of input block (inluding halo)
-    static constexpr int H = P+R-1; // Y-dimension of input block (inluding halo)
-    static constexpr int W = Q+S-1; // Z-dimension of input block (inluding halo)
 
     int c, k;  // Input/output feature dimensions (runtime)
     __hostdev__ int C() const { return c; }
@@ -64,10 +61,6 @@ struct IGEMM_Geometry
     static constexpr int Cy = 8/(PP*P);  // Cluster count along Y-dimension of leaf node
     static constexpr int Cz = 8/(QQ*Q);  // Cluster count along Z-dimension of leaf node
 
-    static constexpr int Hx = T+7;       // X-dimension of leaf node domain, enlarged by the necessary halo for convolution
-    static constexpr int Hy = R+7;       // Y-dimension of leaf node domain, enlarged by the necessary halo for convolution
-    static constexpr int Hz = S+7;       // Z-dimension of leaf node domain, enlarged by the necessary halo for convolution
-
     static constexpr int CHx = ZZ*Z+T-1; // Cluster halo (voxel width, plus halo of one cluster) count along X-dimension
     static constexpr int CHy = PP*P+R-1; // Cluster halo (voxel width, plus halo of one cluster) count along Y-dimension
     static constexpr int CHz = QQ*Q+S-1; // Cluster halo (voxel width, plus halo of one cluster) count along Z-dimension
@@ -77,7 +70,6 @@ struct IGEMM_Geometry
     static constexpr int CVz = QQ*Q;     // Voxel count per cluster along Z-dimension
 
     static constexpr int VoxelsPerLeafnodeNoHalo() { return 512; }
-    static constexpr int VoxelsPerLeafnodeWithHalo() { return Hx*Hy*Hz; }
 
     static constexpr int VoxelsPerClusterNoHalo() { return CVx*CVy*CVz; }
     static constexpr int VoxelsPerClusterWithHalo() { return CHx*CHy*CHz; }
@@ -99,6 +91,10 @@ struct Test_Geometry : IGEMM_Geometry {
     static constexpr int K_ = 128;
     static constexpr int Di = C_;
     static constexpr int Do = K_;
+    static constexpr int Hx = (Bx*Z-1)*St+T; // X-dimension of leaf node domain, enlarged by the necessary halo for convolution
+    static constexpr int Hy = (By*P-1)*St+R; // Y-dimension of leaf node domain, enlarged by the necessary halo for convolution
+    static constexpr int Hz = (Bz*Q-1)*St+S; // Z-dimension of leaf node domain, enlarged by the necessary halo for convolution
+    static constexpr int VoxelsPerLeafnodeWithHalo() { return Hx*Hy*Hz; }
     Test_Geometry() : IGEMM_Geometry{C_, K_} {}
 };
 
@@ -175,41 +171,6 @@ void SparseConvolveCudaReference(
     lambda_kernel_wrapper<<<dstLeafCount,Do>>>(convolver);
 }
 
-template<class GeometryT, int Di, int Do, class ValueType>
-void SparseConvolveScatterGatherMapsReference(
-    uint64_t (*gather_idx_buf) [GeometryT::D][GeometryT::H][GeometryT::W],
-    uint64_t (*scatter_idx_buf)[GeometryT::Z][GeometryT::P][GeometryT::Q],
-    const std::size_t blockCount,
-    const ValueType (*filter)[GeometryT::R][GeometryT::S][Do][Di],
-    const ValueType (*inputArray)[Di],
-    ValueType (*outputArray)[Do])
-{
-    auto convolver = [=] __device__ () {
-        int blockID = blockIdx.x;
-        auto gatherIndices = gather_idx_buf[blockID];
-        auto scatterIndices = scatter_idx_buf[blockID];
-        int out = threadIdx.x;
-
-        for ( int i = 0; i < GeometryT::Z; ++i )
-        for ( int j = 0; j < GeometryT::P; ++j )
-        for ( int k = 0; k < GeometryT::Q; ++k ) {
-            const auto dstIndex = scatterIndices[i][j][k];
-            if (dstIndex) {
-                outputArray[dstIndex][out] = 0.f;
-                for ( int di = 0; di < GeometryT::T; ++di )
-                for ( int dj = 0; dj < GeometryT::R; ++dj )
-                for ( int dk = 0; dk < GeometryT::S; ++dk ) {
-                    const auto srcIndex = gatherIndices[i+di][j+dj][k+dk];
-                    if (srcIndex)
-                        for ( int in = 0; in < Di; ++in )
-                            outputArray[dstIndex][out] += filter[di][dj][dk][out][in] * inputArray[srcIndex][in];
-                }
-            }
-        }
-    };
-
-    lambda_kernel_wrapper<<<blockCount,Do>>>(convolver);
-}
 
 template<int Do, class ValueType>
 void ResultCompare(
@@ -366,135 +327,7 @@ void mainSparseConvolutionIGEMM(
         filterData[i] = ((float)distribution(generator))/256.0f; // Use only up to 7 bits in the mantissa
     gpuTimer.stop();
 
-    gpuTimer.start("Initializing scatter indices");
     auto outputLeafCount = outputGrid->tree().nodeCount(0);
-    auto blockCount = outputLeafCount
-        * IGEMM_Geometry::Bx * IGEMM_Geometry::By * IGEMM_Geometry::Bz;
-
-    using ConvOp = AmperePredicatedFprop<IGEMM_Geometry>;
-#ifdef USE_HIERARCHICAL_BLOCK_TRAVERSAL
-    auto leafShape = make_shape(Int<IGEMM_Geometry::Bx>{},  Int<IGEMM_Geometry::By>{},  Int<IGEMM_Geometry::Bz>{});
-    auto blockedLeafShape = shape(zipped_divide(make_layout(leafShape), ConvOp::Tiler_N{}));
-    auto blockedLeafLayout = make_ordered_layout(
-        blockedLeafShape,
-        make_tuple(make_tuple(_2{},_1{},_0{}),make_tuple(_5{},_4{},_3{})));
-#endif
-
-    auto outputVoxelsPerBlock = IGEMM_Geometry::Z * IGEMM_Geometry::P * IGEMM_Geometry::Q;
-    using ScatterIndexLegacyT = uint64_t [IGEMM_Geometry::Z][IGEMM_Geometry::P][IGEMM_Geometry::Q];
-#ifndef USE_HIERARCHICAL_BLOCK_TRAVERSAL
-    using ScatterIndexArrayLegacyT = ScatterIndexLegacyT [IGEMM_Geometry::Bx][IGEMM_Geometry::By][IGEMM_Geometry::Bz];
-#else
-    using ScatterIndexArrayLegacyT = ScatterIndexLegacyT [IGEMM_Geometry::Bx*IGEMM_Geometry::By*IGEMM_Geometry::Bz];
-#endif
-    auto scatterIndexDataLegacy = thrust::universal_vector<uint64_t>(blockCount*outputVoxelsPerBlock);
-    auto scatterIndexArrayLegacy = reinterpret_cast<ScatterIndexArrayLegacyT*>(scatterIndexDataLegacy.data().get());
-
-    // Per-leaf non-halo index map
-    using ScatterIndexArrayT = uint64_t [8][8][8];
-    auto scatterIndexData = thrust::universal_vector<uint64_t>(outputLeafCount*512);
-    auto scatterIndexArray = reinterpret_cast<ScatterIndexArrayT*>(scatterIndexData.data().get());
-
-#pragma omp parallel for
-    for (int l = 0; l < outputLeafCount; l++) {
-        auto &leaf = outputGrid->tree().getFirstLeaf()[l];
-#ifndef USE_HIERARCHICAL_BLOCK_TRAVERSAL
-        for (int bi = 0; bi < IGEMM_Geometry::Bx; bi++)
-        for (int bj = 0; bj < IGEMM_Geometry::By; bj++)
-        for (int bk = 0; bk < IGEMM_Geometry::Bz; bk++) {
-#else
-    for (int bbi = 0; bbi < shape<1,0>(blockedLeafLayout); ++bbi)
-    for (int bbj = 0; bbj < shape<1,1>(blockedLeafLayout); ++bbj)
-    for (int bbk = 0; bbk < shape<1,2>(blockedLeafLayout); ++bbk)
-    for (int bii = 0; bii < shape<0,0>(blockedLeafLayout); ++bii)
-    for (int bjj = 0; bjj < shape<0,1>(blockedLeafLayout); ++bjj)
-    for (int bkk = 0; bkk < shape<0,2>(blockedLeafLayout); ++bkk)
-    {
-        int bi = bbi * shape<0,0>(blockedLeafLayout) + bii;
-        int bj = bbj * shape<0,1>(blockedLeafLayout) + bjj;
-        int bk = bbk * shape<0,2>(blockedLeafLayout) + bkk;
-#endif
-            nanovdb::Coord blockOffset(bi*IGEMM_Geometry::Z, bj*IGEMM_Geometry::P, bk*IGEMM_Geometry::Q);
-            for (int i = 0; i < IGEMM_Geometry::Z; i++)
-            for (int j = 0; j < IGEMM_Geometry::P; j++)
-            for (int k = 0; k < IGEMM_Geometry::Q; k++) {
-                auto localCoord = blockOffset.offsetBy(i,j,k);
-#ifndef USE_HIERARCHICAL_BLOCK_TRAVERSAL
-                scatterIndexArrayLegacy[l][bi][bj][bk][i][j][k] = leaf.getValue(localCoord);
-#else
-                scatterIndexArrayLegacy[l]
-                    [blockedLeafLayout(make_tuple(bii, bjj, bkk), make_tuple(bbi, bbj, bbk))]
-                    [i][j][k] = leaf.getValue(localCoord);
-#endif
-            }
-        }
-        for (int i = 0; i < 8; i++)
-        for (int j = 0; j < 8; j++)
-        for (int k = 0; k < 8; k++) {
-            scatterIndexArray[l][i][j][k] = leaf.getValue(nanovdb::Coord(i,j,k));
-        }
-    }
-    gpuTimer.stop();
-
-    gpuTimer.start("Initializing gather indices");
-    auto inputVoxelsPerBlock = IGEMM_Geometry::D * IGEMM_Geometry::H * IGEMM_Geometry::W;
-    using GatherIndexLegacyT = uint64_t [IGEMM_Geometry::D][IGEMM_Geometry::H][IGEMM_Geometry::W];
-#ifndef USE_HIERARCHICAL_BLOCK_TRAVERSAL
-    using GatherIndexArrayLegacyT = GatherIndexLegacyT [IGEMM_Geometry::Bx][IGEMM_Geometry::By][IGEMM_Geometry::Bz];
-#else
-    using GatherIndexArrayLegacyT = GatherIndexLegacyT [IGEMM_Geometry::Bx*IGEMM_Geometry::By*IGEMM_Geometry::Bz];
-#endif
-    auto gatherIndexDataLegacy = thrust::universal_vector<uint64_t>(blockCount*inputVoxelsPerBlock);
-    auto gatherIndexArrayLegacy = reinterpret_cast<GatherIndexArrayLegacyT*>(gatherIndexDataLegacy.data().get());
-
-    // Per-leaf halo index map
-    using GatherIndexArrayT = uint64_t [IGEMM_Geometry::Hx][IGEMM_Geometry::Hy][IGEMM_Geometry::Hz];
-    auto gatherIndexData = thrust::universal_vector<uint64_t>(outputLeafCount*IGEMM_Geometry::Hx*IGEMM_Geometry::Hy*IGEMM_Geometry::Hz);
-    auto gatherIndexArray = reinterpret_cast<GatherIndexArrayT*>(gatherIndexData.data().get());
-
-#pragma omp parallel for
-    for (int l = 0; l < outputLeafCount; l++) {
-        auto &outputLeaf = outputGrid->tree().getFirstLeaf()[l];
-        const auto origin = outputLeaf.origin();
-#ifndef USE_HIERARCHICAL_BLOCK_TRAVERSAL
-        for (int bi = 0; bi < IGEMM_Geometry::Bx; bi++)
-        for (int bj = 0; bj < IGEMM_Geometry::By; bj++)
-        for (int bk = 0; bk < IGEMM_Geometry::Bz; bk++) {
-#else
-    for (int bbi = 0; bbi < shape<1,0>(blockedLeafLayout); ++bbi)
-    for (int bbj = 0; bbj < shape<1,1>(blockedLeafLayout); ++bbj)
-    for (int bbk = 0; bbk < shape<1,2>(blockedLeafLayout); ++bbk)
-    for (int bii = 0; bii < shape<0,0>(blockedLeafLayout); ++bii)
-    for (int bjj = 0; bjj < shape<0,1>(blockedLeafLayout); ++bjj)
-    for (int bkk = 0; bkk < shape<0,2>(blockedLeafLayout); ++bkk)
-    {
-        int bi = bbi * shape<0,0>(blockedLeafLayout) + bii;
-        int bj = bbj * shape<0,1>(blockedLeafLayout) + bjj;
-        int bk = bbk * shape<0,2>(blockedLeafLayout) + bkk;
-#endif
-            nanovdb::Coord blockOffset(bi*IGEMM_Geometry::Z, bj*IGEMM_Geometry::P, bk*IGEMM_Geometry::Q);
-            for (int i = 0; i < IGEMM_Geometry::D; i++)
-            for (int j = 0; j < IGEMM_Geometry::H; j++)
-            for (int k = 0; k < IGEMM_Geometry::W; k++) {
-                auto localCoord = blockOffset.offsetBy(i+IGEMM_Geometry::Dx,j+IGEMM_Geometry::Dy,k+IGEMM_Geometry::Dz);
-                auto globalCoord = origin+localCoord;
-#ifndef USE_HIERARCHICAL_BLOCK_TRAVERSAL
-                gatherIndexArrayLegacy[l][bi][bj][bk][i][j][k] = inputGrid->tree().getValue(globalCoord);
-#else
-                gatherIndexArrayLegacy[l]
-                    [blockedLeafLayout(make_tuple(bii, bjj, bkk), make_tuple(bbi, bbj, bbk))]
-                    [i][j][k] = inputGrid->tree().getValue(globalCoord);
-#endif
-            }
-        }
-
-        auto offsetOrigin = origin.offsetBy(IGEMM_Geometry::Dx, IGEMM_Geometry::Dy, IGEMM_Geometry::Dz);
-        for (int i = 0; i < IGEMM_Geometry::Hx; ++i)
-        for (int j = 0; j < IGEMM_Geometry::Hy; ++j)
-        for (int k = 0; k < IGEMM_Geometry::Hz; ++k)
-            gatherIndexArray[l][i][j][k] = inputGrid->tree().getValue(offsetOrigin+nanovdb::Coord(i,j,k));
-    }
-    gpuTimer.stop();
     
     gpuTimer.start("Reference (GPU) execution");
     SparseConvolveCudaReference<IGEMM_Geometry, Di, Do>(
@@ -518,25 +351,6 @@ void mainSparseConvolutionIGEMM(
         outputArray
     );
     gpuTimer.stop();
-#endif
-
-#if 0
-    gpuTimer.start("Reference (Gather-Scatter) execution");
-    SparseConvolveScatterGatherMapsReference<IGEMM_Geometry, Di, Do>(
-        reinterpret_cast<GatherIndexLegacyT*>(gatherIndexArrayLegacy),
-        reinterpret_cast<ScatterIndexLegacyT*>(scatterIndexArrayLegacy),
-        blockCount,
-        filter,
-        inputArray,
-        outputArray
-    );
-    gpuTimer.stop();
-
-    ResultCompare<Do>(
-        outputValueCount,
-        outputArray,
-        outputReferenceArray
-    );
 #endif
 
     Test_Geometry geometry;

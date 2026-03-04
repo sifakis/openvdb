@@ -50,22 +50,11 @@ using namespace cute;
 template<class SettingsT>
 struct IGEMM_Layouts
 {
-    static constexpr auto T = Int<SettingsT::T>{};
-    static constexpr auto R = Int<SettingsT::R>{};
-    static constexpr auto S = Int<SettingsT::S>{};
     static constexpr auto Z = Int<SettingsT::Z>{};
     static constexpr auto P = Int<SettingsT::P>{};
     static constexpr auto Q = Int<SettingsT::Q>{};
-    static constexpr auto Bx = Int<SettingsT::Bx>{};
-    static constexpr auto By = Int<SettingsT::By>{};
-    static constexpr auto Bz = Int<SettingsT::Bz>{};
-    static constexpr auto Hx = Int<SettingsT::Hx>{};
-    static constexpr auto Hy = Int<SettingsT::Hy>{};
-    static constexpr auto Hz = Int<SettingsT::Hz>{};
-    static constexpr auto CHx = Int<SettingsT::CHx>{};
     static constexpr auto CHy = Int<SettingsT::CHy>{};
     static constexpr auto CHz = Int<SettingsT::CHz>{};
-    static constexpr auto CVx = Int<SettingsT::CVx>{};
     static constexpr auto CVy = Int<SettingsT::CVy>{};
     static constexpr auto CVz = Int<SettingsT::CVz>{};
 

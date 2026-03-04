@@ -80,20 +80,20 @@ struct IGEMM_Layouts
         // inner_layout(make_coord((nzpq), (csrt))) => (idx_buffer_idx, dense_c_idx)
         auto EG = E<0>{};  // Gather basis     (1,0) (idx_buffer_idx)
         auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)
-        auto C_ = geometry.C();
-        auto T_ = Int<SettingsT::T>{}; auto R_ = Int<SettingsT::R>{}; auto S_ = Int<SettingsT::S>{};
-        auto Bx_ = Int<SettingsT::Bx>{}; auto By_ = Int<SettingsT::By>{}; auto Bz_ = Int<SettingsT::Bz>{};
-        auto Z_ = Int<SettingsT::Z>{}; auto P_ = Int<SettingsT::P>{}; auto Q_ = Int<SettingsT::Q>{};
-        auto Hy_ = Int<SettingsT::Hy>{}; auto Hz_ = Int<SettingsT::Hz>{};
+        auto C = geometry.C();
+        auto T = Int<SettingsT::T>{}; auto R = Int<SettingsT::R>{}; auto S = Int<SettingsT::S>{};
+        auto Bx = Int<SettingsT::Bx>{}; auto By = Int<SettingsT::By>{}; auto Bz = Int<SettingsT::Bz>{};
+        auto Z = Int<SettingsT::Z>{}; auto P = Int<SettingsT::P>{}; auto Q = Int<SettingsT::Q>{};
+        auto Hy = Int<SettingsT::Hy>{}; auto Hz = Int<SettingsT::Hz>{};
         auto xformed_act_logical_inner = make_layout(
-            make_shape (make_shape (make_shape (          Bx_,        By_,    Bz_),          Z_,      P_,   Q_), make_shape (C_,          T_,      R_,  S_)),
-            make_stride(make_stride(make_stride(Hy_*Hz_*Z_*EG, Hz_*P_*EG, Q_*EG), Hy_*Hz_*EG, Hz_*EG, EG), make_stride(EC, Hy_*Hz_*EG, Hz_*EG, EG)));
+            make_shape (make_shape (make_shape (        Bx,      By,  Bz),        Z,    P,  Q), make_shape (C,        T,    R, S)),
+            make_stride(make_stride(make_stride(Hy*Hz*Z*EG, Hz*P*EG, Q*EG), Hy*Hz*EG, Hz*EG, EG), make_stride(EC, Hy*Hz*EG, Hz*EG, EG)));
 
         // outer_layout(make_coord(idx_buffer_idx, dense_c_idx)) => idx
         // IndexedGather obtains idx by applying (gmem_base_ptr + gather_idx_buf[idx_buffer_idx] + dense_offset)
         auto xformed_act_gather_outer = make_layout(
             make_shape(_1{},_1{}),
-            make_stride(example::CustomStride{example::IndexedGather{gather_idx_buf}, C_}, _1{}));
+            make_stride(example::CustomStride{example::IndexedGather{gather_idx_buf}, C}, _1{}));
 
         // Compose the inner and outer layouts
         // gather_composed(make_coord((nzpq), (csrt))) => idx
@@ -108,14 +108,55 @@ struct IGEMM_Layouts
     {
         // Input gather index layout
         // gather_layout_index(make_coord((ndhw), c)) => buffer_idx
-        auto C_ = geometry.C();
-        auto T_ = Int<SettingsT::T>{}; auto R_ = Int<SettingsT::R>{}; auto S_ = Int<SettingsT::S>{};
-        auto Bx_ = Int<SettingsT::Bx>{}; auto By_ = Int<SettingsT::By>{}; auto Bz_ = Int<SettingsT::Bz>{};
-        auto Z_ = Int<SettingsT::Z>{}; auto P_ = Int<SettingsT::P>{}; auto Q_ = Int<SettingsT::Q>{};
-        auto Hy_ = Int<SettingsT::Hy>{}; auto Hz_ = Int<SettingsT::Hz>{};
+        auto C = geometry.C();
+        auto T = Int<SettingsT::T>{}; auto R = Int<SettingsT::R>{}; auto S = Int<SettingsT::S>{};
+        auto Bx = Int<SettingsT::Bx>{}; auto By = Int<SettingsT::By>{}; auto Bz = Int<SettingsT::Bz>{};
+        auto Z = Int<SettingsT::Z>{}; auto P = Int<SettingsT::P>{}; auto Q = Int<SettingsT::Q>{};
+        auto Hy = Int<SettingsT::Hy>{}; auto Hz = Int<SettingsT::Hz>{};
         return make_layout(
-            make_shape (make_shape (make_shape (      Bx_,    By_,  Bz_),       Z_,   P_,     Q_), make_shape (C_,      T_,   R_,     S_)),
-            make_stride(make_stride(make_stride(Hy_*Hz_*Z_, Hz_*P_,  Q_), Hy_*Hz_, Hz_, _1{}), make_stride(_0{}, Hy_*Hz_, Hz_, _1{})));
+            make_shape (make_shape (make_shape (    Bx,  By, Bz),     Z,  P,   Q), make_shape (C,    T,  R,   S)),
+            make_stride(make_stride(make_stride(Hy*Hz*Z, Hz*P,  Q), Hy*Hz, Hz, _1{}), make_stride(_0{}, Hy*Hz, Hz, _1{})));
+    }
+
+    __hostdev__
+    auto clusterActivationComposedGatherLayout(const uint64_t* gather_idx_buf)
+    {
+        // Per-cluster input gather layout (indexes into cluster-halo-sized sBIdx buffer)
+        // inner_layout(make_coord((zpq), (csrt))) => (idx_buffer_idx, dense_c_idx)
+        auto EG = E<0>{};  // Gather basis     (1,0) (idx_buffer_idx)
+        auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)
+        auto C = geometry.C();
+        auto T = Int<SettingsT::T>{}; auto R = Int<SettingsT::R>{}; auto S = Int<SettingsT::S>{};
+        auto ZZ = Int<SettingsT::ZZ>{}; auto PP = Int<SettingsT::PP>{}; auto QQ = Int<SettingsT::QQ>{};
+        auto Z = Int<SettingsT::Z>{}; auto P = Int<SettingsT::P>{}; auto Q = Int<SettingsT::Q>{};
+        auto CHy = Int<SettingsT::CHy>{}; auto CHz = Int<SettingsT::CHz>{};
+        auto xformed_act_logical_inner = make_layout(
+            make_shape (make_shape (make_shape (          ZZ,        PP,  QQ),          Z,     P,  Q), make_shape (C,          T,     R, S)),
+            make_stride(make_stride(make_stride(CHy*CHz*Z*EG, CHz*P*EG, Q*EG), CHy*CHz*EG, CHz*EG, EG), make_stride(EC, CHy*CHz*EG, CHz*EG, EG)));
+
+        auto xformed_act_gather_outer = make_layout(
+            make_shape(_1{},_1{}),
+            make_stride(example::CustomStride{example::IndexedGather{gather_idx_buf}, C}, _1{}));
+
+        return composition(
+            xformed_act_gather_outer,
+            make_arithmetic_tuple(_0{}, _0{}),
+            xformed_act_logical_inner);
+    }
+
+    __hostdev__
+    auto clusterActivationIndexLayout()
+    {
+        // Per-cluster input gather index layout (indexes into cluster-halo-sized sBIdx buffer)
+        // gather_layout_index(make_coord((zpq), c)) => buffer_idx
+        auto C = geometry.C();
+        auto T = Int<SettingsT::T>{}; auto R = Int<SettingsT::R>{}; auto S = Int<SettingsT::S>{};
+        auto ZZ = Int<SettingsT::ZZ>{}; auto PP = Int<SettingsT::PP>{}; auto QQ = Int<SettingsT::QQ>{};
+        auto Z = Int<SettingsT::Z>{}; auto P = Int<SettingsT::P>{}; auto Q = Int<SettingsT::Q>{};
+        auto CHy = Int<SettingsT::CHy>{}; auto CHz = Int<SettingsT::CHz>{};
+        return make_layout(
+            make_shape (make_shape (make_shape (        ZZ,    PP,  QQ),       Z,  P,   Q), make_shape (C,      T,  R,   S)),
+            make_stride(make_stride(make_stride(CHy*CHz*Z, CHz*P,  Q), CHy*CHz, CHz, _1{}), make_stride(_0{}, CHy*CHz, CHz, _1{})));
     }
 
     __hostdev__
@@ -130,11 +171,11 @@ struct IGEMM_Layouts
     __hostdev__
     auto filterLayout()
     {
-        auto C_ = geometry.C();
-        auto K_ = geometry.K();
-        auto T_ = Int<SettingsT::T>{}; auto R_ = Int<SettingsT::R>{}; auto S_ = Int<SettingsT::S>{};
+        auto C = geometry.C();
+        auto K = geometry.K();
+        auto T = Int<SettingsT::T>{}; auto R = Int<SettingsT::R>{}; auto S = Int<SettingsT::S>{};
         return make_ordered_layout(
-            make_shape(K_, make_shape(C_, T_, R_, S_)),
+            make_shape(K, make_shape(C, T, R, S)),
             tuple<_1, tuple<_0,_4,_3,_2>>{}
         );
     }
@@ -146,15 +187,15 @@ struct IGEMM_Layouts
         // scatter_layout_index(k, make_coord((nzpq))) => buffer_idx
         auto ES = E<0>{};  // Scatter basis    (1,0) (idx_buffer_idx)
         auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)
-        auto K_ = geometry.K();
-        auto Bx_ = Int<SettingsT::Bx>{}; auto By_ = Int<SettingsT::By>{}; auto Bz_ = Int<SettingsT::Bz>{};
-        auto Z_ = Int<SettingsT::Z>{}; auto P_ = Int<SettingsT::P>{}; auto Q_ = Int<SettingsT::Q>{};
+        auto K = geometry.K();
+        auto Bx = Int<SettingsT::Bx>{}; auto By = Int<SettingsT::By>{}; auto Bz = Int<SettingsT::Bz>{};
+        auto Z = Int<SettingsT::Z>{}; auto P = Int<SettingsT::P>{}; auto Q = Int<SettingsT::Q>{};
         auto xformed_out_logical_inner = make_layout(
-            make_shape (K_, make_shape (make_shape (          Bx_,          By_,    Bz_),          Z_,        P_,   Q_)),
-            make_stride(EC, make_stride(make_stride(_64{}*Z_*ES, _8()*P_*ES, Q_*ES), _64{}*ES, _8{}*ES, ES)));
+            make_shape (K, make_shape (make_shape (      Bx,        By, Bz),      Z,      P,  Q)),
+            make_stride(EC, make_stride(make_stride(_64{}*Z*ES, _8()*P*ES, Q*ES), _64{}*ES, _8{}*ES, ES)));
         auto xformed_out_scatter_outer = make_layout(
             make_shape(_1{},_1{}),
-            make_stride(example::CustomStride{example::IndexedGather{scatter_idx_buf}, K_}, _1{}));
+            make_stride(example::CustomStride{example::IndexedGather{scatter_idx_buf}, K}, _1{}));
         return composition(
             xformed_out_scatter_outer,
             make_arithmetic_tuple(_0{},_0{}),
@@ -166,12 +207,12 @@ struct IGEMM_Layouts
     {
         // Output scatter index layout
         // scatter_layout_index(k, make_coord((nzpq))) => buffer_idx
-        auto K_ = geometry.K();
-        auto Bx_ = Int<SettingsT::Bx>{}; auto By_ = Int<SettingsT::By>{}; auto Bz_ = Int<SettingsT::Bz>{};
-        auto Z_ = Int<SettingsT::Z>{}; auto P_ = Int<SettingsT::P>{}; auto Q_ = Int<SettingsT::Q>{};
+        auto K = geometry.K();
+        auto Bx = Int<SettingsT::Bx>{}; auto By = Int<SettingsT::By>{}; auto Bz = Int<SettingsT::Bz>{};
+        auto Z = Int<SettingsT::Z>{}; auto P = Int<SettingsT::P>{}; auto Q = Int<SettingsT::Q>{};
         return make_layout(
-            make_shape (K_, make_shape (make_shape (      Bx_,      By_,  Bz_),      Z_,     P_,     Q_)),
-            make_stride(_0{}, make_stride(make_stride(_64{}*Z_, _8{}*P_,   Q_), _64{}, _8{}, _1{})));
+            make_shape (K, make_shape (make_shape (   Bx,   By, Bz),   Z,   P,   Q)),
+            make_stride(_0{}, make_stride(make_stride(_64{}*Z, _8{}*P,  Q), _64{}, _8{}, _1{})));
     }
 
     __hostdev__
@@ -265,7 +306,7 @@ struct AmperePredicatedFprop {
             } epilogue;
         };
 
-        uint64_t sBIdxMatrix[SettingsT::VoxelsPerLeafnodeWithHalo()];
+        uint64_t sBIdxMatrix[SettingsT::VoxelsPerClusterWithHalo()];
         uint64_t sCIdxMatrix[SettingsT::VoxelsPerLeafnodeNoHalo()];
         bool sBPredMatrix[SettingsT::VoxelsPerClusterWithHalo()];
         bool sCPredMatrix[SettingsT::VoxelsPerClusterNoHalo()];
@@ -388,19 +429,9 @@ struct AmperePredicatedFprop {
             sCIdx_ptr[v+threadIdx.x] = outLeaf.getValue(v+threadIdx.x);
         const auto& actTree = mActGrid->tree();
         auto sBIdx_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sBIdxMatrix[0];
-        const auto filterOrigin = outLeaf.origin().offsetBy(SettingsT::Dx,SettingsT::Dy,SettingsT::Dz);
-        for (int v = 0; v < SettingsT::VoxelsPerLeafnodeWithHalo(); v += MaxThreadsPerBlock)
-            if ((v+threadIdx.x) < SettingsT::VoxelsPerLeafnodeWithHalo())
-            {
-                auto [i,j,k] = idx2crd(v+threadIdx.x, shape(HaloLayout{}), stride(HaloLayout{}));
-                sBIdx_ptr[v+threadIdx.x] = actTree.getValue(filterOrigin.offsetBy(i,j,k));
-            }
-
-        __syncthreads();
+        const auto leafOrigin = outLeaf.origin();
 
         IGEMM_Layouts<SettingsT> layouts(geometry);
-        Tensor gAct    = make_tensor(make_gmem_ptr(actData),layouts.activationComposedGatherLayout(sBIdx_ptr));
-        Tensor sActIdx = make_tensor(make_smem_ptr(sBIdx_ptr),layouts.activationIndexLayout());
         Tensor gOut    = make_tensor(make_gmem_ptr(outData),layouts.outputComposedScatterLayout(sCIdx_ptr));
         Tensor sOutIdx = make_tensor(make_smem_ptr(sCIdx_ptr),layouts.outputIndexLayout());
 
@@ -410,22 +441,39 @@ struct AmperePredicatedFprop {
         // Set up tensors
         // NOTE: blockIdx.x projects onto act-NDHW mode, y along the flt-K mode for the sake of higher dynamic range in NDHW
         Tensor gA_mk    = local_tile(mFlt,    TilerFlt{}, make_coord(_,_));                // (BLK_M,BLK_K,m',k')
-        Tensor gB_nk    = local_tile(gAct,    TilerAct{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
-        Tensor sBIdx_nk = local_tile(sActIdx, TilerAct{}, make_coord(_,_));                // (BLK_N,BLK_K,n',_1)
         Tensor gC_mn    = local_tile(gOut,    TilerOut{}, make_coord(_,_));                // (BLK_M,BLK_N,m',n')
-        Tensor sCIdx_mn = local_tile(sOutIdx, TilerOut{}, make_coord(_,_));                // (BLK_M,BLK_N,m',n')        
-        
+        Tensor sCIdx_mn = local_tile(sOutIdx, TilerOut{}, make_coord(_,_));                // (BLK_M,BLK_N,m',n')
+
         for (int m_coord = 0; m_coord < size<2>(gA_mk); ++m_coord)
         for (int clusterID = 0; clusterID < size(ClusterShape{}); ++clusterID)
         {
             clear(accum);
-        
+
             auto clusterCoord = idx2crd(clusterID, ClusterShape{});
             auto n_coord = make_tuple(clusterCoord,_0{},_0{},_0{});
 
-            Tensor gA    = gA_mk   (_,_,m_coord,_);                                            // (BLK_M,BLK_K,k')
-            Tensor gB    = gB_nk   (_,_,n_coord,_);                                            // (BLK_N,BLK_K,_1)
-            Tensor sBIdx = sBIdx_nk(_,_,n_coord,_);                                            // (BLK_N,BLK_K,_1)
+            // Fill cluster-halo-sized sBIdx buffer for this cluster
+            const auto clusterFilterOrigin = leafOrigin.offsetBy(
+                get<0>(clusterCoord) * SettingsT::ZZ * SettingsT::Z + SettingsT::Dx,
+                get<1>(clusterCoord) * SettingsT::PP * SettingsT::P + SettingsT::Dy,
+                get<2>(clusterCoord) * SettingsT::QQ * SettingsT::Q + SettingsT::Dz);
+            for (int v = 0; v < SettingsT::VoxelsPerClusterWithHalo(); v += MaxThreadsPerBlock)
+                if ((v+threadIdx.x) < SettingsT::VoxelsPerClusterWithHalo())
+                {
+                    auto [i,j,k] = idx2crd(v+threadIdx.x, shape(ClusterHaloLayout{}), stride(ClusterHaloLayout{}));
+                    sBIdx_ptr[v+threadIdx.x] = actTree.getValue(clusterFilterOrigin.offsetBy(i,j,k));
+                }
+
+            __syncthreads();
+
+            Tensor gAct    = make_tensor(make_gmem_ptr(actData), layouts.clusterActivationComposedGatherLayout(sBIdx_ptr));
+            Tensor sActIdx = make_tensor(make_smem_ptr(sBIdx_ptr), layouts.clusterActivationIndexLayout());
+            Tensor gB_nk   = local_tile(gAct,    TilerAct{}, make_coord(_,_));             // (BLK_N,BLK_K,_1,k')
+            Tensor sBIdx_nk = local_tile(sActIdx, TilerAct{}, make_coord(_,_));            // (BLK_N,BLK_K,_1,_1)
+
+            Tensor gA    = gA_mk    (_,_,m_coord,_);                                           // (BLK_M,BLK_K,k')
+            Tensor gB    = gB_nk   (_,_,_0{},_);                                               // (BLK_N,BLK_K,_1)
+            Tensor sBIdx = sBIdx_nk(_,_,_0{},_);                                               // (BLK_N,BLK_K,_1)
             Tensor gC    = gC_mn   (_,_,m_coord,n_coord);                                      // (BLK_M,BLK_N)
             Tensor sCIdx = sCIdx_mn(_,_,m_coord,n_coord);                                      // (BLK_M,BLK_N)
             
@@ -492,8 +540,7 @@ struct AmperePredicatedFprop {
             auto tDsCPred = gmem_thr_copy_C.partition_D(sCPred);
             copy_if(gmem_tiled_copy_C, tDsCPred, tDsC, tDgC);
 
-            __syncthreads(); // necessary if the predicate tensors are built once per leafnode
+            __syncthreads(); // necessary to ensure sBIdx is not overwritten by next cluster's fill
         }
-        // __syncthreads(); // should be safe to synchronize only here; predicates built at every iteration
     }
 };

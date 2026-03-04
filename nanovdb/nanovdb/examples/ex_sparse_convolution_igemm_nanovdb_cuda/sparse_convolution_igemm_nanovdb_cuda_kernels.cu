@@ -124,7 +124,10 @@ void SparseConvolveCPUReference(
             for ( int dj = 0; dj < GeometryT::R; ++dj )
             for ( int dk = 0; dk < GeometryT::S; ++dk )
             {
-                const auto srcCoord = dstCoord.offsetBy(di+GeometryT::Dx, dj+GeometryT::Dy, dk+GeometryT::Dz);
+                const auto srcCoord = nanovdb::Coord(
+                    dstCoord[0]*GeometryT::STx + di + GeometryT::Dx,
+                    dstCoord[1]*GeometryT::STy + dj + GeometryT::Dy,
+                    dstCoord[2]*GeometryT::STz + dk + GeometryT::Dz);
                 const auto srcIndex = srcAcc.getValue(srcCoord);
                 if (srcIndex)
                     for ( int out = 0; out < Do; ++out )
@@ -161,7 +164,10 @@ void SparseConvolveCudaReference(
             for ( int dj = 0; dj < GeometryT::R; ++dj )
             for ( int dk = 0; dk < GeometryT::S; ++dk )
             {
-                const auto srcCoord = dstCoord.offsetBy(di+GeometryT::Dx, dj+GeometryT::Dy, dk+GeometryT::Dz);
+                const auto srcCoord = nanovdb::Coord(
+                    dstCoord[0]*GeometryT::STx + di + GeometryT::Dx,
+                    dstCoord[1]*GeometryT::STy + dj + GeometryT::Dy,
+                    dstCoord[2]*GeometryT::STz + dk + GeometryT::Dz);
                 const auto srcIndex = srcGrid->tree().getValue(srcCoord);
                 if (srcIndex)
                     for ( int in = 0; in < Di; ++in )

@@ -74,9 +74,10 @@ struct IGEMM_Layouts
         auto ZZ = Int<SettingsT::ZZ>{}; auto PP = Int<SettingsT::PP>{}; auto QQ = Int<SettingsT::QQ>{};
         auto Z = Int<SettingsT::Z>{}; auto P = Int<SettingsT::P>{}; auto Q = Int<SettingsT::Q>{};
         auto CHy = Int<SettingsT::CHy>{}; auto CHz = Int<SettingsT::CHz>{};
+        auto STx = Int<SettingsT::STx>{}; auto STy = Int<SettingsT::STy>{}; auto STz = Int<SettingsT::STz>{};
         auto xformed_act_logical_inner = make_layout(
-            make_shape (make_shape (make_shape (          ZZ,        PP,  QQ),          Z,     P,  Q), make_shape (C,          T,     R, S)),
-            make_stride(make_stride(make_stride(CHy*CHz*Z*EG, CHz*P*EG, Q*EG), CHy*CHz*EG, CHz*EG, EG), make_stride(EC, CHy*CHz*EG, CHz*EG, EG)));
+            make_shape (make_shape (make_shape (                ZZ,           PP,     QQ),             Z,        P,    Q), make_shape (C,          T,     R, S)),
+            make_stride(make_stride(make_stride(CHy*CHz*Z*STx*EG, CHz*P*STy*EG, Q*STz*EG), CHy*CHz*STx*EG, CHz*STy*EG, STz*EG), make_stride(EC, CHy*CHz*EG, CHz*EG, EG)));
 
         auto xformed_act_gather_outer = make_layout(
             make_shape(_1{},_1{}),
@@ -98,9 +99,10 @@ struct IGEMM_Layouts
         auto ZZ = Int<SettingsT::ZZ>{}; auto PP = Int<SettingsT::PP>{}; auto QQ = Int<SettingsT::QQ>{};
         auto Z = Int<SettingsT::Z>{}; auto P = Int<SettingsT::P>{}; auto Q = Int<SettingsT::Q>{};
         auto CHy = Int<SettingsT::CHy>{}; auto CHz = Int<SettingsT::CHz>{};
+        auto STx = Int<SettingsT::STx>{}; auto STy = Int<SettingsT::STy>{}; auto STz = Int<SettingsT::STz>{};
         return make_layout(
-            make_shape (make_shape (make_shape (        ZZ,    PP,  QQ),       Z,  P,   Q), make_shape (C,      T,  R,   S)),
-            make_stride(make_stride(make_stride(CHy*CHz*Z, CHz*P,  Q), CHy*CHz, CHz, _1{}), make_stride(_0{}, CHy*CHz, CHz, _1{})));
+            make_shape (make_shape (make_shape (            ZZ,        PP,    QQ),         Z,      P,    Q), make_shape (C,      T,  R,   S)),
+            make_stride(make_stride(make_stride(CHy*CHz*Z*STx, CHz*P*STy, Q*STz), CHy*CHz*STx, CHz*STy, STz), make_stride(_0{}, CHy*CHz, CHz, _1{})));
     }
 
     __hostdev__
@@ -109,7 +111,10 @@ struct IGEMM_Layouts
         // Input gather index layout
         // gather_layout_index(make_coord((ndhw), c)) => buffer_idx
         //     make_shape (make_shape (make_shape (       Bx,    By, Bz),       Z,   P,    Q), make_shape (  KK,  _1,  _1,  _1), make_shape (  BC,       T,   R,    S)),
-        return make_stride(make_stride(make_stride(CHy*CHz*Z, CHz*P,  Q), CHy*CHz, CHz, _1{}), make_stride(_0{},_0{},_0{},_0{}), make_stride(_0{}, CHy*CHz, CHz, _1{}));
+        auto CHy = Int<SettingsT::CHy>{}; auto CHz = Int<SettingsT::CHz>{};
+        auto Z = Int<SettingsT::Z>{}; auto P = Int<SettingsT::P>{}; auto Q = Int<SettingsT::Q>{};
+        auto STx = Int<SettingsT::STx>{}; auto STy = Int<SettingsT::STy>{}; auto STz = Int<SettingsT::STz>{};
+        return make_stride(make_stride(make_stride(CHy*CHz*Z*STx, CHz*P*STy, Q*STz), CHy*CHz*STx, CHz*STy, STz), make_stride(_0{},_0{},_0{},_0{}), make_stride(_0{}, CHy*CHz, CHz, _1{}));
     }
 
     __hostdev__
@@ -354,7 +359,11 @@ struct AmperePredicatedFprop {
             sCIdx_ptr[v+threadIdx.x] = outLeaf.getValue(v+threadIdx.x);
         const auto& actTree = mActGrid->tree();
         auto sBIdx_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sBIdxMatrix[0];
-        const auto leafOrigin = outLeaf.origin();
+        const auto outputLeafOrigin = outLeaf.origin();
+        const auto actLeafOrigin = nanovdb::Coord(
+            outputLeafOrigin[0] * SettingsT::STx,
+            outputLeafOrigin[1] * SettingsT::STy,
+            outputLeafOrigin[2] * SettingsT::STz);
 
         IGEMM_Layouts<SettingsT> layouts(geometry);
         Tensor gOut    = make_tensor(make_gmem_ptr(outData),layouts.outputComposedScatterLayout(sCIdx_ptr));
@@ -378,10 +387,10 @@ struct AmperePredicatedFprop {
             auto n_coord = make_tuple(clusterCoord,_0{},_0{},_0{});
 
             // Fill cluster-halo-sized sBIdx buffer for this cluster
-            const auto clusterFilterOrigin = leafOrigin.offsetBy(
-                get<0>(clusterCoord) * SettingsT::ZZ * SettingsT::Z + SettingsT::Dx,
-                get<1>(clusterCoord) * SettingsT::PP * SettingsT::P + SettingsT::Dy,
-                get<2>(clusterCoord) * SettingsT::QQ * SettingsT::Q + SettingsT::Dz);
+            const auto clusterFilterOrigin = actLeafOrigin.offsetBy(
+                get<0>(clusterCoord) * SettingsT::ZZ * SettingsT::Z * SettingsT::STx + SettingsT::Dx,
+                get<1>(clusterCoord) * SettingsT::PP * SettingsT::P * SettingsT::STy + SettingsT::Dy,
+                get<2>(clusterCoord) * SettingsT::QQ * SettingsT::Q * SettingsT::STz + SettingsT::Dz);
             for (int v = 0; v < SettingsT::VoxelsPerClusterWithHalo(); v += MaxThreadsPerBlock)
                 if ((v+threadIdx.x) < SettingsT::VoxelsPerClusterWithHalo())
                 {

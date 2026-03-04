@@ -41,12 +41,8 @@ struct IGEMM_Geometry
     static constexpr int H = P+R-1; // Y-dimension of input block (inluding halo)
     static constexpr int W = Q+S-1; // Z-dimension of input block (inluding halo)
 
-    static constexpr int C_ = 64;    // Input feature dimension (compile-time default)
-    int c{C_};
+    int c, k;  // Input/output feature dimensions (runtime)
     __hostdev__ int C() const { return c; }
-
-    static constexpr int K_ = 128;  // Output feature dimension (compile-time default)
-    int k{K_};
     __hostdev__ int K() const { return k; }
 
     static constexpr int TC = 32;   // Tile size along C (input feature) dimension
@@ -94,6 +90,16 @@ struct IGEMM_Geometry
     static constexpr int Dy = -1; // Y-coordinate offset of the minimum corner of the convolution filter
     static constexpr int Dz = -1; // Z-coordinate offset of the minimum corner of the convolution filter
 
+};
+
+// Derived geometry with compile-time default C/K values, used for test setup
+// and legacy reference implementations.
+struct Test_Geometry : IGEMM_Geometry {
+    static constexpr int C_ = 64;
+    static constexpr int K_ = 128;
+    static constexpr int Di = C_;
+    static constexpr int Do = K_;
+    Test_Geometry() : IGEMM_Geometry{C_, K_} {}
 };
 
 
@@ -276,8 +282,8 @@ void mainSparseConvolutionIGEMM(
 {
     using BuildT = nanovdb::ValueOnIndex;
     using BufferT = nanovdb::cuda::UnifiedBuffer;
-    static constexpr int Di = IGEMM_Geometry::C_;
-    static constexpr int Do = IGEMM_Geometry::K_;
+    static constexpr int Di = Test_Geometry::Di;
+    static constexpr int Do = Test_Geometry::Do;
     using inputArrayT = float (&) [][Di];
     using outputArrayT = float (&) [][Do];
     using filterT = float (&) [IGEMM_Geometry::T][IGEMM_Geometry::R][IGEMM_Geometry::S][Do][Di];
@@ -533,7 +539,7 @@ void mainSparseConvolutionIGEMM(
     );
 #endif
 
-    IGEMM_Geometry geometry;
+    Test_Geometry geometry;
 
     IGEMM_Layouts<IGEMM_Geometry> layouts(geometry);
 

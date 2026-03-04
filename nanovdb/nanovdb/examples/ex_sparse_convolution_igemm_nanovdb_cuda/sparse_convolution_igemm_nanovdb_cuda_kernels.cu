@@ -32,7 +32,9 @@ struct IGEMM_Geometry
     static constexpr int R = 3;     // Y-dimension of convolution filter
     static constexpr int S = 3;     // Z-dimension of convolution filter
 
-    static constexpr int St = 1;    // Convolution stride (isotropic)
+    static constexpr int STx = 1;   // Convolution stride along X
+    static constexpr int STy = 1;   // Convolution stride along Y
+    static constexpr int STz = 1;   // Convolution stride along Z
 
     static constexpr int Z = 4;     // X-dimension of output block
     static constexpr int P = 2;     // Y-dimension of output block
@@ -61,9 +63,9 @@ struct IGEMM_Geometry
     static constexpr int Cy = 8/(PP*P);  // Cluster count along Y-dimension of leaf node
     static constexpr int Cz = 8/(QQ*Q);  // Cluster count along Z-dimension of leaf node
 
-    static constexpr int CHx = ZZ*Z+T-1; // Cluster halo (voxel width, plus halo of one cluster) count along X-dimension
-    static constexpr int CHy = PP*P+R-1; // Cluster halo (voxel width, plus halo of one cluster) count along Y-dimension
-    static constexpr int CHz = QQ*Q+S-1; // Cluster halo (voxel width, plus halo of one cluster) count along Z-dimension
+    static constexpr int CHx = (ZZ*Z-1)*STx+T; // Cluster halo count along X-dimension
+    static constexpr int CHy = (PP*P-1)*STy+R; // Cluster halo count along Y-dimension
+    static constexpr int CHz = (QQ*Q-1)*STz+S; // Cluster halo count along Z-dimension
 
     static constexpr int CVx = ZZ*Z;     // Voxel count per cluster along X-dimension
     static constexpr int CVy = PP*P;     // Voxel count per cluster along Y-dimension
@@ -91,9 +93,9 @@ struct Test_Geometry : IGEMM_Geometry {
     static constexpr int K_ = 128;
     static constexpr int Di = C_;
     static constexpr int Do = K_;
-    static constexpr int Hx = (Bx*Z-1)*St+T; // X-dimension of leaf node domain, enlarged by the necessary halo for convolution
-    static constexpr int Hy = (By*P-1)*St+R; // Y-dimension of leaf node domain, enlarged by the necessary halo for convolution
-    static constexpr int Hz = (Bz*Q-1)*St+S; // Z-dimension of leaf node domain, enlarged by the necessary halo for convolution
+    static constexpr int Hx = (Bx*Z-1)*STx+T; // X-dimension of leaf node domain, enlarged by the necessary halo for convolution
+    static constexpr int Hy = (By*P-1)*STy+R; // Y-dimension of leaf node domain, enlarged by the necessary halo for convolution
+    static constexpr int Hz = (Bz*Q-1)*STz+S; // Z-dimension of leaf node domain, enlarged by the necessary halo for convolution
     static constexpr int VoxelsPerLeafnodeWithHalo() { return Hx*Hy*Hz; }
     Test_Geometry() : IGEMM_Geometry{C_, K_} {}
 };

@@ -53,8 +53,6 @@ struct IGEMM_Layouts
     static constexpr auto Z = Int<SettingsT::Z>{};
     static constexpr auto P = Int<SettingsT::P>{};
     static constexpr auto Q = Int<SettingsT::Q>{};
-    static constexpr auto CHy = Int<SettingsT::CHy>{};
-    static constexpr auto CHz = Int<SettingsT::CHz>{};
     static constexpr auto CVy = Int<SettingsT::CVy>{};
     static constexpr auto CVz = Int<SettingsT::CVz>{};
 
@@ -101,7 +99,7 @@ struct IGEMM_Layouts
         auto CHy = Int<SettingsT::CHy>{}; auto CHz = Int<SettingsT::CHz>{};
         auto STx = Int<SettingsT::STx>{}; auto STy = Int<SettingsT::STy>{}; auto STz = Int<SettingsT::STz>{};
         return make_layout(
-            make_shape (make_shape (make_shape (            ZZ,        PP,    QQ),         Z,      P,    Q), make_shape (C,      T,  R,   S)),
+            make_shape (make_shape (make_shape (           ZZ,        PP,    QQ),           Z,       P,   Q), make_shape (   C,       T,   R,    S)),
             make_stride(make_stride(make_stride(CHy*CHz*Z*STx, CHz*P*STy, Q*STz), CHy*CHz*STx, CHz*STy, STz), make_stride(_0{}, CHy*CHz, CHz, _1{})));
     }
 
@@ -109,20 +107,20 @@ struct IGEMM_Layouts
     static auto clusterActivationPredicateStride()
     {
         // Input gather index layout
-        // gather_layout_index(make_coord((ndhw), c)) => buffer_idx
-        //     make_shape (make_shape (make_shape (       Bx,    By, Bz),       Z,   P,    Q), make_shape (  KK,  _1,  _1,  _1), make_shape (  BC,       T,   R,    S)),
         auto CHy = Int<SettingsT::CHy>{}; auto CHz = Int<SettingsT::CHz>{};
         auto Z   = Int<SettingsT::Z>{};   auto P   = Int<SettingsT::P>{};   auto Q   = Int<SettingsT::Q>{};
         auto STx = Int<SettingsT::STx>{}; auto STy = Int<SettingsT::STy>{}; auto STz = Int<SettingsT::STz>{};
+        // gather_layout_index(make_coord((ndhw), c)) => buffer_idx
+        //     make_shape (make_shape (make_shape (           Bx,        By,    Bz),           Z,       P,   Q), make_shape (  KK,  _1,  _1,  _1), make_shape (  BC,       T,   R,    S)),
         return make_stride(make_stride(make_stride(CHy*CHz*Z*STx, CHz*P*STy, Q*STz), CHy*CHz*STx, CHz*STy, STz), make_stride(_0{},_0{},_0{},_0{}), make_stride(_0{}, CHy*CHz, CHz, _1{}));
     }
 
     __hostdev__
     auto filterLayout()
     {
-        auto C   = geometry.C();
-        auto K   = geometry.K();
-        auto T   = Int<SettingsT::T>{};   auto R   = Int<SettingsT::R>{};   auto S   = Int<SettingsT::S>{};
+        auto C = geometry.C();
+        auto K = geometry.K();
+        auto T = Int<SettingsT::T>{}; auto R = Int<SettingsT::R>{}; auto S = Int<SettingsT::S>{};
         return make_ordered_layout(
             make_shape(K, make_shape(C, T, R, S)),
             tuple<_1, tuple<_0,_4,_3,_2>>{}
@@ -134,13 +132,13 @@ struct IGEMM_Layouts
     {
         // Output scatter layout
         // scatter_layout_index(k, make_coord((nzpq))) => buffer_idx
-        auto ES  = E<0>{};  // Scatter basis    (1,0) (idx_buffer_idx)
-        auto EC  = E<1>{};  // Contiguous basis (0,1) (dense_offset)
-        auto K   = geometry.K();
-        auto Bx  = Int<SettingsT::Bx>{}; auto By  = Int<SettingsT::By>{}; auto Bz  = Int<SettingsT::Bz>{};
-        auto Z   = Int<SettingsT::Z>{};   auto P   = Int<SettingsT::P>{};   auto Q   = Int<SettingsT::Q>{};
+        auto ES = E<0>{};  // Scatter basis    (1,0) (idx_buffer_idx)
+        auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)
+        auto K  = geometry.K();
+        auto Bx = Int<SettingsT::Bx>{}; auto By = Int<SettingsT::By>{}; auto Bz = Int<SettingsT::Bz>{};
+        auto Z  = Int<SettingsT::Z>{};  auto P  = Int<SettingsT::P>{};  auto Q  = Int<SettingsT::Q>{};
         auto xformed_out_logical_inner = make_layout(
-            make_shape (K, make_shape (make_shape (      Bx,        By, Bz),      Z,      P,  Q)),
+            make_shape ( K, make_shape (make_shape (        Bx,        By,   Bz),        Z,       P,  Q)),
             make_stride(EC, make_stride(make_stride(_64{}*Z*ES, _8()*P*ES, Q*ES), _64{}*ES, _8{}*ES, ES)));
         auto xformed_out_scatter_outer = make_layout(
             make_shape(_1{},_1{}),
@@ -156,11 +154,11 @@ struct IGEMM_Layouts
     {
         // Output scatter index layout
         // scatter_layout_index(k, make_coord((nzpq))) => buffer_idx
-        auto K   = geometry.K();
-        auto Bx  = Int<SettingsT::Bx>{}; auto By  = Int<SettingsT::By>{}; auto Bz  = Int<SettingsT::Bz>{};
-        auto Z   = Int<SettingsT::Z>{};   auto P   = Int<SettingsT::P>{};   auto Q   = Int<SettingsT::Q>{};
+        auto K  = geometry.K();
+        auto Bx = Int<SettingsT::Bx>{}; auto By = Int<SettingsT::By>{}; auto Bz = Int<SettingsT::Bz>{};
+        auto Z  = Int<SettingsT::Z>{};  auto P  = Int<SettingsT::P>{};  auto Q  = Int<SettingsT::Q>{};
         return make_layout(
-            make_shape (K, make_shape (make_shape (   Bx,   By, Bz),   Z,   P,   Q)),
+            make_shape (   K, make_shape (make_shape (     Bx,     By, Bz),     Z,    P,    Q)),
             make_stride(_0{}, make_stride(make_stride(_64{}*Z, _8{}*P,  Q), _64{}, _8{}, _1{})));
     }
 
@@ -180,10 +178,6 @@ struct AmperePredicatedFprop {
     //
     // Static config for conv problem shape
     //
-
-    using T = Int<SettingsT::T>;
-    using R = Int<SettingsT::R>;
-    using S = Int<SettingsT::S>;
 
     using Z = Int<SettingsT::Z>;
     using P = Int<SettingsT::P>;
@@ -219,8 +213,6 @@ struct AmperePredicatedFprop {
 
     using TileSizeM = Int<size(TileM{})>;
     using TileSizeN = Int<size(TileN{})>;
-    using TileSizeK = Int<size(TileK{})>;
-    static constexpr int Stages = PIPE::value;
 
     using ElementFlt = tfloat32_t;
     using ElementAct = tfloat32_t;

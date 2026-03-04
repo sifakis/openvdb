@@ -457,12 +457,10 @@ struct AmperePredicatedFprop {
 
             Tensor gAct    = make_tensor(make_gmem_ptr(actData), layouts.clusterActivationComposedGatherLayout(sBIdx_ptr));
             Tensor sActIdx = make_tensor(make_smem_ptr(sBIdx_ptr), layouts.clusterActivationIndexLayout());
-            Tensor gB_nk   = local_tile(gAct,    TilerAct{}, make_coord(_,_));             // (BLK_N,BLK_K,_1,k')
-            Tensor sBIdx_nk = local_tile(sActIdx, TilerAct{}, make_coord(_,_));            // (BLK_N,BLK_K,_1,_1)
 
-            Tensor gA    = gA_mk    (_,_,m_coord,_);                                           // (BLK_M,BLK_K,k')
-            Tensor gB    = gB_nk   (_,_,_0{},_);                                               // (BLK_N,BLK_K,_1)
-            Tensor sBIdx = sBIdx_nk(_,_,_0{},_);                                               // (BLK_N,BLK_K,_1)
+            Tensor gA    = gA_mk(_,_,m_coord,_);                                               // (BLK_M,BLK_K,k')
+            Tensor gB    = local_tile(gAct,    TilerAct{}, make_coord(_0{},_));                // (BLK_N,BLK_K,k')
+            Tensor sBIdx = local_tile(sActIdx, TilerAct{}, make_coord(_0{},_));                // (BLK_N,BLK_K,k')
             Tensor gC    = gC_mn   (_,_,m_coord,n_coord);                                      // (BLK_M,BLK_N)
             Tensor sCIdx = sCIdx_mn(_,_,m_coord,n_coord);                                      // (BLK_M,BLK_N)
             

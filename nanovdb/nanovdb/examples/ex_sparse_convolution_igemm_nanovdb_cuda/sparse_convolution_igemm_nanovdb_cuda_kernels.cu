@@ -41,8 +41,13 @@ struct IGEMM_Geometry
     static constexpr int H = P+R-1; // Y-dimension of input block (inluding halo)
     static constexpr int W = Q+S-1; // Z-dimension of input block (inluding halo)
 
-    static constexpr int C = 64;    // Input feature dimension
-    static constexpr int K = 128;   // Output feature dimension
+    static constexpr int C_ = 64;    // Input feature dimension (compile-time default)
+    int c{C_};
+    __hostdev__ int C() const { return c; }
+
+    static constexpr int K_ = 128;  // Output feature dimension (compile-time default)
+    int k{K_};
+    __hostdev__ int K() const { return k; }
 
     static constexpr int TC = 32;   // Tile size along C (input feature) dimension
     static constexpr int TK = 128;  // Tile size along K (output feature) dimension
@@ -223,10 +228,10 @@ __launch_bounds__(Operator::MaxThreadsPerBlock, Operator::MinBlocksPerMultiproce
       const nanovdb::NanoGrid<BuildT>* inputGrid,
       const nanovdb::NanoGrid<BuildT>* outputGrid,
       const float *inputData,
-      float *outputData
+      float *outputData,
+      Operator op
   ) {
   extern __shared__ char smem_buf[];
-  Operator op;
   op(
       mFlt,
       inputGrid,
@@ -271,8 +276,8 @@ void mainSparseConvolutionIGEMM(
 {
     using BuildT = nanovdb::ValueOnIndex;
     using BufferT = nanovdb::cuda::UnifiedBuffer;
-    static constexpr int Di = IGEMM_Geometry::C;
-    static constexpr int Do = IGEMM_Geometry::K;
+    static constexpr int Di = IGEMM_Geometry::C_;
+    static constexpr int Do = IGEMM_Geometry::K_;
     using inputArrayT = float (&) [][Di];
     using outputArrayT = float (&) [][Do];
     using filterT = float (&) [IGEMM_Geometry::T][IGEMM_Geometry::R][IGEMM_Geometry::S][Do][Di];
@@ -528,12 +533,16 @@ void mainSparseConvolutionIGEMM(
     );
 #endif
 
-    IGEMM_Layouts<IGEMM_Geometry> layouts;
+    IGEMM_Geometry geometry;
+
+    IGEMM_Layouts<IGEMM_Geometry> layouts(geometry);
 
     Tensor tFilter = make_tensor(
         make_gmem_ptr(filterData.data().get()),
         layouts.filterLayout()
     );
+
+    AmperePredicatedFprop<IGEMM_Geometry> op(geometry);
 
     constexpr size_t smem_size = sizeof(typename AmperePredicatedFprop<IGEMM_Geometry>::SharedStorage);
     std::cout << "smem_size = " << smem_size << std::endl;
@@ -554,7 +563,8 @@ void mainSparseConvolutionIGEMM(
                 inputGrid,
                 outputGrid,
                 inputData.data().get(),
-                outputData.data().get()
+                outputData.data().get(),
+                op
             );
         gpuTimer.stop();
     }

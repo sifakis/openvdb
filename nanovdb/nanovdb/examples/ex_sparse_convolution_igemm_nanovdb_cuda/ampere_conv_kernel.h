@@ -56,8 +56,6 @@ struct IGEMM_Layouts
     static constexpr auto Z = Int<SettingsT::Z>{};
     static constexpr auto P = Int<SettingsT::P>{};
     static constexpr auto Q = Int<SettingsT::Q>{};
-    static constexpr auto C = Int<SettingsT::C>{};
-    static constexpr auto K = Int<SettingsT::K>{};
     static constexpr auto Bx = Int<SettingsT::Bx>{};
     static constexpr auto By = Int<SettingsT::By>{};
     static constexpr auto Bz = Int<SettingsT::Bz>{};
@@ -71,22 +69,31 @@ struct IGEMM_Layouts
     static constexpr auto CVy = Int<SettingsT::CVy>{};
     static constexpr auto CVz = Int<SettingsT::CVz>{};
 
+    SettingsT geometry{};
+
+    __hostdev__ IGEMM_Layouts(SettingsT g = {}) : geometry(g) {}
+
     __hostdev__
-    static auto activationComposedGatherLayout(const uint64_t* gather_idx_buf)
+    auto activationComposedGatherLayout(const uint64_t* gather_idx_buf)
     {
         // Input gather layout
         // inner_layout(make_coord((nzpq), (csrt))) => (idx_buffer_idx, dense_c_idx)
-        auto EG = E<0>{};  // Gather basis     (1,0) (idx_buffer_idx) 
-        auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)    
+        auto EG = E<0>{};  // Gather basis     (1,0) (idx_buffer_idx)
+        auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)
+        auto C_ = geometry.C();
+        auto T_ = Int<SettingsT::T>{}; auto R_ = Int<SettingsT::R>{}; auto S_ = Int<SettingsT::S>{};
+        auto Bx_ = Int<SettingsT::Bx>{}; auto By_ = Int<SettingsT::By>{}; auto Bz_ = Int<SettingsT::Bz>{};
+        auto Z_ = Int<SettingsT::Z>{}; auto P_ = Int<SettingsT::P>{}; auto Q_ = Int<SettingsT::Q>{};
+        auto Hy_ = Int<SettingsT::Hy>{}; auto Hz_ = Int<SettingsT::Hz>{};
         auto xformed_act_logical_inner = make_layout(
-            make_shape (make_shape (make_shape (        Bx,      By,   Bz),        Z,     P,  Q), make_shape ( C,        T,     R,  S)),
-            make_stride(make_stride(make_stride(Hy*Hz*Z*EG, Hz*P*EG, Q*EG), Hy*Hz*EG, Hz*EG, EG), make_stride(EC, Hy*Hz*EG, Hz*EG, EG)));
+            make_shape (make_shape (make_shape (          Bx_,        By_,    Bz_),          Z_,      P_,   Q_), make_shape (C_,          T_,      R_,  S_)),
+            make_stride(make_stride(make_stride(Hy_*Hz_*Z_*EG, Hz_*P_*EG, Q_*EG), Hy_*Hz_*EG, Hz_*EG, EG), make_stride(EC, Hy_*Hz_*EG, Hz_*EG, EG)));
 
         // outer_layout(make_coord(idx_buffer_idx, dense_c_idx)) => idx
         // IndexedGather obtains idx by applying (gmem_base_ptr + gather_idx_buf[idx_buffer_idx] + dense_offset)
         auto xformed_act_gather_outer = make_layout(
             make_shape(_1{},_1{}),
-            make_stride(example::CustomStride{example::IndexedGather{gather_idx_buf}, Int<SettingsT::C>{}}, _1{}));
+            make_stride(example::CustomStride{example::IndexedGather{gather_idx_buf}, C_}, _1{}));
 
         // Compose the inner and outer layouts
         // gather_composed(make_coord((nzpq), (csrt))) => idx
@@ -97,13 +104,18 @@ struct IGEMM_Layouts
     }
 
     __hostdev__
-    static auto activationIndexLayout()
+    auto activationIndexLayout()
     {
         // Input gather index layout
         // gather_layout_index(make_coord((ndhw), c)) => buffer_idx
+        auto C_ = geometry.C();
+        auto T_ = Int<SettingsT::T>{}; auto R_ = Int<SettingsT::R>{}; auto S_ = Int<SettingsT::S>{};
+        auto Bx_ = Int<SettingsT::Bx>{}; auto By_ = Int<SettingsT::By>{}; auto Bz_ = Int<SettingsT::Bz>{};
+        auto Z_ = Int<SettingsT::Z>{}; auto P_ = Int<SettingsT::P>{}; auto Q_ = Int<SettingsT::Q>{};
+        auto Hy_ = Int<SettingsT::Hy>{}; auto Hz_ = Int<SettingsT::Hz>{};
         return make_layout(
-            make_shape (make_shape (make_shape (     Bx,   By, Bz),     Z,  P,    Q), make_shape (   C,     T,  R,    S)),
-            make_stride(make_stride(make_stride(Hy*Hz*Z, Hz*P,  Q), Hy*Hz, Hz, _1{}), make_stride(_0{}, Hy*Hz, Hz, _1{})));
+            make_shape (make_shape (make_shape (      Bx_,    By_,  Bz_),       Z_,   P_,     Q_), make_shape (C_,      T_,   R_,     S_)),
+            make_stride(make_stride(make_stride(Hy_*Hz_*Z_, Hz_*P_,  Q_), Hy_*Hz_, Hz_, _1{}), make_stride(_0{}, Hy_*Hz_, Hz_, _1{})));
     }
 
     __hostdev__
@@ -116,27 +128,33 @@ struct IGEMM_Layouts
     }
 
     __hostdev__
-    static auto filterLayout()
+    auto filterLayout()
     {
+        auto C_ = geometry.C();
+        auto K_ = geometry.K();
+        auto T_ = Int<SettingsT::T>{}; auto R_ = Int<SettingsT::R>{}; auto S_ = Int<SettingsT::S>{};
         return make_ordered_layout(
-            make_shape(K, make_shape(C, T, R, S)),
+            make_shape(K_, make_shape(C_, T_, R_, S_)),
             tuple<_1, tuple<_0,_4,_3,_2>>{}
         );
     }
 
     __hostdev__
-    static auto outputComposedScatterLayout(const uint64_t* scatter_idx_buf)
+    auto outputComposedScatterLayout(const uint64_t* scatter_idx_buf)
     {
         // Output scatter layout
         // scatter_layout_index(k, make_coord((nzpq))) => buffer_idx
         auto ES = E<0>{};  // Scatter basis    (1,0) (idx_buffer_idx)
         auto EC = E<1>{};  // Contiguous basis (0,1) (dense_offset)
+        auto K_ = geometry.K();
+        auto Bx_ = Int<SettingsT::Bx>{}; auto By_ = Int<SettingsT::By>{}; auto Bz_ = Int<SettingsT::Bz>{};
+        auto Z_ = Int<SettingsT::Z>{}; auto P_ = Int<SettingsT::P>{}; auto Q_ = Int<SettingsT::Q>{};
         auto xformed_out_logical_inner = make_layout(
-            make_shape ( K, make_shape (make_shape (        Bx,        By,   Bz),        Z,       P,  Q)),
-            make_stride(EC, make_stride(make_stride(_64{}*Z*ES, _8()*P*ES, Q*ES), _64{}*ES, _8{}*ES, ES)));
+            make_shape (K_, make_shape (make_shape (          Bx_,          By_,    Bz_),          Z_,        P_,   Q_)),
+            make_stride(EC, make_stride(make_stride(_64{}*Z_*ES, _8()*P_*ES, Q_*ES), _64{}*ES, _8{}*ES, ES)));
         auto xformed_out_scatter_outer = make_layout(
             make_shape(_1{},_1{}),
-            make_stride(example::CustomStride{example::IndexedGather{scatter_idx_buf}, Int<SettingsT::K>{}}, _1{}));
+            make_stride(example::CustomStride{example::IndexedGather{scatter_idx_buf}, K_}, _1{}));
         return composition(
             xformed_out_scatter_outer,
             make_arithmetic_tuple(_0{},_0{}),
@@ -144,13 +162,16 @@ struct IGEMM_Layouts
     }
 
     __hostdev__
-    static auto outputIndexLayout()
+    auto outputIndexLayout()
     {
         // Output scatter index layout
         // scatter_layout_index(k, make_coord((nzpq))) => buffer_idx
+        auto K_ = geometry.K();
+        auto Bx_ = Int<SettingsT::Bx>{}; auto By_ = Int<SettingsT::By>{}; auto Bz_ = Int<SettingsT::Bz>{};
+        auto Z_ = Int<SettingsT::Z>{}; auto P_ = Int<SettingsT::P>{}; auto Q_ = Int<SettingsT::Q>{};
         return make_layout(
-            make_shape (   K, make_shape (make_shape (     Bx,     By, Bz),     Z,    P,    Q)),
-            make_stride(_0{}, make_stride(make_stride(_64{}*Z, _8{}*P,  Q), _64{}, _8{}, _1{})));
+            make_shape (K_, make_shape (make_shape (      Bx_,      By_,  Bz_),      Z_,     P_,     Q_)),
+            make_stride(_0{}, make_stride(make_stride(_64{}*Z_, _8{}*P_,   Q_), _64{}, _8{}, _1{})));
     }
 
     __hostdev__
@@ -197,9 +218,6 @@ struct AmperePredicatedFprop {
     using CVx = Int<SettingsT::CVx>;
     using CVy = Int<SettingsT::CVy>;
     using CVz = Int<SettingsT::CVz>;
-
-    using C = Int<SettingsT::C>;
-    using K = Int<SettingsT::K>;
 
     // Tiler config
     using Tiler_K = Int<SettingsT::TK>;
@@ -256,10 +274,6 @@ struct AmperePredicatedFprop {
     //
     // Stencil tensor
     //
-
-    using GmemLayoutFlt = decltype(make_ordered_layout(
-            Shape< K, Shape< C, T, R, S>>{},
-            tuple<_1, tuple<_0,_4,_3,_2>>{}));
 
     // We have 64 elements * 32b each in the major mode that we can vectorize
     // Max vector size is 128b, so lay 16 threads along the major mode with a vector size of 4
@@ -326,13 +340,20 @@ struct AmperePredicatedFprop {
     using SmemLayoutOut       = Layout<Shape<TileSizeM, TileSizeN>>;
 
     //
+    // Instance data
+    //
+    SettingsT geometry{};
+
+    __hostdev__ AmperePredicatedFprop(SettingsT g = {}) : geometry(g) {}
+
+    //
     // Conv functor (predicated IGEMM)
     //
-    template <class BuildT, class EngineFlt>
+    template <class BuildT, class EngineFlt, class LayoutFlt>
     // class ActivationTensor, class ActivationIndexTensor, class OutputTensor, class OutputIndexTensor>
     void __device__
     operator()(
-        cute::Tensor<EngineFlt, GmemLayoutFlt> mFlt,      // (K,(C,T,R,S))
+        cute::Tensor<EngineFlt, LayoutFlt> mFlt,          // (K,(C,T,R,S))
         const nanovdb::NanoGrid<BuildT>        *mActGrid,
         const nanovdb::NanoGrid<BuildT>        *mOutGrid,
         const float                            *actData,
@@ -377,10 +398,11 @@ struct AmperePredicatedFprop {
 
         __syncthreads();
 
-        Tensor gAct    = make_tensor(make_gmem_ptr(actData),IGEMM_Layouts<SettingsT>::activationComposedGatherLayout(sBIdx_ptr));
-        Tensor sActIdx = make_tensor(make_smem_ptr(sBIdx_ptr),IGEMM_Layouts<SettingsT>::activationIndexLayout());
-        Tensor gOut    = make_tensor(make_gmem_ptr(outData),IGEMM_Layouts<SettingsT>::outputComposedScatterLayout(sCIdx_ptr));
-        Tensor sOutIdx = make_tensor(make_smem_ptr(sCIdx_ptr),IGEMM_Layouts<SettingsT>::outputIndexLayout());
+        IGEMM_Layouts<SettingsT> layouts(geometry);
+        Tensor gAct    = make_tensor(make_gmem_ptr(actData),layouts.activationComposedGatherLayout(sBIdx_ptr));
+        Tensor sActIdx = make_tensor(make_smem_ptr(sBIdx_ptr),layouts.activationIndexLayout());
+        Tensor gOut    = make_tensor(make_gmem_ptr(outData),layouts.outputComposedScatterLayout(sCIdx_ptr));
+        Tensor sOutIdx = make_tensor(make_smem_ptr(sCIdx_ptr),layouts.outputIndexLayout());
 
         TiledMma tiled_mma;
         Tensor accum = partition_fragment_C(tiled_mma, TilerOut{});

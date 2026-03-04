@@ -32,9 +32,9 @@ struct IGEMM_Geometry
     static constexpr int R = 3;     // Y-dimension of convolution filter
     static constexpr int S = 3;     // Z-dimension of convolution filter
 
-    static constexpr int STx = 1;   // Convolution stride along X
-    static constexpr int STy = 1;   // Convolution stride along Y
-    static constexpr int STz = 1;   // Convolution stride along Z
+    static constexpr int STx = 2;   // Convolution stride along X
+    static constexpr int STy = 2;   // Convolution stride along Y
+    static constexpr int STz = 2;   // Convolution stride along Z
 
     static constexpr int Z = 4;     // X-dimension of output block
     static constexpr int P = 2;     // Y-dimension of output block
@@ -244,11 +244,51 @@ void printGridDiagnostics(nanovdb::GridHandle<BufferT>& handle)
     std::cout << "Memory usage             : " << gridSize << " bytes" << std::endl;
 }
 
+void validateClusterActivationLayout()
+{
+    using G = IGEMM_Geometry;
+    Test_Geometry geometry;
+    IGEMM_Layouts<G> layouts(geometry);
+    auto indexLayout = layouts.clusterActivationIndexLayout();
+
+    int errors = 0, checks = 0;
+    for (int zz = 0; zz < G::ZZ; zz++)
+    for (int pp = 0; pp < G::PP; pp++)
+    for (int qq = 0; qq < G::QQ; qq++)
+    for (int z  = 0; z  < G::Z;  z++ )
+    for (int p  = 0; p  < G::P;  p++ )
+    for (int q  = 0; q  < G::Q;  q++ )
+    for (int t  = 0; t  < G::T;  t++ )
+    for (int r  = 0; r  < G::R;  r++ )
+    for (int s  = 0; s  < G::S;  s++ )
+    {
+        auto coord = make_coord(
+            make_coord(make_coord(zz, pp, qq), z, p, q),
+            make_coord(0, t, r, s));
+
+        int got      = indexLayout(coord);
+        int expected = ((zz*G::Z+z)*G::STx + t) * G::CHy * G::CHz
+                     + ((pp*G::P+p)*G::STy + r) * G::CHz
+                     + ((qq*G::Q+q)*G::STz + s);
+        if (got != expected) {
+            std::cout << "MISMATCH at (zz,pp,qq,z,p,q,t,r,s)=("
+                      << zz<<","<<pp<<","<<qq<<","<<z<<","<<p<<","<<q<<","
+                      << t<<","<<r<<","<<s<<"): got "<<got<<" expected "<<expected<<"\n";
+            ++errors;
+        }
+        ++checks;
+    }
+    std::cout << "clusterActivationIndexLayout: "
+              << checks << " coords checked, " << errors << " errors\n";
+}
+
 void mainSparseConvolutionIGEMM(
     const std::vector<nanovdb::Coord>& inputPoints,
     const std::vector<nanovdb::Coord>& outputPoints,
     uint32_t benchmark_iters)
 {
+    validateClusterActivationLayout();
+
     using BuildT = nanovdb::ValueOnIndex;
     using BufferT = nanovdb::cuda::UnifiedBuffer;
     static constexpr int Di = Test_Geometry::Di;

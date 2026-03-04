@@ -416,11 +416,7 @@ struct AmperePredicatedFprop {
                 IGEMM_Layouts<SettingsT>::clusterActivationPredicateStride());
             for (int v = 0; v < SettingsT::VoxelsPerClusterWithHalo(); v += MaxThreadsPerBlock)
                 if (v+threadIdx.x < SettingsT::VoxelsPerClusterWithHalo())
-                {
-                    auto [i,j,k] = idx2crd(v+threadIdx.x, shape(ClusterHaloLayout{}), stride(ClusterHaloLayout{}));
-                    auto coord = make_tuple(make_tuple(make_tuple(0,0,0),i,j,k),make_tuple(0,0,0,0),make_tuple(0,0,0,0));
-                    sBPred(coord) = sBIdx(coord);
-                }
+                    sBPred_ptr[v+threadIdx.x] = (bool)sBIdx_ptr[v+threadIdx.x];
 
             auto sCPred_ptr = &reinterpret_cast<SharedStorage*>(smem_buf)->sCPredMatrix[0];
             Tensor sCPred = make_tensor(make_smem_ptr(sCPred_ptr), shape(sCIdx),

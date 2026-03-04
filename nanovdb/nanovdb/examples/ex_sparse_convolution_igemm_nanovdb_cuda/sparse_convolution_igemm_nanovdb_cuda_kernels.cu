@@ -43,6 +43,9 @@ struct IGEMM_Geometry
 
     static constexpr int C = 64;    // Input feature dimension
     static constexpr int K = 128;   // Output feature dimension
+
+    static constexpr int TC = 32;   // Tile size along C (input feature) dimension
+    static constexpr int TK = 128;  // Tile size along K (output feature) dimension
     
     //
     // Leaf node geometry

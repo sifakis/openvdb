@@ -202,8 +202,8 @@ struct AmperePredicatedFprop {
     using K = Int<SettingsT::K>;
 
     // Tiler config
-    using Tiler_K = decltype(cute::min(K{}, _128{}));
-    using Tiler_C = decltype(cute::min(C{}, _32{}));
+    using Tiler_K = Int<SettingsT::TK>;
+    using Tiler_C = Int<SettingsT::TC>;
     using Tiler_N = Shape<ZZ, PP, QQ>;
     using TileM   = Tiler_K;
     using TileN   = Shape<Tiler_N, Z, P, Q>;

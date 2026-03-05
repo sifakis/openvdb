@@ -40,8 +40,8 @@ struct IGEMM_Geometry
     static constexpr int P = 2;     // Y-dimension of output block
     static constexpr int Q = 2;     // Z-dimension of output block
 
-    int c, k;   // Input/output feature dimensions (runtime)
-    int dx, dy, dz; // Filter offset (runtime)
+    int c, k;                       // Input/output feature dimensions (runtime)
+    int dx, dy, dz;                 // Filter offset (runtime)
     __hostdev__ int C()  const { return c;  }
     __hostdev__ int K()  const { return k;  }
     __hostdev__ int Dx() const { return dx; }

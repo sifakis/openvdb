@@ -323,7 +323,7 @@ struct IGEMM_Layouts
 };
 
 template<class SettingsT>
-struct AmperePredicatedFprop {
+struct SparseFpropSm80 {
     //
     // Static config for conv problem shape
     //
@@ -477,7 +477,7 @@ struct AmperePredicatedFprop {
     //
     SettingsT geometry{};
 
-    __hostdev__ AmperePredicatedFprop(SettingsT g = {}) : geometry(g) {}
+    __hostdev__ SparseFpropSm80(SettingsT g = {}) : geometry(g) {}
 
     //
     // Conv functor (predicated IGEMM)

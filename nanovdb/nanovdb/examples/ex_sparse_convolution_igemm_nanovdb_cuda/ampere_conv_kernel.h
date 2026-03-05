@@ -304,10 +304,6 @@ struct AmperePredicatedFprop {
     // Static config for conv problem shape
     //
 
-    using T = Int<SettingsT::T>;
-    using R = Int<SettingsT::R>;
-    using S = Int<SettingsT::S>;
-
     using Z = Int<SettingsT::Z>;
     using P = Int<SettingsT::P>;
     using Q = Int<SettingsT::Q>;

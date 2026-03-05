@@ -409,14 +409,14 @@ void mainSparseConvolutionIGEMM(
         layouts.filterLayout()
     );
 
-    AmperePredicatedFprop<IGEMM_Geometry> op(geometry);
+    SparseFpropSm80Strided<IGEMM_Geometry> op(geometry);
 
-    constexpr size_t smem_size = sizeof(typename AmperePredicatedFprop<IGEMM_Geometry>::SharedStorage);
+    constexpr size_t smem_size = sizeof(typename SparseFpropSm80Strided<IGEMM_Geometry>::SharedStorage);
     std::cout << "smem_size = " << smem_size << std::endl;
 
     cudaCheck(
         cudaFuncSetAttribute(
-            kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, BuildT, decltype(tFilter)>,
+            kernel_entrypoint_custom<SparseFpropSm80Strided<IGEMM_Geometry>, BuildT, decltype(tFilter)>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             smem_size
         ));
@@ -424,8 +424,8 @@ void mainSparseConvolutionIGEMM(
     int num_iterations = 10;
     for (int i = 0; i < num_iterations; ++i) {
         gpuTimer.start("Scatter-Gather Cutlass IGEMM (GPU) execution");
-        kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, BuildT, decltype(tFilter)>
-            <<<outputLeafCount, AmperePredicatedFprop<IGEMM_Geometry>::MaxThreadsPerBlock, smem_size>>>(
+        kernel_entrypoint_custom<SparseFpropSm80Strided<IGEMM_Geometry>, BuildT, decltype(tFilter)>
+            <<<outputLeafCount, SparseFpropSm80Strided<IGEMM_Geometry>::MaxThreadsPerBlock, smem_size>>>(
                 tFilter,
                 inputGrid,
                 outputGrid,

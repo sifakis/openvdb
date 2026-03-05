@@ -33,10 +33,6 @@
 #include "cute/tensor.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cute/atom/copy_atom.hpp"
-#include <random>
-
-#include "cutlass/util/print_error.hpp"
-
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/collective/collective_mma_decl.hpp"
 
@@ -265,7 +261,7 @@ struct IGEMM_Layouts
 };
 
 template<class SettingsT>
-struct AmperePredicatedFprop {
+struct SparseFpropSm80Strided {
     //
     // Static config for conv problem shape
     //
@@ -398,7 +394,7 @@ struct AmperePredicatedFprop {
     //
     SettingsT geometry{};
 
-    __hostdev__ AmperePredicatedFprop(SettingsT g = {}) : geometry(g) {}
+    __hostdev__ SparseFpropSm80Strided(SettingsT g = {}) : geometry(g) {}
 
     //
     // Conv functor (predicated IGEMM)

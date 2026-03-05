@@ -30,6 +30,14 @@
  **************************************************************************************************/
 #pragma once
 
+#include "cutlass/arch/arch.h"
+#include "cutlass/gemm/gemm.h"
+
+#include "cute/layout.hpp"
+#include "cute/numeric/integral_constant.hpp" // cute::false_type
+#include "cute/atom/copy_traits_sm100.hpp"
+#include "cutlass/detail/collective/sm103_kernel_type.hpp"
+
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 
@@ -38,6 +46,29 @@
 #include "cute/algorithm/gemm.hpp"
 #include "cute/numeric/arithmetic_tuple.hpp"
 
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+namespace cutlass::gemm {
+using namespace cute;
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+//
+// Collective Mainloop Policies
+//
+
+// n-buffer in smem (cp.async), pipelined with registers, with predicated B-matrix gather loads
+template<int Stages_>
+struct MainloopSm80CpAsyncPredGatherB {
+  constexpr static int Stages = Stages_;
+  using ArchTag = arch::Sm80;
+  using Schedule = KernelMultistage;
+  using ClusterShape = Shape<_1,_1,_1>;
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+} // namespace cutlass::gemm
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -62,7 +93,7 @@ template <
   class SmemCopyAtomB_,
   class TransformB_>
 struct CollectiveMma<
-    MainloopSm80CpAsyncUnpredicatedCustom<Stages>,
+    MainloopSm80CpAsyncPredGatherB<Stages>,
     TileShape_,
     ElementA_,
     StrideA_,

@@ -33,18 +33,131 @@
 #include "cute/tensor.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cute/atom/copy_atom.hpp"
-#include <random>
-
-#include "cutlass/util/print_error.hpp"
-
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/collective/collective_mma_decl.hpp"
 
-#include "dispatch_policy_custom.hpp"
-#include "sm80_mma_multistage_custom.hpp"
-#include "gather_tensor.hpp"
+#include "sm80_mma_multistage_predgatherb.hpp"
 
 using namespace cute;
+
+namespace example {
+using namespace cute;
+
+/// Function object that applies an index to its argument
+template <class Index>
+struct IndexedGather
+{
+  CUTE_HOST_DEVICE constexpr
+  IndexedGather(Index const *indices = {}): indices_(indices) {}
+
+  template <typename I>
+  CUTE_HOST_DEVICE constexpr
+  Index
+  operator()(I i) const { return indices_[i]; }
+
+  CUTE_HOST_DEVICE friend
+  void
+  print(IndexedGather const &s) {
+    cute::print("Indexed");
+  }
+
+  Index const *indices_;
+};
+
+/// Custom stride object that applies a function followed by a stride
+template <class Func, class Stride>
+struct CustomStride
+{
+  CUTE_HOST_DEVICE constexpr
+  CustomStride(Func const &func, Stride const &stride): func_(func), stride_(stride) {}
+
+  template <class I>
+  CUTE_HOST_DEVICE constexpr friend
+  auto
+  operator*(I i, CustomStride const &s) { return s.func_(i) * s.stride_; }
+
+  template <class I>
+  CUTE_HOST_DEVICE constexpr friend
+  auto
+  operator*(CustomStride const &s, I i) { return s.func_(i) * s.stride_; }
+
+  CUTE_HOST_DEVICE friend
+  void
+  print(CustomStride const & s) {
+    cute::print("Custom{");
+    print(s.func_);
+    cute::print(",");
+    print(s.stride_);
+    cute::print("}");
+  }
+
+  template<class Div>
+  CUTE_HOST_DEVICE constexpr friend
+  auto
+  safe_div(CustomStride const &s, Div const &div)
+  {
+    return CustomStride<Func, decltype(safe_div(s.stride_, div))>(s.func_, safe_div(s.stride_, div));
+  }
+
+  // Circumvent the requirement on make_layout that shape and stride are integral
+  template <class Shape>
+  CUTE_HOST_DEVICE constexpr friend
+  auto
+  make_layout(Shape const &shape, CustomStride const &stride)
+  {
+    return Layout<Shape, CustomStride>(shape, stride);
+  }
+
+  Func func_;
+  Stride stride_;
+};
+
+} // namespace example
+
+namespace cute {
+
+template<int N, int I, class Shape, class Stride>
+CUTE_HOST_DEVICE constexpr
+auto
+upcast(Shape const& shape, Stride const& stride)
+{
+  if constexpr (is_tuple<Shape>::value) {
+    return transform_layout(shape, stride, [](auto const& s, auto const& d) { return upcast<N,I>(s,d); });
+  } else if constexpr (is_scaled_basis<Stride>::value) {
+    if constexpr (Stride::mode() == I) {
+      return make_layout(ceil_div(shape, Int<N>{}), ceil_div(stride, Int<N>{}));
+    } else {
+      return make_layout(shape, stride);
+    }
+  } else {
+    return upcast<N>(shape, stride);
+  }
+
+  CUTE_GCC_UNREACHABLE;
+}
+
+template <int N, class OuterShape, class OuterStride, class Offset, class Shape, class Stride>
+CUTE_HOST_DEVICE constexpr
+auto
+upcast(ComposedLayout<Layout<OuterShape,OuterStride>,Offset,Layout<Shape,Stride>> const& layout)
+{
+  // Find index of the stride-1 mode - that is the only one that requires updating inner shape and offset
+  auto idx = find_if(layout.layout_a().stride(), [](auto x){ return is_constant<1, decltype(x)>{}; });
+  constexpr int I = decltype(idx)::value;
+
+  // Upcast the outer layout (works as expected)
+  auto outer = upcast<N>(layout.layout_a());
+
+  // Upcast the accumulated offset along stride-1 mode
+  auto offset = as_arithmetic_tuple(replace<I>(layout.offset(), upcast<N>(get<I>(layout.offset()))));
+
+  // Upcast the inner layout's shape along stride-1 mode
+  auto inner = upcast<N,I>(layout.layout_b().shape(), layout.layout_b().stride());
+
+  return composition(outer, offset, inner);
+}
+
+} // namespace cute
 
 
 template<class SettingsT>
@@ -363,7 +476,7 @@ struct AmperePredicatedFprop {
     {
         using namespace cute;
         using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveMma<
-            cutlass::gemm::MainloopSm80CpAsyncUnpredicatedCustom<PIPE::value>,
+            cutlass::gemm::MainloopSm80CpAsyncPredGatherB<PIPE::value>,
             Shape<TileM,TileN,TileK>,
             ElementFlt,
             Underscore, // Ignore the stride, we are passing full cute::Tensor to operator()

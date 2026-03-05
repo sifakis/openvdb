@@ -9,7 +9,7 @@
 #include <thrust/universal_vector.h>
 #include <random>
 
-#include "ampere_conv_kernel.h"
+#include "SparseFpropSm80.h"
 
 #define USE_HIERARCHICAL_BLOCK_TRAVERSAL
 

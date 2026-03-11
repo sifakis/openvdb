@@ -65,6 +65,12 @@ public:
     /// @param bandWidth Narrow band width in cell units
     void setNarrowBandWidth(float bandWidth = 3.f) { mBandWidth = bandWidth; }
 
+    /// @brief Set the child scale threshold below which the intersection test switches
+    ///        from a conservative AABB-only test to a precise SAT test.
+    ///        Default is 128 (the size of a NanoVDB lower node).
+    /// @param threshold Child scale threshold in voxel units
+    void setSATThreshold(int threshold = 128) { mSATThreshold = threshold; }
+
     /// @brief Set the mode for checksum computation, which is disabled by default
     /// @param mode Mode of checksum computation
     // void setChecksum(CheckMode mode = CheckMode::Disable){mBuilder.mChecksum = mode;}
@@ -94,6 +100,7 @@ private:
     util::cuda::Timer            mTimer;
     int                          mVerbose{0};
     float                        mBandWidth{3.f};
+    int                          mSATThreshold{128};
     const nanovdb::Vec3f         *mDevicePoints;
     const uint32_t               mPointCount;
     const nanovdb::Vec3i         *mDeviceTriangles;
@@ -643,8 +650,21 @@ void MeshToGrid<BuildT>::processLeafTrianglePairs()
         }
         auto* dCounts = static_cast<uint64_t*>(countsBuffer.deviceData());
 
-        // 3. Evaluate & Count Kernel (Grid: mBoxTrianglePairCount blocks, Block: 512 threads)
-        //    Action: Threads do AABB/SAT tests, write to Mask, block reduces count.
+        // Evaluate & Count: 1 CTA per parent pair, 512 threads per CTA.
+        // Uses AABB-only test for large child scales (>= mSATThreshold), full SAT below.
+        // padding = mBandWidth: tight bound would be mBandWidth-0.5 (geometric box already
+        // extends 0.5 beyond outermost cell centers), but we add 0.5 extra for safety.
+        int childScale = scale / 8;
+        const float padding = mBandWidth;
+        if (childScale >= mSATThreshold)
+            topology::detail::evaluateAndCountSubBoxesKernel<BuildT, true>
+                <<<mBoxTrianglePairCount, 512, 0, mStream>>>(
+                    deviceBoxTrianglePairs(), deviceXformedTriangles(), dMasks, dCounts, scale, padding);
+        else
+            topology::detail::evaluateAndCountSubBoxesKernel<BuildT, false>
+                <<<mBoxTrianglePairCount, 512, 0, mStream>>>(
+                    deviceBoxTrianglePairs(), deviceXformedTriangles(), dMasks, dCounts, scale, padding);
+        cudaCheckError();
 
         // 4. Prefix Sum (CUB InclusiveScan)
         //    Action: Computes global offsets and newTotalChildPairs
@@ -657,10 +677,9 @@ void MeshToGrid<BuildT>::processLeafTrianglePairs()
 
         // 7. The std::move Ping-Pong!
         // mBoxTrianglePairsBuffer = std::move(newChildPairsBuffer);
-        // mBoxTrianglePairCount = newTotalChildPairs; 
-        
-        // Prepare for the next subdivision tier
-        scale /= 8; 
+        // mBoxTrianglePairCount = newTotalChildPairs;
+
+        scale /= 8;
     }
 
 } // MeshToGrid<BuildT>::processLeafTrianglePairs

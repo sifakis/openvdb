@@ -700,6 +700,7 @@ void MeshToGrid<BuildT>::processLeafTrianglePairs()
         // extends 0.5 beyond outermost cell centers), but we add 0.5 extra for safety.
         int childScale = scale / 8;
         const float padding = mBandWidth;
+        if (mVerbose == 1) mTimer.start("  Evaluate & Count");
         if (childScale >= mSATThreshold)
             topology::detail::evaluateAndCountSubBoxesKernel<BuildT, true>
                 <<<mBoxTrianglePairCount, 512, 0, mStream>>>(
@@ -709,6 +710,7 @@ void MeshToGrid<BuildT>::processLeafTrianglePairs()
                 <<<mBoxTrianglePairCount, 512, 0, mStream>>>(
                     deviceBoxTrianglePairs(), deviceXformedTriangles(), dMasks, dCounts, scale, padding);
         cudaCheckError();
+        if (mVerbose == 1) mTimer.stop();
 
         // Prefix Sum: element [i+1] = exclusive write offset for parent i's children,
         // element [0] = 0, element [mBoxTrianglePairCount] = total child pair count.
@@ -739,6 +741,7 @@ void MeshToGrid<BuildT>::processLeafTrianglePairs()
         auto* dNewPairs = static_cast<BoxTrianglePair*>(newPairsBuffer.deviceData());
 
         // Scatter surviving child pairs into the new buffer
+        if (mVerbose == 1) mTimer.start("  Scatter");
         util::cuda::lambdaKernel<<<numBlocks(mBoxTrianglePairCount), mNumThreads, 0, mStream>>>(
             mBoxTrianglePairCount,
             topology::detail::ScatterChildPairsFunctor<BuildT>{
@@ -746,6 +749,7 @@ void MeshToGrid<BuildT>::processLeafTrianglePairs()
             }
         );
         cudaCheckError();
+        if (mVerbose == 1) mTimer.stop();
 
         // Ping-pong: replace the parent pair buffer with the new child pair buffer
         mBoxTrianglePairsBuffer = std::move(newPairsBuffer);

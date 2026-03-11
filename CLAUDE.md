@@ -76,8 +76,17 @@ The converter works via a hierarchical top-down subdivision approach on the GPU:
    **Padding logic**: the continuous region with UDF ≤ `mBandWidth` is `[xmin - mBandWidth, xmax + mBandWidth]`. The integer cell indices whose centers fall in that interval are `ceilf(xmin - mBandWidth)` to `floorf(xmax + mBandWidth)`. Those voxel indices are then mapped to root tile indices via `floorf(voxel * invRootDim)`.
 
 3. **`processLeafTrianglePairs()`** — Hierarchical subdivision (3 passes: 4096→512→64→8), refining `mBoxTrianglePairsBuffer` in place (ping-pong). Each pass:
-   - `evaluateAndCountSubBoxesKernel` — 1 CTA per parent pair, 512 threads (one per 8³ sub-box). Uses `testTriangleAABB<OnlyUseAABB>` for triangle-AABB intersection. Warp ballot builds `Mask<3>` with no atomics; CUB `BlockReduce` counts hits.
-   - Prefix scan → allocate child pair buffer → scatter surviving child pairs → replace parent buffer.
+   - `evaluateAndCountSubBoxesKernel` — 1 CTA per parent pair, 512 threads (one per 8³ sub-box). Uses `testTriangleAABB<OnlyUseAABB>` for triangle-AABB intersection. Warp ballot via `__ballot_sync` writes results directly into a `Mask<3>` via `reinterpret_cast` on an `alignas`-qualified `uint32_t[16]` shared array (avoids union constructor issues). `countOn()` gives hit count.
+   - AABB-only test used for `childScale >= mSATThreshold` (default 128); full SAT used below.
+   - Prefix scan → allocate child pair buffer → `ScatterChildPairsFunctor` (1 thread per parent, iterates set bits) → ping-pong swap.
+   - **padding**: `mBandWidth` is passed as padding (tight bound would be `mBandWidth - 0.5`; extra 0.5 is deliberate conservatism).
+
+**Validated on dragon.obj at voxel size 0.0005** (871K triangles, 220K reference leaves):
+- Pair counts per pass: 897K (root) → 929K → 1.3M → 8.1M (leaf/triangle pairs)
+- 278K unique leaf origins in output vs 220K reference leaves — ~27% conservatism, all reference leaves present ✓
+- Evaluate & count dominates timing (~4ms at finest scale); scatter is fast (~0.8ms)
+
+**Next step**: build the NanoVDB `ValueOnIndex` tree from the leaf/triangle pair list.
 
 The narrow-band half-width (`mBandWidth`, default 3.0 voxels) controls the geometric expansion applied during AABB overlap tests.
 

@@ -289,7 +289,7 @@ struct CountRootBoxesFunctor
 {
     const std::array<nanovdb::Vec3f, 3>* dXformedTriangles;
     uint64_t* dCounts;
-    float mPadding; // typically 2.5f for a 3-cell-width narrowband
+    float mBandWidth; 
 
     __device__
     void operator()(size_t triangleID) const
@@ -305,27 +305,26 @@ struct CountRootBoxesFunctor
         float max_y = fmaxf(tri[0][1], fmaxf(tri[1][1], tri[2][1]));
         float max_z = fmaxf(tri[0][2], fmaxf(tri[1][2], tri[2][2]));
 
-        // Apply geometric expansion (mPadding) and cell-center alignment shift (+0.5f)
-        float adj_min_x = min_x - mPadding + 0.5f;
-        float adj_min_y = min_y - mPadding + 0.5f;
-        float adj_min_z = min_z - mPadding + 0.5f;
-        
-        float adj_max_x = max_x + mPadding + 0.5f;
-        float adj_max_y = max_y + mPadding + 0.5f;
-        float adj_max_z = max_z + mPadding + 0.5f;
+        // Find the exact integer Voxel/Cell indices we must cover
+        // ceilf() gets the lowest integer >= min_valid
+        // floorf() gets the highest integer <= max_valid
+        float voxel_min_x = ceilf(min_x - mBandWidth);
+        float voxel_min_y = ceilf(min_y - mBandWidth);
+        float voxel_min_z = ceilf(min_z - mBandWidth);
 
-        // Convert padded continuous bounds to discrete Root Tile index space
-        // A NanoVDB Upper node (Root tile) spans exactly 4096^3 voxels
+        float voxel_max_x = floorf(max_x + mBandWidth);
+        float voxel_max_y = floorf(max_y + mBandWidth);
+        float voxel_max_z = floorf(max_z + mBandWidth);
+
+        // Map the required voxels to Root Node index space
         const float invRootDim = 1.0f / 4096.0f;
+        int min_i = static_cast<int>(floorf(voxel_min_x * invRootDim));
+        int min_j = static_cast<int>(floorf(voxel_min_y * invRootDim));
+        int min_k = static_cast<int>(floorf(voxel_min_z * invRootDim));
 
-        // floorf safely maps negative/positive coordinates to the correct integer index
-        int min_i = static_cast<int>(floorf(adj_min_x * invRootDim));
-        int min_j = static_cast<int>(floorf(adj_min_y * invRootDim));
-        int min_k = static_cast<int>(floorf(adj_min_z * invRootDim));
-
-        int max_i = static_cast<int>(floorf(adj_max_x * invRootDim));
-        int max_j = static_cast<int>(floorf(adj_max_y * invRootDim));
-        int max_k = static_cast<int>(floorf(adj_max_z * invRootDim));
+        int max_i = static_cast<int>(floorf(voxel_max_x * invRootDim));
+        int max_j = static_cast<int>(floorf(voxel_max_y * invRootDim));
+        int max_k = static_cast<int>(floorf(voxel_max_z * invRootDim));
 
         // Compute the 3D grid dimensions of overlapping root boxes
         uint64_t count_x = max_i - min_i + 1;
@@ -345,7 +344,7 @@ struct ScatterRootTrianglePairsFunctor
     const std::array<nanovdb::Vec3f, 3>* dXformedTriangles;
     const uint64_t* dOffsets;
     PairT* dPairs;
-    float mPadding;
+    float mBandWidth;
 
     __device__
     void operator()(size_t triangleID) const
@@ -361,24 +360,24 @@ struct ScatterRootTrianglePairsFunctor
         float max_y = fmaxf(tri[0][1], fmaxf(tri[1][1], tri[2][1]));
         float max_z = fmaxf(tri[0][2], fmaxf(tri[1][2], tri[2][2]));
 
-        // Apply geometric expansion and cell-center alignment shift
-        float adj_min_x = min_x - mPadding + 0.5f;
-        float adj_min_y = min_y - mPadding + 0.5f;
-        float adj_min_z = min_z - mPadding + 0.5f;
-        
-        float adj_max_x = max_x + mPadding + 0.5f;
-        float adj_max_y = max_y + mPadding + 0.5f;
-        float adj_max_z = max_z + mPadding + 0.5f;
+        // Find the exact integer Voxel/Cell indices we must cover
+        float voxel_min_x = ceilf(min_x - mBandWidth);
+        float voxel_min_y = ceilf(min_y - mBandWidth);
+        float voxel_min_z = ceilf(min_z - mBandWidth);
 
-        // Convert padded continuous bounds to discrete root index space
+        float voxel_max_x = floorf(max_x + mBandWidth);
+        float voxel_max_y = floorf(max_y + mBandWidth);
+        float voxel_max_z = floorf(max_z + mBandWidth);
+
+        // 3. Map the required voxels to Root Node index space
         const float invRootDim = 1.0f / 4096.0f;
-        int min_i = static_cast<int>(floorf(adj_min_x * invRootDim));
-        int min_j = static_cast<int>(floorf(adj_min_y * invRootDim));
-        int min_k = static_cast<int>(floorf(adj_min_z * invRootDim));
+        int min_i = static_cast<int>(floorf(voxel_min_x * invRootDim));
+        int min_j = static_cast<int>(floorf(voxel_min_y * invRootDim));
+        int min_k = static_cast<int>(floorf(voxel_min_z * invRootDim));
 
-        int max_i = static_cast<int>(floorf(adj_max_x * invRootDim));
-        int max_j = static_cast<int>(floorf(adj_max_y * invRootDim));
-        int max_k = static_cast<int>(floorf(adj_max_z * invRootDim));
+        int max_i = static_cast<int>(floorf(voxel_max_x * invRootDim));
+        int max_j = static_cast<int>(floorf(voxel_max_y * invRootDim));
+        int max_k = static_cast<int>(floorf(voxel_max_z * invRootDim));
 
         // Scatter the pairs into the global array
         uint64_t write_idx = dOffsets[triangleID];
@@ -418,7 +417,7 @@ void MeshToGrid<BuildT>::processRootTrianglePairs()
         topology::detail::CountRootBoxesFunctor<BuildT>{
             deviceXformedTriangles(),
             static_cast<uint64_t*>(rootBoxCounts.deviceData()),
-            mBandWidth-.5f // Due to level set values being cell-centered
+            mBandWidth
         }
     );
     cudaCheckError();
@@ -455,7 +454,7 @@ void MeshToGrid<BuildT>::processRootTrianglePairs()
             deviceXformedTriangles(),
             static_cast<uint64_t*>(rootBoxOffsets.deviceData()),
             deviceBoxTrianglePairs(),
-            mBandWidth - 0.5f
+            mBandWidth
         }
     );
 
@@ -555,63 +554,54 @@ __global__ void evaluateAndCountSubBoxesKernel(
     int parentScale,
     float padding)
 {
-    // 1 CTA perfectly evaluates 1 Parent Pair
+    // 1 CTA exactly evaluates/refines 1 parent Pair
     uint64_t parentID = blockIdx.x;
-    int threadID = threadIdx.x; // 0 to 511
+    int threadID = threadIdx.x;
 
     const auto& parentPair = dParents[parentID];
     const auto& tri = dXformedTriangles[parentPair.triangleID];
 
-    int subScale = parentScale / 8;
+    int childScale = parentScale / 8;
 
-    // 1. Thread to 3D sub-box index mapping
-    int i = threadID & 7;           // % 8
-    int j = (threadID >> 3) & 7;    // (/ 8) % 8
-    int k = (threadID >> 6) & 7;    // / 64
+    // Thread to 3D sub-box index mapping
+    int i =  threadID       & 0x7;
+    int j = (threadID >> 3) & 0x7;
+    int k = (threadID >> 6) & 0x7;
 
-    // 2. Mathematically exact bounding box for this sub-domain
-    // Voxel bounds are [origin - 0.5, origin + subScale - 0.5]
-    float centerX = parentPair.origin[0] + i * subScale + (subScale * 0.5f) - 0.5f;
-    float centerY = parentPair.origin[1] + j * subScale + (subScale * 0.5f) - 0.5f;
-    float centerZ = parentPair.origin[2] + k * subScale + (subScale * 0.5f) - 0.5f;
+    // Compute voxel-encompassing bounding box for this subdomain
+    // Voxel bounds are [origin - 0.5, origin + childScale - 0.5]
+    float centerX = parentPair.origin[0] + i * childScale + (childScale * 0.5f) - 0.5f;
+    float centerY = parentPair.origin[1] + j * childScale + (childScale * 0.5f) - 0.5f;
+    float centerZ = parentPair.origin[2] + k * childScale + (childScale * 0.5f) - 0.5f;
     
     nanovdb::Vec3f boxCenter(centerX, centerY, centerZ);
-    float halfExt = (subScale * 0.5f) + padding;
+    float halfExt = (childScale * 0.5f) + padding;
     nanovdb::Vec3f boxHalfExtents(halfExt, halfExt, halfExt);
 
-    // 3. Evaluate intersection
+    // Evaluate intersection
     bool hit = testTriangleAABB<OnlyUseAABB>(boxCenter, boxHalfExtents, tri[0], tri[1], tri[2]);
 
-    // 4. ZERO-ATOMIC Mask Building using Warp Voting
-    // Each warp (32 threads) creates a 32-bit mask of its hits.
-    __shared__ uint32_t s_words_32[16]; // 16 warps * 32 bits = 512 bits total
-    
+    // Mask Building without using atomics, via Warp Voting
+    // threadID = i + j*8 + k*64 matches NanoVDB Mask<3> bit ordering exactly,
+    // so a union of uint32_t[16] and Mask<3> lets warp ballots map directly
+    // into the mask with no stitching required.
+    __shared__ union {
+        uint32_t words32[16]; // 16 warps * 32 bits = 512 bits total
+        nanovdb::Mask<3> mask;
+    } s_shared;
+
     unsigned int ballot = __ballot_sync(0xFFFFFFFF, hit);
     if ((threadID & 31) == 0) {
-        // The first thread of each warp writes the warp's result into shared memory
-        s_words_32[threadID >> 5] = ballot;
+        // The first thread of each warp writes its ballot directly into the mask
+        s_shared.words32[threadID >> 5] = ballot;
     }
-
-    // 5. CUB Block-wide Reduction to get the total hit count
-    using BlockReduce = cub::BlockReduce<int, 512>;
-    __shared__ typename BlockReduce::TempStorage temp_storage;
-    
-    int aggregate_hits = BlockReduce(temp_storage).Sum(hit ? 1 : 0);
 
     __syncthreads();
 
-    // 6. Thread 0 safely formats and flushes the data to global memory
+    // Thread 0 flushes the mask and its popcount to global memory
     if (threadID == 0) {
-        nanovdb::Mask<3> outMask;
-        // Stitch the 32-bit words into NanoVDB's expected 64-bit words
-        for (int w = 0; w < 8; ++w) {
-            uint64_t low = s_words_32[w * 2];
-            uint64_t high = s_words_32[w * 2 + 1];
-            outMask.words()[w] = low | (high << 32);
-        }
-        
-        dMasks[parentID] = outMask;
-        dCounts[parentID] = aggregate_hits;
+        dMasks[parentID] = s_shared.mask;
+        dCounts[parentID] = s_shared.mask.countOn();
     }
 }
 
@@ -635,8 +625,8 @@ void MeshToGrid<BuildT>::processLeafTrianglePairs()
                    pass, scale, scale / 8);
         }
 
-         // 1. Allocate Mask<3> buffer for the CTA hit results
-        //    Size: mBoxTrianglePairCount * sizeof(nanovdb::Mask<3>)
+        // Allocate Mask<3> buffer for the CTA hit results
+        // Size: mBoxTrianglePairCount * sizeof(nanovdb::Mask<3>)
         nanovdb::cuda::DeviceBuffer maskBuffer = nanovdb::cuda::DeviceBuffer::create(
             mBoxTrianglePairCount * sizeof(nanovdb::Mask<3>), nullptr, device, mStream);
         if (maskBuffer.deviceData() == nullptr) {
@@ -644,8 +634,8 @@ void MeshToGrid<BuildT>::processLeafTrianglePairs()
         }
         auto* dMasks = static_cast<nanovdb::Mask<3>*>(maskBuffer.deviceData());
 
-        // 2. Allocate Counts buffer for Prefix Sum
-        //    Size: mBoxTrianglePairCount * sizeof(uint64_t)
+        // Allocate Counts buffer for Prefix Sum
+        // Size: mBoxTrianglePairCount * sizeof(uint64_t)
         nanovdb::cuda::DeviceBuffer countsBuffer = nanovdb::cuda::DeviceBuffer::create(
             mBoxTrianglePairCount * sizeof(uint64_t), nullptr, device, mStream);
         if (countsBuffer.deviceData() == nullptr) {

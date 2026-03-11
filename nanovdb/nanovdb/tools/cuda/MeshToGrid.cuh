@@ -65,10 +65,10 @@ public:
     /// @param bandWidth Narrow band width in cell units
     void setNarrowBandWidth(float bandWidth = 3.f) { mBandWidth = bandWidth; }
 
-    /// @brief Set the child scale threshold below which the intersection test switches
+    /// @brief Set the AABB scale threshold below which the intersection test switches
     ///        from a conservative AABB-only test to a precise SAT test.
     ///        Default is 128 (the size of a NanoVDB lower node).
-    /// @param threshold Child scale threshold in voxel units
+    /// @param threshold Index-space AABB scale threshold in voxel units
     void setSATThreshold(int threshold = 128) { mSATThreshold = threshold; }
 
     /// @brief Set the mode for checksum computation, which is disabled by default
@@ -590,25 +590,24 @@ __global__ void evaluateAndCountSubBoxesKernel(
 
     // Mask Building without using atomics, via Warp Voting
     // threadID = i + j*8 + k*64 matches NanoVDB Mask<3> bit ordering exactly,
-    // so a union of uint32_t[16] and Mask<3> lets warp ballots map directly
-    // into the mask with no stitching required.
-    __shared__ union {
-        uint32_t words32[16]; // 16 warps * 32 bits = 512 bits total
-        nanovdb::Mask<3> mask;
-    } s_shared;
+    // so warp ballots map directly into the mask with no stitching required.
+    // We use reinterpret_cast rather than a union to avoid Mask<3>'s non-trivial
+    // constructor deleting the union's default constructor.
+    __shared__ alignas(nanovdb::Mask<3>) uint32_t s_words32[16]; // 16 warps * 32 bits = 512 bits total
 
     unsigned int ballot = __ballot_sync(0xFFFFFFFF, hit);
     if ((threadID & 31) == 0) {
         // The first thread of each warp writes its ballot directly into the mask
-        s_shared.words32[threadID >> 5] = ballot;
+        s_words32[threadID >> 5] = ballot;
     }
 
     __syncthreads();
 
     // Thread 0 flushes the mask and its popcount to global memory
     if (threadID == 0) {
-        dMasks[parentID] = s_shared.mask;
-        dCounts[parentID] = s_shared.mask.countOn();
+        const auto& outMask = reinterpret_cast<const nanovdb::Mask<3>&>(s_words32);
+        dMasks[parentID] = outMask;
+        dCounts[parentID] = outMask.countOn();
     }
 }
 

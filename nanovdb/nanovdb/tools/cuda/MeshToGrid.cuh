@@ -89,6 +89,8 @@ private:
 
     void processRootTrianglePairs();
 
+    void enumerateRootTiles();
+
     void processLeafTrianglePairs();
 
 
@@ -110,6 +112,8 @@ private:
     nanovdb::cuda::DeviceBuffer  mXformedTriangles;
     nanovdb::cuda::DeviceBuffer  mBoxTrianglePairsBuffer;
     uint64_t                     mBoxTrianglePairCount{0};
+    nanovdb::cuda::DeviceBuffer  mUniqueRootOriginsBuffer;
+    uint64_t                     mUniqueRootTileCount{0};
 
     auto deviceXformedTriangles() { return static_cast<TriangleT*>(mXformedTriangles.deviceData()); }
     // auto hostXformedTriangles() { return static_cast<TriangleT*>(mXformedTriangles.data()); }
@@ -121,6 +125,9 @@ private:
 public:
     uint64_t getPairCount() const { return mBoxTrianglePairCount; }
     const BoxTrianglePair* getDevicePairs() const { return static_cast<const BoxTrianglePair*>(mBoxTrianglePairsBuffer.deviceData()); }
+
+    uint64_t getRootTileCount() const { return mUniqueRootTileCount; }
+    const nanovdb::Coord* getDeviceRootOrigins() const { return static_cast<const nanovdb::Coord*>(mUniqueRootOriginsBuffer.deviceData()); }
 }; // tools::cuda::MeshToGrid<BuildT>
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -158,6 +165,11 @@ MeshToGrid<BuildT>::getHandle(const BufferT &pool)
     // Process Root-Triangle pairs
     if (mVerbose==1) mTimer.start("Computing candidate RootTile-Triangle intersection pairs");
     processRootTrianglePairs();
+    if (mVerbose==1) mTimer.stop();
+
+    // Extract unique root tile origins while root-level pairs are still available
+    if (mVerbose==1) mTimer.start("Enumerating unique root tiles");
+    enumerateRootTiles();
     if (mVerbose==1) mTimer.stop();
 
     // Process Leaf-Triangle pairs
@@ -657,6 +669,123 @@ __global__ void evaluateAndCountSubBoxesKernel(
 }
 
 } // namespace topology::detail
+
+namespace topology::detail {
+
+// coordToKey / keyToCoord: encode/decode a root-tile Coord origin as a
+// sortable uint64_t key, following the convention from PointsToGrid.cuh.
+//   key     = (field_x << 42) | (field_y << 21) | field_z
+//   field_i = uint32_t(int64_t(ijk[i]) + kOffset) >> 12
+// The >>12 groups all voxels sharing a 4096^3 root tile to the same key.
+// kOffset = 1<<31 ensures the full int32_t coordinate range maps to [0, 2^32-1]
+// before the uint32_t cast, making the encoding well-defined for all coordinates.
+
+static constexpr int64_t kRootTileKeyOffset = int64_t(1) << 31;
+
+__device__ inline uint64_t coordToKey(const nanovdb::Coord& ijk)
+{
+    return  (uint64_t(uint32_t(int64_t(ijk[0]) + kRootTileKeyOffset) >> 12) << 42) |
+            (uint64_t(uint32_t(int64_t(ijk[1]) + kRootTileKeyOffset) >> 12) << 21) |
+             uint64_t(uint32_t(int64_t(ijk[2]) + kRootTileKeyOffset) >> 12);
+}
+
+__device__ inline nanovdb::Coord keyToCoord(uint64_t key)
+{
+    const uint32_t field_x = uint32_t(key >> 42);
+    const uint32_t field_y = uint32_t((key >> 21) & 0x1FFFFF);
+    const uint32_t field_z = uint32_t(key & 0x1FFFFF);
+    return nanovdb::Coord(
+        int32_t(int64_t(uint64_t(field_x) << 12) - kRootTileKeyOffset),
+        int32_t(int64_t(uint64_t(field_y) << 12) - kRootTileKeyOffset),
+        int32_t(int64_t(uint64_t(field_z) << 12) - kRootTileKeyOffset));
+}
+
+template <typename BuildT>
+struct EncodeRootOriginsFunctor
+{
+    const typename MeshToGrid<BuildT>::BoxTrianglePair* dPairs;
+    uint64_t*                                           dKeys;
+
+    __device__ void operator()(size_t i) const { dKeys[i] = coordToKey(dPairs[i].origin); }
+};
+
+template <typename BuildT>
+struct DecodeRootOriginsFunctor
+{
+    const uint64_t*  dKeys;
+    nanovdb::Coord*  dOrigins;
+
+    __device__ void operator()(size_t i) const { dOrigins[i] = keyToCoord(dKeys[i]); }
+};
+
+} // namespace topology::detail
+
+template<typename BuildT>
+void MeshToGrid<BuildT>::enumerateRootTiles()
+{
+    if (mBoxTrianglePairCount == 0) return;
+
+    int device = 0;
+    cudaGetDevice(&device);
+
+    // Step 1: Encode each pair's root origin as a sortable uint64_t key
+    if (mVerbose == 1) mTimer.restart("[In MeshToGrid::enumerateRootTiles()] Encoding origins as keys");
+
+    nanovdb::cuda::DeviceBuffer keysBuffer = nanovdb::cuda::DeviceBuffer::create(
+        mBoxTrianglePairCount * sizeof(uint64_t), nullptr, device, mStream);
+    auto* dKeys = static_cast<uint64_t*>(keysBuffer.deviceData());
+
+    util::cuda::lambdaKernel<<<numBlocks(mBoxTrianglePairCount), mNumThreads, 0, mStream>>>(
+        mBoxTrianglePairCount,
+        topology::detail::EncodeRootOriginsFunctor<BuildT>{ deviceBoxTrianglePairs(), dKeys }
+    );
+    cudaCheckError();
+
+    // Step 2: Sort keys (SortKeys requires separate in/out buffers)
+    if (mVerbose == 1) mTimer.restart("[In MeshToGrid::enumerateRootTiles()] Sorting keys");
+
+    nanovdb::cuda::DeviceBuffer sortedKeysBuffer = nanovdb::cuda::DeviceBuffer::create(
+        mBoxTrianglePairCount * sizeof(uint64_t), nullptr, device, mStream);
+    auto* dSortedKeys = static_cast<uint64_t*>(sortedKeysBuffer.deviceData());
+
+    CALL_CUBS(DeviceRadixSort::SortKeys, dKeys, dSortedKeys, (int)mBoxTrianglePairCount, 0, 64);
+
+    // Step 3: Select unique keys
+    if (mVerbose == 1) mTimer.restart("[In MeshToGrid::enumerateRootTiles()] Selecting unique keys");
+
+    nanovdb::cuda::DeviceBuffer uniqueKeysBuffer = nanovdb::cuda::DeviceBuffer::create(
+        mBoxTrianglePairCount * sizeof(uint64_t), nullptr, device, mStream);
+    auto* dUniqueKeys = static_cast<uint64_t*>(uniqueKeysBuffer.deviceData());
+
+    nanovdb::cuda::DeviceBuffer numSelectedBuffer = nanovdb::cuda::DeviceBuffer::create(
+        sizeof(int32_t), nullptr, device, mStream);
+    auto* dNumSelected = static_cast<int32_t*>(numSelectedBuffer.deviceData());
+
+    CALL_CUBS(DeviceSelect::Unique, dSortedKeys, dUniqueKeys, dNumSelected, (int)mBoxTrianglePairCount);
+
+    int32_t uniqueCount = 0;
+    cudaCheck(cudaMemcpyAsync(&uniqueCount, dNumSelected, sizeof(int32_t), cudaMemcpyDeviceToHost, mStream));
+    cudaStreamSynchronize(mStream);
+    mUniqueRootTileCount = static_cast<uint64_t>(uniqueCount);
+
+    if (mVerbose == 1) printf("Unique root tiles: %llu\n", (unsigned long long)mUniqueRootTileCount);
+
+    // Step 4: Decode unique keys back to Coord origins
+    if (mVerbose == 1) mTimer.restart("[In MeshToGrid::enumerateRootTiles()] Decoding keys to Coord origins");
+
+    mUniqueRootOriginsBuffer = nanovdb::cuda::DeviceBuffer::create(
+        mUniqueRootTileCount * sizeof(nanovdb::Coord), nullptr, device, mStream);
+    auto* dOrigins = static_cast<nanovdb::Coord*>(mUniqueRootOriginsBuffer.deviceData());
+
+    util::cuda::lambdaKernel<<<numBlocks(mUniqueRootTileCount), mNumThreads, 0, mStream>>>(
+        mUniqueRootTileCount,
+        topology::detail::DecodeRootOriginsFunctor<BuildT>{ dUniqueKeys, dOrigins }
+    );
+    cudaCheckError();
+
+} // MeshToGrid<BuildT>::enumerateRootTiles
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 template<typename BuildT>
 void MeshToGrid<BuildT>::processLeafTrianglePairs()

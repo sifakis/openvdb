@@ -471,6 +471,51 @@ void MeshToGrid<BuildT>::processRootTrianglePairs()
 
 namespace topology::detail {
 
+/// @brief Scatters surviving child BoxTrianglePairs from a subdivision pass.
+///        Launched with 1 thread per parent pair; each thread iterates over set bits
+///        in the parent's Mask<3> and writes a new BoxTrianglePair for each surviving
+///        child sub-box.
+///
+///        @note The 1-thread-per-parent approach is simple and efficient for sparse masks
+///        (typical after SAT culling at finer scales). It does incur warp divergence since
+///        different parents may have different child counts. An alternative would be a
+///        1-CTA-per-parent launch (512 threads, one per child sub-box) with a warp-level
+///        scan to compute local write offsets — better for dense masks but more complex.
+///        Profile before switching.
+template <typename BuildT>
+struct ScatterChildPairsFunctor
+{
+    using PairT = typename MeshToGrid<BuildT>::BoxTrianglePair;
+
+    const PairT*            dParents;
+    const nanovdb::Mask<3>* dMasks;
+    const uint64_t*         dOffsets;
+    PairT*                  dNewPairs;
+    int                     childScale;
+
+    __device__
+    void operator()(size_t parentID) const
+    {
+        const auto& parentPair = dParents[parentID];
+        const auto& mask       = dMasks[parentID];
+        uint64_t    writeIdx   = dOffsets[parentID];
+
+        for (uint32_t n = 0; n < 512; ++n) {
+            if (mask.isOn(n)) {
+                int i = n & 0x7;
+                int j = (n >> 3) & 0x7;
+                int k = (n >> 6) & 0x7;
+                dNewPairs[writeIdx].origin = nanovdb::Coord(
+                    parentPair.origin[0] + i * childScale,
+                    parentPair.origin[1] + j * childScale,
+                    parentPair.origin[2] + k * childScale);
+                dNewPairs[writeIdx].triangleID = parentPair.triangleID;
+                ++writeIdx;
+            }
+        }
+    }
+};
+
 /// @brief Tests if a Triangle intersects an Axis-Aligned Bounding Box.
 template <bool OnlyUseAABB>
 __device__ inline bool testTriangleAABB(
@@ -665,18 +710,46 @@ void MeshToGrid<BuildT>::processLeafTrianglePairs()
                     deviceBoxTrianglePairs(), deviceXformedTriangles(), dMasks, dCounts, scale, padding);
         cudaCheckError();
 
-        // 4. Prefix Sum (CUB InclusiveScan)
-        //    Action: Computes global offsets and newTotalChildPairs
+        // Prefix Sum: element [i+1] = exclusive write offset for parent i's children,
+        // element [0] = 0, element [mBoxTrianglePairCount] = total child pair count.
+        nanovdb::cuda::DeviceBuffer offsetsBuffer = nanovdb::cuda::DeviceBuffer::create(
+            (mBoxTrianglePairCount + 1) * sizeof(uint64_t), nullptr, device, mStream);
+        if (offsetsBuffer.deviceData() == nullptr)
+            throw std::runtime_error("Failed to allocate offsets buffer for subdivision pass");
+        auto* dOffsets = static_cast<uint64_t*>(offsetsBuffer.deviceData());
 
-        // 5. Allocate New Child Pair Buffer
-        //    Size: newTotalChildPairs * sizeof(BoxTrianglePair)
+        cudaCheck(cudaMemsetAsync(dOffsets, 0, sizeof(uint64_t), mStream));
+        CALL_CUBS(DeviceScan::InclusiveSum,
+            dCounts,
+            dOffsets + 1,
+            mBoxTrianglePairCount);
 
-        // 6. Scatter Kernel
-        //    Action: Reads the Mask<3> and writes surviving sub-boxes to the new buffer
+        uint64_t newPairCount = 0;
+        cudaCheck(cudaMemcpyAsync(&newPairCount, dOffsets + mBoxTrianglePairCount,
+            sizeof(uint64_t), cudaMemcpyDeviceToHost, mStream));
+        cudaStreamSynchronize(mStream);
 
-        // 7. The std::move Ping-Pong!
-        // mBoxTrianglePairsBuffer = std::move(newChildPairsBuffer);
-        // mBoxTrianglePairCount = newTotalChildPairs;
+        if (mVerbose == 1) printf("Total child pairs after subdivision: %llu\n", (unsigned long long)newPairCount);
+
+        // Allocate new child pair buffer
+        nanovdb::cuda::DeviceBuffer newPairsBuffer = nanovdb::cuda::DeviceBuffer::create(
+            newPairCount * sizeof(BoxTrianglePair), nullptr, device, mStream);
+        if (newPairsBuffer.deviceData() == nullptr)
+            throw std::runtime_error("Failed to allocate child pairs buffer for subdivision pass");
+        auto* dNewPairs = static_cast<BoxTrianglePair*>(newPairsBuffer.deviceData());
+
+        // Scatter surviving child pairs into the new buffer
+        util::cuda::lambdaKernel<<<numBlocks(mBoxTrianglePairCount), mNumThreads, 0, mStream>>>(
+            mBoxTrianglePairCount,
+            topology::detail::ScatterChildPairsFunctor<BuildT>{
+                deviceBoxTrianglePairs(), dMasks, dOffsets, dNewPairs, childScale
+            }
+        );
+        cudaCheckError();
+
+        // Ping-pong: replace the parent pair buffer with the new child pair buffer
+        mBoxTrianglePairsBuffer = std::move(newPairsBuffer);
+        mBoxTrianglePairCount   = newPairCount;
 
         scale /= 8;
     }

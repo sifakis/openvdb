@@ -73,7 +73,7 @@ The converter works via a hierarchical top-down subdivision approach on the GPU:
    - Pass 2: CUB `DeviceScan::InclusiveSum` prefix scan → write offsets + total count.
    - Pass 3: `ScatterRootTrianglePairsFunctor` — scatter `BoxTrianglePair` structs (16B: `Coord origin` + `uint32_t triangleID`) at pre-computed offsets. No atomics needed.
 
-   **Known bug**: `mPadding` is passed as `mBandWidth - 0.5f`, but then the functor adds `+0.5f`, yielding a net expansion of `mBandWidth + 0.5f` instead of `mBandWidth`. The correct padding to pass is `mBandWidth` (letting the functor's `+0.5f` handle the cell-center correction), or equivalently remove the `+0.5f` from the functor and pass `mBandWidth - 0.5f`. At root scale (4096³) the 0.5-voxel error is negligible but should be fixed for correctness at finer levels.
+   **Padding logic**: the continuous region with UDF ≤ `mBandWidth` is `[xmin - mBandWidth, xmax + mBandWidth]`. The integer cell indices whose centers fall in that interval are `ceilf(xmin - mBandWidth)` to `floorf(xmax + mBandWidth)`. Those voxel indices are then mapped to root tile indices via `floorf(voxel * invRootDim)`.
 
 3. **`processLeafTrianglePairs()`** — Hierarchical subdivision (3 passes: 4096→512→64→8), refining `mBoxTrianglePairsBuffer` in place (ping-pong). Each pass:
    - `evaluateAndCountSubBoxesKernel` — 1 CTA per parent pair, 512 threads (one per 8³ sub-box). Uses `testTriangleAABB<OnlyUseAABB>` for triangle-AABB intersection. Warp ballot builds `Mask<3>` with no atomics; CUB `BlockReduce` counts hits.

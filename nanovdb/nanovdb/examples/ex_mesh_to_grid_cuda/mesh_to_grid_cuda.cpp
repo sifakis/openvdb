@@ -19,7 +19,8 @@ void mainMeshToGrid(
     const int pointCount,
     const nanovdb::Vec3i *deviceTriangles,
     const int triangleCount,
-    const nanovdb::Map map);
+    const nanovdb::Map map,
+    const openvdb::FloatGrid::Ptr refGrid);
 
 void readOBJ(const std::string& filename,
     std::vector<openvdb::Vec3s>& points,
@@ -170,7 +171,8 @@ int main(int argc, char *argv[])
             nanovdb_points.size(),
             nanovdb_triangles.data().get(),
             nanovdb_triangles.size(),
-            map);
+            map,
+            grid);
 
         return 0;
     }

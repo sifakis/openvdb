@@ -6,6 +6,11 @@
 
 #include <nanovdb/tools/cuda/MeshToGrid.cuh>
 
+#include <openvdb/openvdb.h>
+
+#include <set>
+#include <array>
+
 #if 0
 #include <nanovdb/tools/cuda/DilateGrid.cuh>
 #include <nanovdb/tools/cuda/PruneGrid.cuh>
@@ -28,7 +33,8 @@ void mainMeshToGrid(
     const int pointCount,
     const nanovdb::Vec3i *deviceTriangles,
     const int triangleCount,
-    const nanovdb::Map map)
+    const nanovdb::Map map,
+    const openvdb::FloatGrid::Ptr refGrid)
 {
     nanovdb::util::cuda::Timer gpuTimer;
 
@@ -38,48 +44,75 @@ void mainMeshToGrid(
     converter.getHandle();
 
 
-    // --- DIAGNOSTIC CHECK 1: The Modulus & Bounds Test ---
+#if 0
+    // --- DIAGNOSTIC CHECK: Root-level Modulus & Bounds Test (only valid before processLeafTrianglePairs) ---
     uint64_t pairCount = converter.getPairCount();
     if (pairCount > 0) {
         std::cout << "\n--- Running GPU Diagnostics ---" << std::endl;
-        
-        // Allocate host memory and download the pairs
+
         std::vector<typename nanovdb::tools::cuda::MeshToGrid<BuildT>::BoxTrianglePair> hostPairs(pairCount);
-        cudaMemcpy(hostPairs.data(), converter.getDevicePairs(), 
-                   pairCount * sizeof(typename nanovdb::tools::cuda::MeshToGrid<BuildT>::BoxTrianglePair), 
+        cudaMemcpy(hostPairs.data(), converter.getDevicePairs(),
+                   pairCount * sizeof(typename nanovdb::tools::cuda::MeshToGrid<BuildT>::BoxTrianglePair),
                    cudaMemcpyDeviceToHost);
         cudaDeviceSynchronize();
 
         bool passed = true;
         for (uint64_t i = 0; i < pairCount; ++i) {
             const auto& pair = hostPairs[i];
-            
-            // 1. Verify Modulo 4096 (Strict Root Tile Alignment)
-            if (pair.origin[0] % 4096 != 0 || 
-                pair.origin[1] % 4096 != 0 || 
+            if (pair.origin[0] % 4096 != 0 ||
+                pair.origin[1] % 4096 != 0 ||
                 pair.origin[2] % 4096 != 0) {
-                std::cerr << "FAIL: Misaligned Root Origin at index " << i 
+                std::cerr << "FAIL: Misaligned Root Origin at index " << i
                           << " (" << pair.origin[0] << ", " << pair.origin[1] << ", " << pair.origin[2] << ")\n";
                 passed = false;
                 break;
             }
-
-            // 2. Verify Triangle ID bounds
-            if (pair.triangleID >= triangleCount) {
+            if (pair.triangleID >= (uint32_t)triangleCount) {
                 std::cerr << "FAIL: Out-of-bounds TriangleID " << pair.triangleID << " at index " << i << "\n";
                 passed = false;
                 break;
             }
         }
-        
-        if (passed) {
+        if (passed)
             std::cout << "SUCCESS: All " << pairCount << " pairs are perfectly 4096-aligned and bounded!" << std::endl;
-            // Print a sample to visually inspect
-            std::cout << "Sample Pair [0]: Origin(" << hostPairs[0].origin[0] << ", " 
-                      << hostPairs[0].origin[1] << ", " << hostPairs[0].origin[2] << ") - TriID: " 
-                      << hostPairs[0].triangleID << std::endl;
+    }
+#endif
+
+    // --- CORRECTNESS CHECK: Every OpenVDB reference leaf must appear in our output ---
+    using PairT = typename nanovdb::tools::cuda::MeshToGrid<BuildT>::BoxTrianglePair;
+    uint64_t pairCount = converter.getPairCount();
+    std::cout << "\n--- Correctness Check: " << pairCount << " leaf/triangle pairs ---" << std::endl;
+
+    // Download leaf/triangle pairs from device
+    std::vector<PairT> hostPairs(pairCount);
+    cudaMemcpy(hostPairs.data(), converter.getDevicePairs(),
+               pairCount * sizeof(PairT), cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
+
+    // Build set of unique leaf origins from our output
+    std::set<std::array<int,3>> ourLeafOrigins;
+    for (const auto& pair : hostPairs)
+        ourLeafOrigins.insert({pair.origin[0], pair.origin[1], pair.origin[2]});
+
+    std::cout << "Unique leaf origins in our output: " << ourLeafOrigins.size() << std::endl;
+
+    // Check every OpenVDB reference leaf is present in our output
+    uint64_t missing = 0;
+    for (auto it = refGrid->tree().beginLeaf(); it; ++it) {
+        auto o = it->origin();
+        if (!ourLeafOrigins.count({o[0], o[1], o[2]})) {
+            ++missing;
+            if (missing <= 10)
+                std::cerr << "  MISSING leaf at (" << o[0] << ", " << o[1] << ", " << o[2] << ")\n";
         }
     }
+
+    uint64_t refLeafCount = refGrid->tree().leafCount();
+    if (missing == 0)
+        std::cout << "SUCCESS: All " << refLeafCount << " reference leaves present in our output "
+                  << "(our output has " << ourLeafOrigins.size() << " unique leaf origins)." << std::endl;
+    else
+        std::cerr << "FAIL: " << missing << "/" << refLeafCount << " reference leaves missing from our output." << std::endl;
 
 
 
@@ -152,4 +185,5 @@ void mainMeshToGrid<nanovdb::ValueOnIndex>(
     const int pointCount,
     const nanovdb::Vec3i *deviceTriangles,
     const int triangleCount,
-    const nanovdb::Map map);
+    const nanovdb::Map map,
+    const openvdb::FloatGrid::Ptr refGrid);

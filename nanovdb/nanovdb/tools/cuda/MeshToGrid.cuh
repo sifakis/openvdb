@@ -79,6 +79,10 @@ public:
     /// @param threshold Index-space AABB scale threshold in voxel units
     void setSATThreshold(int threshold = 128) { mSATThreshold = threshold; }
 
+    /// @brief Set the name of the output grid
+    /// @param name Grid name string
+    void setGridName(const std::string& name) { mGridName = name; }
+
     /// @brief Set the mode for checksum computation, which is disabled by default
     /// @param mode Mode of checksum computation
     // void setChecksum(CheckMode mode = CheckMode::Disable){mBuilder.mChecksum = mode;}
@@ -105,12 +109,15 @@ private:
 
     void rasterizeInternalNodes();
 
+    void processGridTreeRoot();
+
 
     static constexpr unsigned int mNumThreads = 128;// for kernels spawned via lambdaKernel (others may specialize)
     static unsigned int numBlocks(unsigned int n) {return (n + mNumThreads - 1) / mNumThreads;}
 
     TopologyBuilder<BuildT>      mBuilder;
     cudaStream_t                 mStream{0};
+    std::string                  mGridName;
     util::cuda::Timer            mTimer;
     int                          mVerbose{0};
     float                        mBandWidth{3.f};
@@ -202,6 +209,28 @@ MeshToGrid<BuildT>::getHandle(const BufferT &pool)
     // Scatter leaf/triangle pair origins into upper/lower topology masks
     if (mVerbose==1) mTimer.start("Rasterizing internal nodes");
     rasterizeInternalNodes();
+    if (mVerbose==1) mTimer.stop();
+
+    // Count nodes at all levels from the filled masks
+    if (mVerbose==1) mTimer.start("Counting nodes");
+    mBuilder.countNodes(mStream);
+    cudaStreamSynchronize(mStream); // node counts written async; sync before reading or passing to getBuffer
+    if (mVerbose==1) {
+        mTimer.stop();
+        printf("Node counts — upper: %u  lower: %u  leaf: %u\n",
+               mBuilder.data()->nodeCount[2],
+               mBuilder.data()->nodeCount[1],
+               mBuilder.data()->nodeCount[0]);
+    }
+
+    // Allocate output grid buffer
+    if (mVerbose==1) mTimer.start("Allocating grid buffer");
+    auto gridBuffer = mBuilder.getBuffer(pool, mStream);
+    if (mVerbose==1) mTimer.stop();
+
+    // Initialize grid/tree/root metadata
+    if (mVerbose==1) mTimer.start("Processing grid/tree/root");
+    processGridTreeRoot();
     if (mVerbose==1) mTimer.stop();
 
     // int device = 0;
@@ -861,6 +890,28 @@ void MeshToGrid<BuildT>::rasterizeInternalNodes()
     cudaCheckError();
 
 } // MeshToGrid<BuildT>::rasterizeInternalNodes
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+template<typename BuildT>
+void MeshToGrid<BuildT>::processGridTreeRoot()
+{
+    // Initialize grid/tree/root metadata from scratch using the provided map.
+    // InitGridTreeRootFunctor sets all GridData fields explicitly (magic, version,
+    // flags, map, gridClass=IndexGrid, etc.) since there is no source grid to copy from.
+    util::cuda::lambdaKernel<<<1, 1, 0, mStream>>>(1,
+        topology::detail::InitGridTreeRootFunctor<BuildT>{mMap}, mBuilder.deviceData());
+    cudaCheckError();
+
+    // Copy grid name into the output grid's name field
+    char* dst = mBuilder.data()->getGrid().mGridName;
+    if (!mGridName.empty()) {
+        cudaCheck(cudaMemcpyAsync(dst, mGridName.data(), GridData::MaxNameSize, cudaMemcpyHostToDevice, mStream));
+    } else {
+        cudaCheck(cudaMemsetAsync(dst, 0, GridData::MaxNameSize, mStream));
+    }
+
+} // MeshToGrid<BuildT>::processGridTreeRoot
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 

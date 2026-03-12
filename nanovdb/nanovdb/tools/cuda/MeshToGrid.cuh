@@ -21,6 +21,7 @@
 #include <nanovdb/GridHandle.h>
 #include <nanovdb/cuda/TempPool.h>
 #include <nanovdb/util/cuda/Timer.h>
+#include <nanovdb/tools/cuda/TopologyBuilder.cuh>
 
 namespace nanovdb {
 
@@ -29,9 +30,15 @@ namespace tools::cuda {
 template <typename BuildT>
 class MeshToGrid
 {
-    using PointT = nanovdb::Vec3f;
+    using PointT  = nanovdb::Vec3f;
     using TriangleIndexT = nanovdb::Vec3i;
     using TriangleT = std::array<PointT,3>;
+    using GridT   = NanoGrid<BuildT>;
+    using TreeT   = NanoTree<BuildT>;
+    using RootT   = NanoRoot<BuildT>;
+    using UpperT  = NanoUpper<BuildT>;
+    using LowerT  = NanoLower<BuildT>;
+    using LeafT   = NanoLeaf<BuildT>;
 
 public:
     struct alignas(16) BoxTrianglePair { // sizeof(BoxTrianglePair) = 16B
@@ -53,7 +60,7 @@ public:
         const nanovdb::Map map = nanovdb::Map(),
         cudaStream_t stream = 0
     )
-        : mStream(stream), mTimer(stream), mDevicePoints(devicePoints), mPointCount(pointCount),
+        : mStream(stream), mTimer(stream), mBuilder(stream), mDevicePoints(devicePoints), mPointCount(pointCount),
          mDeviceTriangles(deviceTriangles), mTriangleCount(triangleCount), mMap(map)
     {}
 
@@ -93,11 +100,13 @@ private:
 
     void processLeafTrianglePairs();
 
+    void buildRasterizedRoot();
+
 
     static constexpr unsigned int mNumThreads = 128;// for kernels spawned via lambdaKernel (others may specialize)
     static unsigned int numBlocks(unsigned int n) {return (n + mNumThreads - 1) / mNumThreads;}
 
-    // TopologyBuilder<BuildT>      mBuilder;
+    TopologyBuilder<BuildT>      mBuilder;
     cudaStream_t                 mStream{0};
     util::cuda::Timer            mTimer;
     int                          mVerbose{0};
@@ -175,6 +184,11 @@ MeshToGrid<BuildT>::getHandle(const BufferT &pool)
     // Process Leaf-Triangle pairs
     if (mVerbose==1) mTimer.start("Computing candidate LeafNode-Triangle intersection pairs");
     processLeafTrianglePairs();
+    if (mVerbose==1) mTimer.stop();
+
+    // Build rasterized root node (one tile per unique root origin)
+    if (mVerbose==1) mTimer.start("Building rasterized root node");
+    buildRasterizedRoot();
     if (mVerbose==1) mTimer.stop();
 
     // int device = 0;
@@ -514,7 +528,7 @@ struct ScatterChildPairsFunctor
 
         for (uint32_t n = 0; n < 512; ++n) {
             if (mask.isOn(n)) {
-                int i = n & 0x7;
+                int i =  n       & 0x7;
                 int j = (n >> 3) & 0x7;
                 int k = (n >> 6) & 0x7;
                 dNewPairs[writeIdx].origin = nanovdb::Coord(
@@ -784,6 +798,38 @@ void MeshToGrid<BuildT>::enumerateRootTiles()
     cudaCheckError();
 
 } // MeshToGrid<BuildT>::enumerateRootTiles
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+template<typename BuildT>
+void MeshToGrid<BuildT>::buildRasterizedRoot()
+{
+    int device = 0;
+    cudaGetDevice(&device);
+
+    // Download unique root origins to host.
+    // Origins are already in coordToKey-sorted order from enumerateRootTiles(),
+    // so no further sorting or deduplication is required here.
+    uint32_t tileCount = static_cast<uint32_t>(mUniqueRootTileCount);
+    std::vector<nanovdb::Coord> hostOrigins(tileCount);
+    cudaCheck(cudaMemcpy(hostOrigins.data(),
+        static_cast<const nanovdb::Coord*>(mUniqueRootOriginsBuffer.deviceData()),
+        tileCount * sizeof(nanovdb::Coord), cudaMemcpyDeviceToHost));
+
+    // Build the root node on CPU: one tile per unique root origin.
+    // Only the NanoVDB tile key is set here; child pointers and values are
+    // filled by TopologyBuilder's subsequent pipeline stages.
+    uint64_t rootSize = RootT::memUsage(tileCount);
+    mBuilder.mProcessedRoot = nanovdb::cuda::DeviceBuffer::create(rootSize);
+    auto* rootPtr = static_cast<RootT*>(mBuilder.mProcessedRoot.data());
+    rootPtr->mTableSize = tileCount;
+    rootPtr->mBackground = typename RootT::ValueType{};
+    for (uint32_t t = 0; t < tileCount; ++t)
+        *rootPtr->tile(t) = typename RootT::DataType::Tile{RootT::CoordToKey(hostOrigins[t])};
+
+    mBuilder.mProcessedRoot.deviceUpload(device, mStream, false);
+
+} // MeshToGrid<BuildT>::buildRasterizedRoot
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 

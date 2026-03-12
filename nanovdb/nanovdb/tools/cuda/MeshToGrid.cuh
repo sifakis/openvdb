@@ -22,6 +22,7 @@
 #include <nanovdb/cuda/TempPool.h>
 #include <nanovdb/util/cuda/Timer.h>
 #include <nanovdb/tools/cuda/TopologyBuilder.cuh>
+#include <nanovdb/util/cuda/Rasterization.cuh>
 
 namespace nanovdb {
 
@@ -101,6 +102,8 @@ private:
     void processLeafTrianglePairs();
 
     void buildRasterizedRoot();
+
+    void rasterizeInternalNodes();
 
 
     static constexpr unsigned int mNumThreads = 128;// for kernels spawned via lambdaKernel (others may specialize)
@@ -189,6 +192,16 @@ MeshToGrid<BuildT>::getHandle(const BufferT &pool)
     // Build rasterized root node (one tile per unique root origin)
     if (mVerbose==1) mTimer.start("Building rasterized root node");
     buildRasterizedRoot();
+    if (mVerbose==1) mTimer.stop();
+
+    // Allocate (zero-filled) upper/lower mask buffers sized from the root tile count
+    if (mVerbose==1) mTimer.start("Allocating internal mask buffers");
+    mBuilder.allocateInternalMaskBuffers(mStream);
+    if (mVerbose==1) mTimer.stop();
+
+    // Scatter leaf/triangle pair origins into upper/lower topology masks
+    if (mVerbose==1) mTimer.start("Rasterizing internal nodes");
+    rasterizeInternalNodes();
     if (mVerbose==1) mTimer.stop();
 
     // int device = 0;
@@ -830,6 +843,24 @@ void MeshToGrid<BuildT>::buildRasterizedRoot()
     mBuilder.mProcessedRoot.deviceUpload(device, mStream, false);
 
 } // MeshToGrid<BuildT>::buildRasterizedRoot
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+template<typename BuildT>
+void MeshToGrid<BuildT>::rasterizeInternalNodes()
+{
+    using RasterizerT = util::rasterization::cuda::RasterizeInternalNodesFunctor<BuildT, BoxTrianglePair>;
+
+    auto* dUpperMasks = static_cast<Mask<5>*>(mBuilder.deviceUpperMasks());
+    auto* dLowerMasks = static_cast<Mask<4>(*)[Mask<5>::SIZE]>(mBuilder.deviceLowerMasks());
+
+    util::cuda::lambdaKernel<<<numBlocks(mBoxTrianglePairCount), mNumThreads, 0, mStream>>>(
+        mBoxTrianglePairCount,
+        RasterizerT{ deviceBoxTrianglePairs(), mBuilder.deviceProcessedRoot(), dUpperMasks, dLowerMasks }
+    );
+    cudaCheckError();
+
+} // MeshToGrid<BuildT>::rasterizeInternalNodes
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 

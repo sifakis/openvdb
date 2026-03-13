@@ -8,10 +8,14 @@
 
 // the following files are from NanoVDB
 #include <nanovdb/NanoVDB.h>
-#include <nanovdb/cuda/DeviceBuffer.h>
-#include <nanovdb/tools/CreateNanoGrid.h>
 
 #include <thrust/universal_vector.h>
+
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
 
 template<typename BuildT>
 void mainMeshToGrid(
@@ -95,12 +99,7 @@ void readOBJ(const std::string& filename,
 /// @brief This example depends on OpenVDB, NanoVDB, and CUDA
 int main(int argc, char *argv[])
 {
-    using GridT = openvdb::FloatGrid;
     using BuildT = nanovdb::ValueOnIndex;
-
-    // Select the type of dilation here. The NN_EDGE case supports leaf dilation too (currently)
-    // openvdb::tools::NearestNeighbors nnType = openvdb::tools::NN_FACE_EDGE_VERTEX;
-    openvdb::tools::NearestNeighbors nnType = openvdb::tools::NN_FACE;
 
     openvdb::util::CpuTimer cpuTimer;
 

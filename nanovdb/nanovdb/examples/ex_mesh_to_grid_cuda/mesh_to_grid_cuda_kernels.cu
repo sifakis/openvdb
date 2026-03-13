@@ -13,21 +13,6 @@
 #include <array>
 #include <vector>
 
-#if 0
-#include <nanovdb/tools/cuda/DilateGrid.cuh>
-#include <nanovdb/tools/cuda/PruneGrid.cuh>
-#include <nanovdb/util/cuda/Injection.cuh>
-
-template<typename T>
-bool bufferCheck(const T* deviceBuffer, const T* hostBuffer, size_t elem_count) {
-    T* tmpBuffer = new T[elem_count];
-    cudaCheck(cudaMemcpy(tmpBuffer, deviceBuffer, elem_count * sizeof(T), cudaMemcpyDeviceToHost));
-    bool same = true;
-    for (int i=0; same && i< elem_count; ++i) { same = (tmpBuffer[i] == hostBuffer[i]); }
-    delete [] tmpBuffer;
-    return same;
-}
-#endif
 
 template<typename BuildT>
 void mainMeshToGrid(
@@ -38,47 +23,12 @@ void mainMeshToGrid(
     const nanovdb::Map map,
     const openvdb::FloatGrid::Ptr refGrid)
 {
-    nanovdb::util::cuda::Timer gpuTimer;
-
     // Initialize mesh-to-grid converter
     nanovdb::tools::cuda::MeshToGrid<BuildT> converter( devicePoints, pointCount, deviceTriangles, triangleCount, map );
     converter.setVerbose(1);
     auto [handle, sidecar] = converter.getHandleAndUDF();
 
 
-#if 0
-    // --- DIAGNOSTIC CHECK: Root-level Modulus & Bounds Test (only valid before processLeafTrianglePairs) ---
-    uint64_t pairCount = converter.getPairCount();
-    if (pairCount > 0) {
-        std::cout << "\n--- Running GPU Diagnostics ---" << std::endl;
-
-        std::vector<typename nanovdb::tools::cuda::MeshToGrid<BuildT>::BoxTrianglePair> hostPairs(pairCount);
-        cudaMemcpy(hostPairs.data(), converter.getDevicePairs(),
-                   pairCount * sizeof(typename nanovdb::tools::cuda::MeshToGrid<BuildT>::BoxTrianglePair),
-                   cudaMemcpyDeviceToHost);
-        cudaDeviceSynchronize();
-
-        bool passed = true;
-        for (uint64_t i = 0; i < pairCount; ++i) {
-            const auto& pair = hostPairs[i];
-            if (pair.origin[0] % 4096 != 0 ||
-                pair.origin[1] % 4096 != 0 ||
-                pair.origin[2] % 4096 != 0) {
-                std::cerr << "FAIL: Misaligned Root Origin at index " << i
-                          << " (" << pair.origin[0] << ", " << pair.origin[1] << ", " << pair.origin[2] << ")\n";
-                passed = false;
-                break;
-            }
-            if (pair.triangleID >= (uint32_t)triangleCount) {
-                std::cerr << "FAIL: Out-of-bounds TriangleID " << pair.triangleID << " at index " << i << "\n";
-                passed = false;
-                break;
-            }
-        }
-        if (passed)
-            std::cout << "SUCCESS: All " << pairCount << " pairs are perfectly 4096-aligned and bounded!" << std::endl;
-    }
-#endif
 
     // --- Voxel-level UDF correctness check ---
     // Download NanoVDB grid to host for CPU-side analysis
@@ -157,9 +107,23 @@ void mainMeshToGrid(
     // Our sidecar is in index space (voxel units); OpenVDB stores world-space distances.
     // Scale our value by voxelSize before comparing.
     const float voxelSize = (float)refGrid->voxelSize()[0];
-    const float epsilon = 0.01f; // in voxel units
-    uint64_t badUDF = 0;
-    float maxError = 0.f;
+    // Split histogram between true positives (active in both) and false positives
+    // (active in ours only). For false positives, refUDF = background = mBandWidth,
+    // so error = |ourUDF - mBandWidth|; a large error there is a real concern.
+    const float thresholds[] = { 0.01f, 0.05f, 0.1f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f };
+    constexpr int nThresh = sizeof(thresholds) / sizeof(thresholds[0]);
+    uint64_t badTP[nThresh] = {}, badFP[nThresh] = {};
+    float maxErrTP = 0.f, maxErrFP = 0.f;
+
+    // Track worst voxels for CPU ground-truth verification.
+    // topNTP is maintained as a min-heap (smallest error at front) capped at N,
+    // so we always evict the least-bad entry when a worse one arrives.
+    struct WorstVoxel { int x, y, z; float ourUDF, refUDF, err; bool isFP; };
+    constexpr int N = 20;
+    auto minHeapCmp = [](const WorstVoxel& a, const WorstVoxel& b){ return a.err > b.err; };
+    std::vector<WorstVoxel> topNTP;
+    topNTP.reserve(N + 1);
+    WorstVoxel worstFP{};
 
     for (uint32_t li = 0; li < nanoLeafCount; ++li) {
         const auto &leaf = leaves[li];
@@ -169,84 +133,141 @@ void mainMeshToGrid(
             const int lx = vi & 7, ly = (vi >> 3) & 7, lz = (vi >> 6) & 7;
             const int x = origin[0]+lx, y = origin[1]+ly, z = origin[2]+lz;
 
+            const openvdb::Coord coord(x, y, z);
             const uint64_t sidecarIdx = leaf.getValue(vi);
             const float ourUDF_world = hostSidecar[sidecarIdx] * voxelSize;
-            const float refUDF       = ovdbAcc.getValue(openvdb::Coord(x, y, z));
-            const float err = std::abs(ourUDF_world - refUDF) / voxelSize; // error in voxel units
-            if (err > epsilon) {
-                ++badUDF;
-                maxError = std::max(maxError, err);
+            const float refUDF       = ovdbAcc.getValue(coord);
+            const float err = std::abs(ourUDF_world - refUDF) / voxelSize;
+
+            const WorstVoxel candidate{ x, y, z, hostSidecar[sidecarIdx],
+                                        refUDF / voxelSize, err, !ovdbAcc.isValueOn(coord) };
+
+            if (ovdbAcc.isValueOn(coord)) {
+                maxErrTP = std::max(maxErrTP, err);
+                for (int t = 0; t < nThresh; ++t)
+                    if (err > thresholds[t]) ++badTP[t];
+                if ((int)topNTP.size() < N || err > topNTP.front().err) {
+                    topNTP.push_back(candidate);
+                    std::push_heap(topNTP.begin(), topNTP.end(), minHeapCmp);
+                    if ((int)topNTP.size() > N) {
+                        std::pop_heap(topNTP.begin(), topNTP.end(), minHeapCmp);
+                        topNTP.pop_back();
+                    }
+                }
+            } else {
+                if (err > worstFP.err) worstFP = candidate;
+                maxErrFP = std::max(maxErrFP, err);
+                for (int t = 0; t < nThresh; ++t)
+                    if (err > thresholds[t]) ++badFP[t];
             }
         }
     }
+    // Sort top-N true positives from worst to best
+    std::sort(topNTP.begin(), topNTP.end(), [](const WorstVoxel& a, const WorstVoxel& b){
+        return a.err > b.err; });
 
-    if (badUDF == 0)
-        std::cout << "UDF values: all within epsilon=" << epsilon << " voxels of OpenVDB reference\n";
-    else
-        std::cerr << "UDF values: " << badUDF << " voxels exceed epsilon=" << epsilon
-                  << " voxels  (max error: " << maxError << " voxels)\n";
+    const uint64_t nTP = ourCoords.size() - falsePositives;
+    std::cout << "True positives (" << nTP << " voxels), max error: " << maxErrTP << " voxels\n";
+    for (int t = 0; t < nThresh; ++t)
+        std::cout << "  > " << thresholds[t] << " voxels: " << badTP[t] << "\n";
+    std::cout << "False positives (" << falsePositives << " voxels), max error: " << maxErrFP << " voxels\n";
+    for (int t = 0; t < nThresh; ++t)
+        std::cout << "  > " << thresholds[t] << " voxels: " << badFP[t] << "\n";
 
-#if 0
-    dilator.setOperation(nanovdb::tools::morphology::NearestNeighbors(nnType));
-    dilator.setChecksum(nanovdb::CheckMode::Default);
+    // --- CPU ground-truth check: brute-force both NanoVDB and Ericson routines ---
+    struct CPUResult {
+        float nvdbUDF, ericsonUDF;   // voxel units
+        int   nearestTri;            // index into deviceTriangles
+        nanovdb::Vec3f voxelCenterWorld;
+    };
+    auto cpuBruteForce = [&](const WorstVoxel& wv) -> CPUResult {
+        const nanovdb::Vec3f wcNvdb = map.applyMap(
+            nanovdb::Vec3f(float(wv.x), float(wv.y), float(wv.z)));
+        const openvdb::Vec3s wcOvdb(wcNvdb[0], wcNvdb[1], wcNvdb[2]);
 
-    auto handle = dilator.getHandle();
-    auto dstGrid = handle.template deviceGrid<BuildT>();
+        float nvdbMinDistSqr = std::numeric_limits<float>::max();
+        float refMinDistSqr  = std::numeric_limits<float>::max();
+        int   nearestTri = -1;
+        for (int t = 0; t < triangleCount; ++t) {
+            const nanovdb::Vec3f nv0 = devicePoints[deviceTriangles[t][0]];
+            const nanovdb::Vec3f nv1 = devicePoints[deviceTriangles[t][1]];
+            const nanovdb::Vec3f nv2 = devicePoints[deviceTriangles[t][2]];
 
-    // Check for correctness
-    if (bufferCheck((char*)dstGrid, (char*)indexGridDilated->data(), indexGridDilated->gridSize()))
-        std::cout << "Result of DilateGrid check out CORRECT against reference" << std::endl;
-    else
-        std::cout << "Result of DilateGrid compares INCORRECT against reference" << std::endl;
+            const float d = nanovdb::math::pointToTriangleDistSqr(nv0, nv1, nv2, wcNvdb);
+            if (d < nvdbMinDistSqr) { nvdbMinDistSqr = d; nearestTri = t; }
 
-    // Re-run warm-started iterations
-    dilator.setVerbose(0);
-    for (int i = 0; i < benchmark_iters; i++) {
-        gpuTimer.start("Re-running entire dilation after warmstart");
-        auto dummyHandle = dilator.getHandle();
-        gpuTimer.stop();
+            // Reference: Ericson §5.1.5, openvdb::Vec3s arithmetic
+            const openvdb::Vec3s a(nv0[0], nv0[1], nv0[2]);
+            const openvdb::Vec3s b(nv1[0], nv1[1], nv1[2]);
+            const openvdb::Vec3s c(nv2[0], nv2[1], nv2[2]);
+            const openvdb::Vec3s p = wcOvdb;
+            const openvdb::Vec3s ab = b-a, ac = c-a, ap = p-a;
+            const float d1 = ab.dot(ap), d2 = ac.dot(ap);
+            if (d1 <= 0.f && d2 <= 0.f) { refMinDistSqr = std::min(refMinDistSqr, (p-a).lengthSqr()); continue; }
+            const openvdb::Vec3s bp = p-b;
+            const float d3 = ab.dot(bp), d4 = ac.dot(bp);
+            if (d3 >= 0.f && d4 <= d3)  { refMinDistSqr = std::min(refMinDistSqr, (p-b).lengthSqr()); continue; }
+            const openvdb::Vec3s cp = p-c;
+            const float d5 = ab.dot(cp), d6 = ac.dot(cp);
+            if (d6 >= 0.f && d5 <= d6)  { refMinDistSqr = std::min(refMinDistSqr, (p-c).lengthSqr()); continue; }
+            const float vc = d1*d4 - d3*d2;
+            if (vc <= 0.f && d1 >= 0.f && d3 <= 0.f) {
+                float v = d1/(d1-d3);
+                refMinDistSqr = std::min(refMinDistSqr, (p-(a+v*ab)).lengthSqr()); continue; }
+            const float vb = d5*d2 - d1*d6;
+            if (vb <= 0.f && d2 >= 0.f && d6 <= 0.f) {
+                float w = d2/(d2-d6);
+                refMinDistSqr = std::min(refMinDistSqr, (p-(a+w*ac)).lengthSqr()); continue; }
+            const float va = d3*d6 - d5*d4;
+            if (va <= 0.f && (d4-d3) >= 0.f && (d5-d6) >= 0.f) {
+                float w = (d4-d3)/((d4-d3)+(d5-d6));
+                refMinDistSqr = std::min(refMinDistSqr, (p-(b+w*(c-b))).lengthSqr()); continue; }
+            const float denom = 1.f/(va+vb+vc);
+            const float rv = vb*denom, rw = vc*denom;
+            refMinDistSqr = std::min(refMinDistSqr, (p-(a+rv*ab+rw*ac)).lengthSqr());
+        }
+        return { std::sqrt(nvdbMinDistSqr) / voxelSize,
+                 std::sqrt(refMinDistSqr)  / voxelSize,
+                 nearestTri, wcNvdb };
+    };
+
+    auto printVec3 = [](const char* label, float x, float y, float z) {
+        std::cout << "    " << label << ": (" << x << ", " << y << ", " << z << ")\n";
+    };
+
+    auto printWorst = [&](const char* label, const WorstVoxel& wv) {
+        std::cout << "\n--- " << label << " ---\n";
+        std::cout << "  Our UDF     : " << wv.ourUDF << " voxels\n";
+        std::cout << "  OpenVDB UDF : " << wv.refUDF << " voxels"
+                  << (wv.isFP ? " (background — not active in OpenVDB)" : "") << "\n";
+        std::cout << "  Error       : " << wv.err << " voxels\n";
+        auto res = cpuBruteForce(wv);
+        std::cout << "  CPU (NanoVDB routine):   " << res.nvdbUDF    << " voxels\n";
+        std::cout << "  CPU (Ericson reference): " << res.ericsonUDF << " voxels\n";
+        std::cout << "  Routine discrepancy: " << std::abs(res.nvdbUDF - res.ericsonUDF) << " voxels\n";
+        std::cout << "  Error vs CPU: our=" << std::abs(wv.ourUDF - res.nvdbUDF)
+                  << "  OpenVDB ref=" << std::abs(wv.refUDF - res.nvdbUDF) << " voxels\n";
+        // World-space geometry
+        std::cout << "  World-space geometry:\n";
+        printVec3("voxel center", res.voxelCenterWorld[0], res.voxelCenterWorld[1], res.voxelCenterWorld[2]);
+        if (res.nearestTri >= 0) {
+            const nanovdb::Vec3f v0 = devicePoints[deviceTriangles[res.nearestTri][0]];
+            const nanovdb::Vec3f v1 = devicePoints[deviceTriangles[res.nearestTri][1]];
+            const nanovdb::Vec3f v2 = devicePoints[deviceTriangles[res.nearestTri][2]];
+            std::cout << "    nearest tri #" << res.nearestTri << ":\n";
+            printVec3("  v0", v0[0], v0[1], v0[2]);
+            printVec3("  v1", v1[0], v1[1], v1[2]);
+            printVec3("  v2", v2[0], v2[1], v2[2]);
+        }
+    };
+
+    for (int i = 0; i < (int)topNTP.size(); ++i) {
+        std::string label = "True positive #" + std::to_string(i+1)
+                          + " (error " + std::to_string(topNTP[i].err) + " voxels)";
+        printWorst(label.c_str(), topNTP[i]);
     }
+    printWorst("Worst false positive", worstFP);
 
-    uint32_t dstLeafCount = nanovdb::util::cuda::DeviceGridTraits<BuildT>::getTreeData(dstGrid).mNodeCount[0];
-    nanovdb::cuda::DeviceBuffer dstLeafMaskBuffer;
-    nanovdb::Mask<3>* dstLeafMasks = nullptr;
-    if (dstLeafCount) {
-        dstLeafMaskBuffer = nanovdb::cuda::DeviceBuffer::create( std::size_t(dstLeafCount) * sizeof(nanovdb::Mask<3>), nullptr, false );
-        dstLeafMasks = static_cast<nanovdb::Mask<3>*>(dstLeafMaskBuffer.deviceData());
-        if (!dstLeafMasks) throw std::runtime_error("No GPU buffer for dstLeafMask");
-    }
-
-    const unsigned int numThreads = 128;
-    auto numBlocks = [numThreads] (unsigned int n) {return (n + numThreads - 1) / numThreads;};
-    gpuTimer.start("Injecting un-dilated topology as a pruning mask");
-    if (dstLeafCount)
-        nanovdb::util::cuda::lambdaKernel<<<numBlocks(dstLeafCount), numThreads>>>(dstLeafCount,
-            nanovdb::util::cuda::InjectGridMaskFunctor<BuildT>(),
-            deviceGridOriginal, dstGrid, dstLeafMasks );
-    gpuTimer.stop();
-
-    // Initialize pruner
-    nanovdb::tools::cuda::PruneGrid<BuildT> pruner( dstGrid, dstLeafMasks );
-    pruner.setChecksum(nanovdb::CheckMode::Default);
-    pruner.setVerbose(1);
-
-    auto prunedHandle = pruner.getHandle();
-    auto prunedGrid = prunedHandle.template deviceGrid<BuildT>();
-
-    // Check for correctness
-    if (bufferCheck((char*)prunedGrid, (char*)indexGridOriginal->data(), indexGridOriginal->gridSize()))
-        std::cout << "Result of PruneGrid check out CORRECT against reference" << std::endl;
-    else
-        std::cout << "Result of PruneGrid compares INCORRECT against reference" << std::endl;
-
-    // Re-run warm-started iterations
-    pruner.setVerbose(0);
-    for (int i = 0; i < benchmark_iters; i++) {
-        gpuTimer.start("Re-running entire pruning after warmstart");
-        auto dummyHandle = pruner.getHandle();
-        gpuTimer.stop();
-    }
-#endif
 }
 
 template

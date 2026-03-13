@@ -139,6 +139,66 @@ struct RasterizeLeafNodesFunctor
     }
 };
 
+/// @brief Computes unsigned distance field (UDF) values for all active voxels
+///        by iterating over (leaf, triangle) pairs and accumulating the minimum
+///        squared distance to each voxel's sidecar entry via an atomic min.
+///
+///        Intended to be called via nanovdb::util::cuda::operatorKernelInstance.
+///        Launched as <<<pairCount, MaxThreadsPerBlock>>> - 1 CTA per leaf/triangle
+///        pair, 512 threads (one per voxel in the 8^3 leaf). Each CTA:
+///          1. Probes the leaf pointer from the grid using the pair's origin.
+///          2. Each thread skips its voxel if inactive in the leaf mask.
+///          3. Active threads compute pointToTriangleDistSqr from the voxel center
+///             to the pair's triangle.
+///          4. If distSqr < bandWidthSqr, an atomicMin via uint32 reinterpret
+///             updates dSidecar[sidecarIdx] with the new minimum squared distance.
+///
+/// @note atomicMin via uint32 reinterpret is valid for all IEEE-754 non-negative
+///       floats (including subnormals and +0.0) because their uint32 bit patterns
+///       are ordered identically to the corresponding floating-point values.
+template<typename BuildT, typename PairT>
+struct ComputeUDFFunctor
+{
+    static constexpr int MaxThreadsPerBlock      = 512;
+    static constexpr int MinBlocksPerMultiprocessor = 1;
+
+    const PairT                         *dPairs;
+    const std::array<nanovdb::Vec3f, 3> *dTriangles;
+    const NanoGrid<BuildT>              *dGrid;
+    float                               *dSidecar;
+    float                                bandWidthSqr;
+
+    __device__ void operator()() const
+    {
+        const uint64_t pairID   = blockIdx.x;
+        const int      threadID = threadIdx.x;
+
+        const auto &pair = dPairs[pairID];
+        const auto *leaf = dGrid->tree().root().probeLeaf(pair.origin);
+
+        if (!leaf->isActive(threadID)) return;
+
+        const int lx =  threadID       & 0x7;
+        const int ly = (threadID >> 3) & 0x7;
+        const int lz = (threadID >> 6) & 0x7;
+
+        const nanovdb::Vec3f voxelCenter(
+            float(pair.origin[0] + lx),
+            float(pair.origin[1] + ly),
+            float(pair.origin[2] + lz));
+
+        const auto &tri = dTriangles[pair.triangleID];
+        const float distSqr = nanovdb::math::pointToTriangleDistSqr(
+            tri[0], tri[1], tri[2], voxelCenter);
+
+        if (distSqr >= bandWidthSqr) return;
+
+        const uint64_t sidecarIdx = leaf->getValue(threadID);
+        atomicMin(reinterpret_cast<uint32_t*>(&dSidecar[sidecarIdx]),
+                  __float_as_uint(distSqr));
+    }
+};
+
 } // namespace cuda
 
 } // namespace rasterization

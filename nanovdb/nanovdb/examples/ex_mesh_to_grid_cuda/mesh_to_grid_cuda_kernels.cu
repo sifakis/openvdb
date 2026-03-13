@@ -43,7 +43,7 @@ void mainMeshToGrid(
     // Initialize mesh-to-grid converter
     nanovdb::tools::cuda::MeshToGrid<BuildT> converter( devicePoints, pointCount, deviceTriangles, triangleCount, map );
     converter.setVerbose(1);
-    auto handle = converter.getHandle();
+    auto [handle, sidecar] = converter.getHandleAndUDF();
 
 
 #if 0
@@ -144,7 +144,47 @@ void mainMeshToGrid(
     std::cout << "False positives: " << falsePositives
               << " (" << (100.0 * falsePositives / ourActiveCount) << "% of our active voxels)\n";
 
+    // --- UDF sidecar value check ---
+    // Download sidecar and compare per-voxel UDF against OpenVDB reference.
+    std::cout << "\n--- UDF sidecar value check ---" << std::endl;
 
+    const uint64_t sidecarFloats = sidecar.size() / sizeof(float);
+    std::vector<float> hostSidecar(sidecarFloats);
+    cudaCheck(cudaMemcpy(hostSidecar.data(), sidecar.deviceData(),
+                         sidecar.size(), cudaMemcpyDeviceToHost));
+
+    // For each active voxel in our grid, compare our UDF against OpenVDB's.
+    // Our sidecar is in index space (voxel units); OpenVDB stores world-space distances.
+    // Scale our value by voxelSize before comparing.
+    const float voxelSize = (float)refGrid->voxelSize()[0];
+    const float epsilon = 0.01f; // in voxel units
+    uint64_t badUDF = 0;
+    float maxError = 0.f;
+
+    for (uint32_t li = 0; li < nanoLeafCount; ++li) {
+        const auto &leaf = leaves[li];
+        const auto origin = leaf.origin();
+        for (uint32_t vi = 0; vi < 512; ++vi) {
+            if (!leaf.isActive(vi)) continue;
+            const int lx = vi & 7, ly = (vi >> 3) & 7, lz = (vi >> 6) & 7;
+            const int x = origin[0]+lx, y = origin[1]+ly, z = origin[2]+lz;
+
+            const uint64_t sidecarIdx = leaf.getValue(vi);
+            const float ourUDF_world = hostSidecar[sidecarIdx] * voxelSize;
+            const float refUDF       = ovdbAcc.getValue(openvdb::Coord(x, y, z));
+            const float err = std::abs(ourUDF_world - refUDF) / voxelSize; // error in voxel units
+            if (err > epsilon) {
+                ++badUDF;
+                maxError = std::max(maxError, err);
+            }
+        }
+    }
+
+    if (badUDF == 0)
+        std::cout << "UDF values: all within epsilon=" << epsilon << " voxels of OpenVDB reference\n";
+    else
+        std::cerr << "UDF values: " << badUDF << " voxels exceed epsilon=" << epsilon
+                  << " voxels  (max error: " << maxError << " voxels)\n";
 
 #if 0
     dilator.setOperation(nanovdb::tools::morphology::NearestNeighbors(nnType));

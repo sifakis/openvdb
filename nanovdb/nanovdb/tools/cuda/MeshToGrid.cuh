@@ -93,8 +93,7 @@ public:
     /// @param buffer optional buffer (currently ignored)
     /// @return returns a handle with a grid of type NanoGrid<BuildT>
     template<typename BufferT = nanovdb::cuda::DeviceBuffer>
-    // GridHandle<BufferT>
-    void
+    GridHandle<BufferT>
     getHandle(const BufferT &buffer = BufferT());
 
 private:
@@ -173,8 +172,7 @@ public:
 
 template<typename BuildT>
 template<typename BufferT>
-// GridHandle<BufferT>
-void
+GridHandle<BufferT>
 MeshToGrid<BuildT>::getHandle(const BufferT &pool)
 {
     cudaStreamSynchronize(mStream);
@@ -272,80 +270,7 @@ MeshToGrid<BuildT>::getHandle(const BufferT &pool)
         printf("Active voxels: %llu\n", (unsigned long long)voxelCount);
     }
 
-    cudaStreamSynchronize(mStream);
-
-    // int device = 0;
-    // cudaGetDevice(&device);
-    // mXformedTriangles.deviceDownload(device, mStream, false);
-    // while(1) {
-    //     int tri;
-    //     std::cin >> tri;
-    //     for (int v = 0; v < 3; v++) {
-    //         for (int w = 0; w < 3; w++)
-    //             std::cout << hostXformedTriangles()[tri][v][w] << " ";
-    //         std::cout << std::endl;
-    //     }
-    // }
-    
-#if 0
-    // Copy TreeData from GPU -> CPU
-    mSrcTreeData = util::cuda::DeviceGridTraits<BuildT>::getTreeData(mDeviceSrcGrid);
-
-    // Ensure that the input grid contains no tile values
-    if (mSrcTreeData.mTileCount[2] || mSrcTreeData.mTileCount[1] || mSrcTreeData.mTileCount[0])
-        throw std::runtime_error("Topological operations not supported on grids with value tiles");
-
-    // Speculatively dilate root node
-    if (mVerbose==1) mTimer.start("\nDilating root node");
-    dilateRoot();
-
-    // Allocate memory for dilated upper/lower masks
-    if (mVerbose==1) mTimer.restart("Allocating internal node mask buffers");
-    mBuilder.allocateInternalMaskBuffers(mStream);
-
-    // Dilate masks of upper/lower nodes
-    if (mVerbose==1) mTimer.restart("Dilate internal nodes");
-    dilateInternalNodes();
-
-    // Enumerate tree nodes
-    if (mVerbose==1) mTimer.restart("Count dilated tree nodes");
-    mBuilder.countNodes(mStream);
-
-    cudaStreamSynchronize(mStream);
-
-    // Allocate new device grid buffer for dilated result
-    if (mVerbose==1) mTimer.restart("Allocating dilated grid buffer");
-    auto buffer = mBuilder.getBuffer(pool, mStream);
-
-    // Process GridData/TreeData/RootData of dilated result
-    if (mVerbose==1) mTimer.restart("Processing grid/tree/root");
-    processGridTreeRoot();
-
-    // Process upper nodes of dilated result
-    if (mVerbose==1) mTimer.restart("Processing upper nodes");
-    mBuilder.processUpperNodes(mStream);
-
-    // Process lower nodes of dilated result
-    if (mVerbose==1) mTimer.restart("Processing lower nodes");
-    mBuilder.processLowerNodes(mStream);
-
-    // Dilate leaf node active masks into new topology
-    if (mVerbose==1) mTimer.restart("Dilating leaf nodes");
-    dilateLeafNodes();
-
-    // Process bounding boxes
-    if (mVerbose==1) mTimer.restart("Processing bounding boxes");
-    mBuilder.processBBox(mStream);
-
-    // Post-process Grid/Tree data
-    if (mVerbose==1) mTimer.restart("Post-processing grid/tree data");
-    mBuilder.postProcessGridTree(mStream);
-    if (mVerbose==1) mTimer.stop();
-
-    cudaStreamSynchronize(mStream);
-
-    return GridHandle<BufferT>(std::move(buffer));
-#endif
+    return GridHandle<BufferT>(std::move(gridBuffer));
 } // MeshToGrid<BuildT>::getHandle
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------

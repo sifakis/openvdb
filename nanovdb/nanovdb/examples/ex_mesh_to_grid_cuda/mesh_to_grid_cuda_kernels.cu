@@ -8,6 +8,7 @@
 
 #include <openvdb/openvdb.h>
 
+#include <limits>
 #include <set>
 #include <array>
 

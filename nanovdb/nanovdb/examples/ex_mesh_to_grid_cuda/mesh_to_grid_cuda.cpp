@@ -133,17 +133,17 @@ int main(int argc, char *argv[])
         openvdb::math::Transform::Ptr transform =
             openvdb::math::Transform::createLinearTransform(voxelSize);
 
-        // Convert Mesh to Level Set (SDF)
+        // Convert Mesh to Unsigned Distance Field (UDF)
         // halfband specifies the half-width of the narrow band in voxel units
-        float halfband = 3.0f; 
-        cpuTimer.start("Converting mesh to OpenVDB level set");
-        openvdb::FloatGrid::Ptr grid = openvdb::tools::meshToLevelSet<openvdb::FloatGrid>(
-        *transform, openvdb_points, openvdb_triangles, quads, halfband);
+        float halfband = 3.0f;
+        cpuTimer.start("Converting mesh to OpenVDB unsigned distance field");
+        openvdb::FloatGrid::Ptr grid = openvdb::tools::meshToUnsignedDistanceField<openvdb::FloatGrid>(
+            *transform, openvdb_points, openvdb_triangles, quads, halfband);
         cpuTimer.stop();
 
 
         // Write the Grid to a VDB File
-        grid->setName("LevelSet");
+        grid->setName("UnsignedDistanceField");
         grid->print(std::cout, 2);
         std::cout << "Writing to " << outputFile << "..." << std::endl;
         openvdb::GridPtrVec grids;

@@ -23,6 +23,7 @@
 #include <nanovdb/util/cuda/Timer.h>
 #include <nanovdb/tools/cuda/TopologyBuilder.cuh>
 #include <nanovdb/util/cuda/Rasterization.cuh>
+#include <nanovdb/util/cuda/DeviceGridTraits.cuh>
 
 namespace nanovdb {
 
@@ -81,7 +82,7 @@ public:
 
     /// @brief Set the name of the output grid
     /// @param name Grid name string
-    void setGridName(const std::string& name) { mGridName = name; }
+    void setGridName(const std::string &name) { mGridName = name; }
 
     /// @brief Set the mode for checksum computation, which is disabled by default
     /// @param mode Mode of checksum computation
@@ -110,6 +111,8 @@ private:
     void rasterizeInternalNodes();
 
     void processGridTreeRoot();
+
+    void rasterizeLeafNodes();
 
 
     static constexpr unsigned int mNumThreads = 128;// for kernels spawned via lambdaKernel (others may specialize)
@@ -143,10 +146,10 @@ private:
     // For diagnostic purposes
 public:
     uint64_t getPairCount() const { return mBoxTrianglePairCount; }
-    const BoxTrianglePair* getDevicePairs() const { return static_cast<const BoxTrianglePair*>(mBoxTrianglePairsBuffer.deviceData()); }
+    const BoxTrianglePair *getDevicePairs() const { return static_cast<const BoxTrianglePair*>(mBoxTrianglePairsBuffer.deviceData()); }
 
     uint64_t getRootTileCount() const { return mUniqueRootTileCount; }
-    const nanovdb::Coord* getDeviceRootOrigins() const { return static_cast<const nanovdb::Coord*>(mUniqueRootOriginsBuffer.deviceData()); }
+    const nanovdb::Coord *getDeviceRootOrigins() const { return static_cast<const nanovdb::Coord*>(mUniqueRootOriginsBuffer.deviceData()); }
 }; // tools::cuda::MeshToGrid<BuildT>
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -217,7 +220,7 @@ MeshToGrid<BuildT>::getHandle(const BufferT &pool)
     cudaStreamSynchronize(mStream); // node counts written async; sync before reading or passing to getBuffer
     if (mVerbose==1) {
         mTimer.stop();
-        printf("Node counts — upper: %u  lower: %u  leaf: %u\n",
+        printf("Node counts - upper: %u  lower: %u  leaf: %u\n",
                mBuilder.data()->nodeCount[2],
                mBuilder.data()->nodeCount[1],
                mBuilder.data()->nodeCount[0]);
@@ -232,6 +235,44 @@ MeshToGrid<BuildT>::getHandle(const BufferT &pool)
     if (mVerbose==1) mTimer.start("Processing grid/tree/root");
     processGridTreeRoot();
     if (mVerbose==1) mTimer.stop();
+
+    // Connect upper nodes to root tiles and fill upper node preambles
+    if (mVerbose==1) mTimer.start("Processing upper nodes");
+    mBuilder.processUpperNodes(mStream);
+    if (mVerbose==1) mTimer.stop();
+
+    // Fill lower node data and leaf node preambles; releases intermediate mask buffers
+    if (mVerbose==1) mTimer.start("Processing lower nodes");
+    mBuilder.processLowerNodes(mStream);
+    if (mVerbose==1) mTimer.stop();
+
+    // Fill leaf voxel value masks via exact point-to-triangle UDF
+    if (mVerbose==1) mTimer.start("Rasterizing leaf nodes");
+    rasterizeLeafNodes();
+    if (mVerbose==1) mTimer.stop();
+
+    // Update leaf value offsets (prefix sums of per-leaf active voxel counts)
+    if (mVerbose==1) mTimer.start("Processing leaf offsets");
+    mBuilder.processLeafOffsets(mStream);
+    if (mVerbose==1) mTimer.stop();
+
+    // Compute world-space bounding boxes
+    if (mVerbose==1) mTimer.start("Processing bounding boxes");
+    mBuilder.processBBox(mStream);
+    if (mVerbose==1) mTimer.stop();
+
+    // Finalize tree statistics (total active voxel count, etc.)
+    if (mVerbose==1) mTimer.start("Post-processing grid/tree data");
+    mBuilder.postProcessGridTree(mStream);
+    cudaStreamSynchronize(mStream);
+    if (mVerbose==1) {
+        mTimer.stop();
+        const auto voxelCount = util::cuda::DeviceGridTraits<BuildT>::getActiveVoxelCount(
+            &mBuilder.data()->getGrid());
+        printf("Active voxels: %llu\n", (unsigned long long)voxelCount);
+    }
+
+    cudaStreamSynchronize(mStream);
 
     // int device = 0;
     // cudaGetDevice(&device);
@@ -548,7 +589,7 @@ namespace topology::detail {
 ///        (typical after SAT culling at finer scales). It does incur warp divergence since
 ///        different parents may have different child counts. An alternative would be a
 ///        1-CTA-per-parent launch (512 threads, one per child sub-box) with a warp-level
-///        scan to compute local write offsets — better for dense masks but more complex.
+///        scan to compute local write offsets - better for dense masks but more complex.
 ///        Profile before switching.
 template <typename BuildT>
 struct ScatterChildPairsFunctor
@@ -789,7 +830,7 @@ void MeshToGrid<BuildT>::enumerateRootTiles()
 
     nanovdb::cuda::DeviceBuffer keysBuffer = nanovdb::cuda::DeviceBuffer::create(
         mBoxTrianglePairCount * sizeof(uint64_t), nullptr, device, mStream);
-    auto* dKeys = static_cast<uint64_t*>(keysBuffer.deviceData());
+    auto *dKeys = static_cast<uint64_t*>(keysBuffer.deviceData());
 
     util::cuda::lambdaKernel<<<numBlocks(mBoxTrianglePairCount), mNumThreads, 0, mStream>>>(
         mBoxTrianglePairCount,
@@ -802,7 +843,7 @@ void MeshToGrid<BuildT>::enumerateRootTiles()
 
     nanovdb::cuda::DeviceBuffer sortedKeysBuffer = nanovdb::cuda::DeviceBuffer::create(
         mBoxTrianglePairCount * sizeof(uint64_t), nullptr, device, mStream);
-    auto* dSortedKeys = static_cast<uint64_t*>(sortedKeysBuffer.deviceData());
+    auto *dSortedKeys = static_cast<uint64_t*>(sortedKeysBuffer.deviceData());
 
     CALL_CUBS(DeviceRadixSort::SortKeys, dKeys, dSortedKeys, (int)mBoxTrianglePairCount, 0, 64);
 
@@ -811,11 +852,11 @@ void MeshToGrid<BuildT>::enumerateRootTiles()
 
     nanovdb::cuda::DeviceBuffer uniqueKeysBuffer = nanovdb::cuda::DeviceBuffer::create(
         mBoxTrianglePairCount * sizeof(uint64_t), nullptr, device, mStream);
-    auto* dUniqueKeys = static_cast<uint64_t*>(uniqueKeysBuffer.deviceData());
+    auto *dUniqueKeys = static_cast<uint64_t*>(uniqueKeysBuffer.deviceData());
 
     nanovdb::cuda::DeviceBuffer numSelectedBuffer = nanovdb::cuda::DeviceBuffer::create(
         sizeof(int32_t), nullptr, device, mStream);
-    auto* dNumSelected = static_cast<int32_t*>(numSelectedBuffer.deviceData());
+    auto *dNumSelected = static_cast<int32_t*>(numSelectedBuffer.deviceData());
 
     CALL_CUBS(DeviceSelect::Unique, dSortedKeys, dUniqueKeys, dNumSelected, (int)mBoxTrianglePairCount);
 
@@ -831,7 +872,7 @@ void MeshToGrid<BuildT>::enumerateRootTiles()
 
     mUniqueRootOriginsBuffer = nanovdb::cuda::DeviceBuffer::create(
         mUniqueRootTileCount * sizeof(nanovdb::Coord), nullptr, device, mStream);
-    auto* dOrigins = static_cast<nanovdb::Coord*>(mUniqueRootOriginsBuffer.deviceData());
+    auto *dOrigins = static_cast<nanovdb::Coord*>(mUniqueRootOriginsBuffer.deviceData());
 
     util::cuda::lambdaKernel<<<numBlocks(mUniqueRootTileCount), mNumThreads, 0, mStream>>>(
         mUniqueRootTileCount,
@@ -863,7 +904,7 @@ void MeshToGrid<BuildT>::buildRasterizedRoot()
     // filled by TopologyBuilder's subsequent pipeline stages.
     uint64_t rootSize = RootT::memUsage(tileCount);
     mBuilder.mProcessedRoot = nanovdb::cuda::DeviceBuffer::create(rootSize);
-    auto* rootPtr = static_cast<RootT*>(mBuilder.mProcessedRoot.data());
+    auto *rootPtr = static_cast<RootT*>(mBuilder.mProcessedRoot.data());
     rootPtr->mTableSize = tileCount;
     rootPtr->mBackground = typename RootT::ValueType{};
     for (uint32_t t = 0; t < tileCount; ++t)
@@ -880,8 +921,8 @@ void MeshToGrid<BuildT>::rasterizeInternalNodes()
 {
     using RasterizerT = util::rasterization::cuda::RasterizeInternalNodesFunctor<BuildT, BoxTrianglePair>;
 
-    auto* dUpperMasks = static_cast<Mask<5>*>(mBuilder.deviceUpperMasks());
-    auto* dLowerMasks = static_cast<Mask<4>(*)[Mask<5>::SIZE]>(mBuilder.deviceLowerMasks());
+    auto *dUpperMasks = static_cast<Mask<5>*>(mBuilder.deviceUpperMasks());
+    auto *dLowerMasks = static_cast<Mask<4>(*)[Mask<5>::SIZE]>(mBuilder.deviceLowerMasks());
 
     util::cuda::lambdaKernel<<<numBlocks(mBoxTrianglePairCount), mNumThreads, 0, mStream>>>(
         mBoxTrianglePairCount,
@@ -904,7 +945,7 @@ void MeshToGrid<BuildT>::processGridTreeRoot()
     cudaCheckError();
 
     // Copy grid name into the output grid's name field
-    char* dst = mBuilder.data()->getGrid().mGridName;
+    char *dst = mBuilder.data()->getGrid().mGridName;
     if (!mGridName.empty()) {
         cudaCheck(cudaMemcpyAsync(dst, mGridName.data(), GridData::MaxNameSize, cudaMemcpyHostToDevice, mStream));
     } else {
@@ -912,6 +953,22 @@ void MeshToGrid<BuildT>::processGridTreeRoot()
     }
 
 } // MeshToGrid<BuildT>::processGridTreeRoot
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+template<typename BuildT>
+void MeshToGrid<BuildT>::rasterizeLeafNodes()
+{
+    if (mBoxTrianglePairCount == 0) return;
+
+    using FunctorT = util::rasterization::cuda::RasterizeLeafNodesFunctor<BuildT, BoxTrianglePair>;
+    util::cuda::operatorKernelInstance<FunctorT>
+        <<<mBoxTrianglePairCount, FunctorT::MaxThreadsPerBlock, 0, mStream>>>(
+            FunctorT{ deviceBoxTrianglePairs(), deviceXformedTriangles(),
+                      &mBuilder.data()->getGrid(), mBandWidth * mBandWidth });
+    cudaCheckError();
+
+} // MeshToGrid<BuildT>::rasterizeLeafNodes
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 

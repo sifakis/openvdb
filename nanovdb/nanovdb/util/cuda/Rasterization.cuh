@@ -175,7 +175,7 @@ struct ComputeUDFFunctor
 
         const auto &pair = dPairs[pairID];
         const auto *leaf = dGrid->tree().root().probeLeaf(pair.origin);
-
+        if (!leaf) return;
         if (!leaf->isActive(threadID)) return;
 
         const int lx =  threadID       & 0x7;

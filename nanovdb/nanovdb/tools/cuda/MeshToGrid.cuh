@@ -22,6 +22,7 @@
 #include <nanovdb/cuda/TempPool.h>
 #include <nanovdb/util/cuda/Timer.h>
 #include <nanovdb/tools/cuda/TopologyBuilder.cuh>
+#include <nanovdb/tools/cuda/PruneGrid.cuh>
 #include <nanovdb/util/cuda/Rasterization.cuh>
 #include <nanovdb/util/cuda/DeviceGridTraits.cuh>
 
@@ -289,7 +290,20 @@ MeshToGrid<BuildT>::getHandle(const BufferT &pool)
         printf("Active voxels: %llu\n", (unsigned long long)voxelCount);
     }
 
-    return GridHandle<BufferT>(std::move(gridBuffer));
+    if (mVerbose==1) mTimer.start("Pruning empty leaves");
+    int device = 0; cudaGetDevice(&device);
+    const uint32_t leafCount = mBuilder.data()->nodeCount[0];
+    nanovdb::cuda::DeviceBuffer retainMaskBuffer = nanovdb::cuda::DeviceBuffer::create(
+        uint64_t(leafCount) * sizeof(nanovdb::Mask<3>), nullptr, device, mStream);
+    cudaCheck(cudaMemsetAsync(retainMaskBuffer.deviceData(), 0xFF,
+        uint64_t(leafCount) * sizeof(nanovdb::Mask<3>), mStream));
+    tools::cuda::PruneGrid<BuildT> pruner(
+        static_cast<const GridT*>(gridBuffer.deviceData()),
+        static_cast<nanovdb::Mask<3>*>(retainMaskBuffer.deviceData()),
+        mStream);
+    auto prunedHandle = pruner.template getHandle<BufferT>(pool);
+    if (mVerbose==1) mTimer.stop();
+    return prunedHandle;
 } // MeshToGrid<BuildT>::getHandle
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -1135,18 +1149,27 @@ MeshToGrid<BuildT>::getHandleAndUDF(const GridBufferT& gridPool, const SidecarBu
     cudaStreamSynchronize(mStream);
     if (mVerbose==1) mTimer.stop();
 
-    // ---- UDF sidecar ----
+    if (mVerbose==1) mTimer.start("Pruning empty leaves");
+    int device = 0; cudaGetDevice(&device);
+    const uint32_t leafCount = mBuilder.data()->nodeCount[0];
+    nanovdb::cuda::DeviceBuffer retainMaskBuffer = nanovdb::cuda::DeviceBuffer::create(
+        uint64_t(leafCount) * sizeof(nanovdb::Mask<3>), nullptr, device, mStream);
+    cudaCheck(cudaMemsetAsync(retainMaskBuffer.deviceData(), 0xFF,
+        uint64_t(leafCount) * sizeof(nanovdb::Mask<3>), mStream));
+    tools::cuda::PruneGrid<BuildT> pruner(
+        static_cast<const GridT*>(gridBuffer.deviceData()),
+        static_cast<nanovdb::Mask<3>*>(retainMaskBuffer.deviceData()),
+        mStream);
+    auto handle = pruner.template getHandle<GridBufferT>(gridPool);
+    if (mVerbose==1) mTimer.stop();
 
-    auto handle = GridHandle<GridBufferT>(std::move(gridBuffer));
+    // ---- UDF sidecar ----
 
     const float voxelSize = (float)mMap.getVoxelSize()[0];
 
     const uint64_t activeVoxelCount = util::cuda::DeviceGridTraits<BuildT>::getActiveVoxelCount(
         handle.template deviceGrid<BuildT>());
     if (mVerbose>=2) printf("Active voxels: %llu\n", (unsigned long long)activeVoxelCount);
-
-    int device = 0;
-    cudaGetDevice(&device);
 
     auto sidecarBuffer = nanovdb::cuda::DeviceBuffer::create(
         (activeVoxelCount + 1) * sizeof(float), nullptr, device, mStream);

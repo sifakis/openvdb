@@ -104,8 +104,7 @@ void mainMeshToGrid(
                          sidecar.size(), cudaMemcpyDeviceToHost));
 
     // For each active voxel in our grid, compare our UDF against OpenVDB's.
-    // Our sidecar is in index space (voxel units); OpenVDB stores world-space distances.
-    // Scale our value by voxelSize before comparing.
+    // Both our sidecar and OpenVDB store world-space distances; error is reported in voxels.
     const float voxelSize = (float)refGrid->voxelSize()[0];
     // Split histogram between true positives (active in both) and false positives
     // (active in ours only). For false positives, refUDF = background = mBandWidth,
@@ -135,11 +134,11 @@ void mainMeshToGrid(
 
             const openvdb::Coord coord(x, y, z);
             const uint64_t sidecarIdx = leaf.getValue(vi);
-            const float ourUDF_world = hostSidecar[sidecarIdx] * voxelSize;
+            const float ourUDF_world = hostSidecar[sidecarIdx];
             const float refUDF       = ovdbAcc.getValue(coord);
             const float err = std::abs(ourUDF_world - refUDF) / voxelSize;
 
-            const WorstVoxel candidate{ x, y, z, hostSidecar[sidecarIdx],
+            const WorstVoxel candidate{ x, y, z, ourUDF_world / voxelSize,
                                         refUDF / voxelSize, err, !ovdbAcc.isValueOn(coord) };
 
             if (ovdbAcc.isValueOn(coord)) {

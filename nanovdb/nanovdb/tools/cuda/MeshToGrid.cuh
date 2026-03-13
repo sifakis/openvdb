@@ -1034,20 +1034,21 @@ struct InitSidecarFunctor
     __device__ void operator()(size_t i) const { dSidecar[i] = 0x7F7FFFFFu; }
 };
 
-/// @brief Finalizes the sidecar after the atomic-min UDF pass:
-///          - slot 0 (background) <- mBandWidth
-///          - slot k (active)     <- sqrtf(distSqr)  if a triangle contributed
-///                                <- mBandWidth       otherwise (false-positive voxels)
+/// @brief Finalizes the sidecar after the atomic-min UDF pass, emitting world-space distances:
+///          - slot 0 (background) <- mBandWidth * voxelSize
+///          - slot k (active)     <- sqrtf(distSqr) * voxelSize  if a triangle contributed
+///                                <- mBandWidth * voxelSize       otherwise (false-positive voxels)
 struct FinalizeSidecarFunctor
 {
     float *dSidecar;
-    float  bandWidth;
+    float  bandWidth; // world-space = mBandWidth * voxelSize
+    float  voxelSize;
 
     __device__ void operator()(size_t i) const
     {
         if (i == 0) { dSidecar[0] = bandWidth; return; }
         const uint32_t bits = __float_as_uint(dSidecar[i]);
-        dSidecar[i] = (bits == 0x7F7FFFFFu) ? bandWidth : sqrtf(dSidecar[i]);
+        dSidecar[i] = (bits == 0x7F7FFFFFu) ? bandWidth : sqrtf(dSidecar[i]) * voxelSize;
     }
 };
 
@@ -1138,6 +1139,8 @@ MeshToGrid<BuildT>::getHandleAndUDF(const GridBufferT& gridPool, const SidecarBu
 
     auto handle = GridHandle<GridBufferT>(std::move(gridBuffer));
 
+    const float voxelSize = (float)mMap.getVoxelSize()[0];
+
     const uint64_t activeVoxelCount = util::cuda::DeviceGridTraits<BuildT>::getActiveVoxelCount(
         handle.template deviceGrid<BuildT>());
     if (mVerbose>=2) printf("Active voxels: %llu\n", (unsigned long long)activeVoxelCount);
@@ -1171,7 +1174,7 @@ MeshToGrid<BuildT>::getHandleAndUDF(const GridBufferT& gridPool, const SidecarBu
     if (mVerbose==1) mTimer.start("Finalizing UDF sidecar (sqrt + clamp)");
     util::cuda::lambdaKernel<<<numBlocks(activeVoxelCount + 1), mNumThreads, 0, mStream>>>(
         activeVoxelCount + 1,
-        topology::detail::FinalizeSidecarFunctor{ dSidecar, mBandWidth });
+        topology::detail::FinalizeSidecarFunctor{ dSidecar, mBandWidth * voxelSize, voxelSize });
     cudaCheckError();
     if (mVerbose==1) mTimer.stop();
 

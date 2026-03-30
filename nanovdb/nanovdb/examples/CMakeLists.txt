@@ -117,8 +117,8 @@ nanovdb_example(NAME "ex_coarsen_nanovdb_cuda" OPENVDB)
 nanovdb_example(NAME "ex_voxelBlockManager_host_cuda")
 if(TARGET ex_voxelBlockManager_host_cuda)
   target_compile_options(ex_voxelBlockManager_host_cuda PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-mavx2>
-    $<$<COMPILE_LANGUAGE:CXX>:-mavx2>)
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-mavx2,-fopenmp-simd>
+    $<$<COMPILE_LANGUAGE:CXX>:-mavx2 -fopenmp-simd>)
 endif()
 
 if(CUDAToolkit_FOUND)

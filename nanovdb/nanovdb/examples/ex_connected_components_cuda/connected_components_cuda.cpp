@@ -47,6 +47,10 @@ void printGridDiagnostics(const GridHandleT& handle, const std::string& title);
 GridHandleT computeDerivedTopology(const GridHandleT& srcHandle, const UDFSidecarT& udfSidecar,
                                    float voxelSize);
 
+/// @brief Implemented on the CUDA side: run connected-components labeling on the (derived)
+///        topology-only index grid. Initially just enumerates per-leaf component counts.
+void computeCC(const GridHandleT& gridHandle);
+
 /// @brief Minimal Wavefront .obj reader (vertices + faces) using NanoVDB types.
 ///
 ///        Polygons with more than 3 vertices are fan-triangulated. Vertex references
@@ -129,7 +133,8 @@ int main(int argc, char* argv[])
         auto derivedHandle = computeDerivedTopology(handle, sidecar, voxelSize);
         printGridDiagnostics(derivedHandle, "Derived CC-input grid");
 
-        // Step 3 (TODO): run the CUDA connected-components labeling on derivedHandle.
+        // Step 3: connected-components labeling on the derived grid.
+        computeCC(derivedHandle);
 
         return 0;
     }

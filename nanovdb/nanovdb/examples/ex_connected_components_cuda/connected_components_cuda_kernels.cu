@@ -16,6 +16,7 @@
 #include <nanovdb/NanoVDB.h>
 #include <nanovdb/tools/cuda/MeshToGrid.cuh>
 #include <nanovdb/tools/cuda/PruneGrid.cuh>
+#include <nanovdb/tools/cuda/ConnectedComponents.cuh>
 #include <nanovdb/util/cuda/DeviceGridTraits.cuh>
 #include <nanovdb/util/cuda/Util.h>
 
@@ -161,4 +162,15 @@ GridHandleT computeDerivedTopology(const GridHandleT& srcHandle, const UDFSideca
     nanovdb::tools::cuda::PruneGrid<BuildT> pruner(d_srcGrid, d_retainMask);
     pruner.setVerbose(1);
     return pruner.getHandle();
+}
+
+void computeCC(const GridHandleT& gridHandle)
+{
+    using BuildT = nanovdb::ValueOnIndex;
+
+    const auto* d_grid = gridHandle.deviceGrid<BuildT>();
+
+    nanovdb::tools::cuda::ConnectedComponents<BuildT> cc(d_grid);
+    cc.setVerbose(1);
+    cc.processLeafConnectedComponents();
 }

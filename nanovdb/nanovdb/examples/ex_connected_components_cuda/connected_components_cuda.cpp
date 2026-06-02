@@ -40,6 +40,13 @@ std::pair<GridHandleT, UDFSidecarT> computeUDF(
 ///        resident index grid (active voxels, node counts, bbox, occupancy, memory).
 void printGridDiagnostics(const GridHandleT& handle, const std::string& title);
 
+/// @brief Implemented on the CUDA side: derive the connected-components input topology by
+///        pruning the surface/barrier shell (voxels within √3/2 voxels of the surface) from
+///        the rasterized index grid via PruneGrid. Returns a clean, topology-only index grid.
+///        voxelSize converts the √3/2-voxel barrier into the sidecar's world-space units.
+GridHandleT computeDerivedTopology(const GridHandleT& srcHandle, const UDFSidecarT& udfSidecar,
+                                   float voxelSize);
+
 /// @brief Minimal Wavefront .obj reader (vertices + faces) using NanoVDB types.
 ///
 ///        Polygons with more than 3 vertices are fan-triangulated. Vertex references
@@ -118,8 +125,11 @@ int main(int argc, char* argv[])
         std::cout << "UDF sidecar                           : "
                   << (sidecar.size() / sizeof(float)) << " floats\n";
 
-        // Step 2 (TODO): derive a connected-components input grid from { handle, sidecar }
-        //                and run the CUDA connected-components labeling on it.
+        // Step 2: derive the CC-input topology by pruning the surface/barrier shell.
+        auto derivedHandle = computeDerivedTopology(handle, sidecar, voxelSize);
+        printGridDiagnostics(derivedHandle, "Derived CC-input grid");
+
+        // Step 3 (TODO): run the CUDA connected-components labeling on derivedHandle.
 
         return 0;
     }

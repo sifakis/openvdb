@@ -15,7 +15,9 @@
 
 #include <nanovdb/NanoVDB.h>
 #include <nanovdb/tools/cuda/MeshToGrid.cuh>
+#include <nanovdb/tools/cuda/PruneGrid.cuh>
 #include <nanovdb/util/cuda/DeviceGridTraits.cuh>
+#include <nanovdb/util/cuda/Util.h>
 
 #include <thrust/universal_vector.h>
 
@@ -85,4 +87,78 @@ void printGridDiagnostics(const GridHandleT& handle, const std::string& title)
               << (leafNodes ? 100.f * float(activeVoxels) / float(leafNodes * 512) : 0.f)
               << "%\n";
     std::cout << "Memory usage                          : " << gridSize << " bytes\n";
+}
+
+namespace {
+
+/// @brief CUDA functor: build a per-leaf retain bitmask that drops the surface/barrier
+///        shell. A voxel is PRUNED iff it is within √3/2 voxels of the surface (half a
+///        voxel space-diagonal - the same barrier OpenVDB's MeshToVolume uses); every
+///        other active voxel is RETAINED. Because the UDF sidecar is in WORLD units, the
+///        test is udf^2 < (√3/2 · voxelSize)^2 = 0.75 · voxelSize^2, passed in precomputed.
+///
+///        Mirrors Benchmark.cu's PruneNarrowBandFunctor: launched via operatorKernel, one
+///        block per leaf, 512 threads per block (one thread per voxel in the 8^3 leaf).
+template <typename BuildT>
+struct UDFBarrierPruneMaskFunctor
+{
+    static constexpr int MaxThreadsPerBlock         = 512;
+    static constexpr int MinBlocksPerMultiprocessor = 1;
+
+    __device__ void operator()(
+        const nanovdb::NanoGrid<BuildT>* d_grid,
+        const float*                     d_udf,           // UDF sidecar, WORLD units
+        float                            barrierSqWorld,  // (√3/2 · voxelSize)^2, world^2 units
+        nanovdb::Mask<3>*                d_dstLeafMasks)
+    {
+        const int leafID   = blockIdx.x;
+        const int threadID = threadIdx.x;
+
+        const auto& leaf       = d_grid->tree().template getFirstNode<0>()[leafID];
+        auto&       resultMask = d_dstLeafMasks[leafID];
+
+        // Clear the leaf's mask words in parallel, then fill the retain bits.
+        if (threadID < nanovdb::Mask<3>::WORD_COUNT)
+            resultMask.words()[threadID] = 0UL;
+        __syncthreads();
+
+        if (auto n = leaf.data()->getValue(threadID)) {  // n != 0 => active voxel
+            const float udf = d_udf[n];
+            if (udf * udf >= barrierSqWorld)            // retain non-barrier voxels
+                resultMask.setOnAtomic(threadID);
+        }
+    }
+};
+
+} // anonymous namespace
+
+GridHandleT computeDerivedTopology(const GridHandleT& srcHandle, const UDFSidecarT& udfSidecar,
+                                   float voxelSize)
+{
+    using BuildT  = nanovdb::ValueOnIndex;
+    using PruneOp = UDFBarrierPruneMaskFunctor<BuildT>;
+
+    // Barrier threshold √3/2 voxels expressed in the sidecar's WORLD units, squared.
+    const float barrierSqWorld = 0.75f * voxelSize * voxelSize;
+
+    const auto*  d_srcGrid = srcHandle.deviceGrid<BuildT>();
+    const float* d_udf     = static_cast<const float*>(udfSidecar.deviceData());
+
+    const uint32_t srcLeafCount =
+        nanovdb::util::cuda::DeviceGridTraits<BuildT>::getTreeData(d_srcGrid).mNodeCount[0];
+
+    // Leaf-indexed retain mask: one Mask<3> (512 bits) per source leaf (device-only).
+    auto retainMask = nanovdb::cuda::DeviceBuffer::create(
+        std::size_t(srcLeafCount) * sizeof(nanovdb::Mask<3>), nullptr, false);
+    auto* d_retainMask = static_cast<nanovdb::Mask<3>*>(retainMask.deviceData());
+
+    // Build the retain mask (drop voxels within √3/2 voxels of the surface).
+    nanovdb::util::cuda::operatorKernel<PruneOp>
+        <<<srcLeafCount, PruneOp::MaxThreadsPerBlock>>>(d_srcGrid, d_udf, barrierSqWorld, d_retainMask);
+    cudaCheck(cudaGetLastError());
+
+    // Topological pruning -> clean, topology-only derived index grid (UDF no longer needed).
+    nanovdb::tools::cuda::PruneGrid<BuildT> pruner(d_srcGrid, d_retainMask);
+    pruner.setVerbose(1);
+    return pruner.getHandle();
 }

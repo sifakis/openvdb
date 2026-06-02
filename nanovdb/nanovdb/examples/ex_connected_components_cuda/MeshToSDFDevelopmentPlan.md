@@ -26,14 +26,18 @@ in and returning device buffers (`GridHandle<DeviceBuffer>`, `DeviceBuffer`) out
 1. **`computeUDF(points, triangles, map, bandWidth)` → `{ handle, sidecar }`** *(done)*
    Rasterize the mesh into a narrow-band `ValueOnIndex` grid (every active voxel gets a
    dense index in `[1, N]`) plus a UDF sidecar of `N+1` floats:
-   `sidecar[0]` = background (band width), `sidecar[leaf.getValue(vi)]` = that voxel's
-   unsigned distance to the closest triangle, in voxel units. This is
-   `nanovdb::tools::cuda::MeshToGrid` and is shared, conceptually, with
-   `ex_mesh_to_grid_cuda` (which is really *mesh → UDF*).
+   `sidecar[0]` = background, `sidecar[leaf.getValue(vi)]` = that voxel's unsigned distance
+   to the closest triangle. This is `nanovdb::tools::cuda::MeshToGrid`, shared conceptually
+   with `ex_mesh_to_grid_cuda` (which is really *mesh → UDF*).
+   **⚠ UNITS:** despite the comment in `MeshToGrid.cuh` saying "voxel units", the sidecar
+   is in **WORLD units** — `sidecar[0] = bandWidth · voxelSize` and values are clamped to it.
+   (Verified empirically: dragon @ voxelSize 0.0005, bandWidth 3 → background = max = 0.0015.
+   Also consistent with `ex_mesh_to_grid_cuda` comparing against OpenVDB's world-space SDF.)
 
-2. **Derive a CC-input topology from `{ handle, sidecar }`** *(specified below; not yet implemented)*
-   The CC labeling does **not** run on the raw rasterized grid; it runs on the rasterized
-   active set with the **surface/barrier shell removed** (see "Derivative topology" below).
+2. **Derive a CC-input topology from `{ handle, sidecar }`** *(DONE — `computeDerivedTopology`)*
+   Runs the rasterized active set with the **surface/barrier shell removed** (see "Derivative
+   topology" below). On the dragon @ 0.0005: 41,492,695 active voxels → **29,512,911** after
+   pruning (~12.0M barrier voxels dropped), exit 0.
 
 3. **Connected-components labeling (CUDA)** *(TODO)*
    Label active voxels of the derived grid so two voxels share a label iff connected
@@ -100,34 +104,44 @@ empty leaves dropped, giving a fresh dense `[1, N']` index space to run CC on. (
 alternative was masking in place and having CC skip barrier voxels — cheaper, but it leaves
 CC operating on a sparser-than-necessary index space and complicates neighbor logic.)
 
-Mechanism (mirrors `ex_dilate_nanovdb_cuda`'s prune step):
+Mechanism as built (`computeDerivedTopology`, mirrors `Benchmark.cu`'s `pruneNarrowBand`):
 
-1. `leafCount = DeviceGridTraits<BuildT>::getTreeData(dGrid).mNodeCount[0]`.
-2. Allocate a retain-mask sidecar: `DeviceBuffer` of `leafCount * sizeof(nanovdb::Mask<3>)`
-   (one 512-bit mask per source leaf, in leaf order).
-3. Fill it with a **custom per-leaf predicate functor** launched 1-thread-per-leaf via
-   `nanovdb::util::cuda::lambdaKernel`. NOTE: we cannot reuse `InjectGridMaskFunctor` — that
-   derives the mask from a *second grid's* topology (`probeLeaf` + `valueMask` intersection).
-   Our keep/drop signal is the UDF sidecar, so the functor evaluates the predicate directly:
+1. `srcLeafCount = DeviceGridTraits<BuildT>::getTreeData(dGrid).mNodeCount[0]`.
+2. Allocate a retain-mask sidecar: a device `DeviceBuffer` of one `nanovdb::Mask<3>` (512 bits)
+   per source leaf, in leaf order. (During debugging this was a `thrust::universal_vector` so the
+   host could popcount it directly; reverted to `DeviceBuffer` once verified.)
+3. Fill it with a **custom per-leaf predicate functor** launched via
+   `nanovdb::util::cuda::operatorKernel`, **one block per leaf, 512 threads** (one per voxel).
+   NOTE: we cannot reuse `InjectGridMaskFunctor` — that derives the mask from a *second grid's*
+   topology (`probeLeaf` + `valueMask` intersection). Our keep/drop signal is the UDF sidecar,
+   so the functor evaluates the predicate directly:
 
    ```cpp
-   // Retain non-barrier voxels: keep iff UDF² > 0.75 (UDF > √3/2 voxels).
+   const int leafID = blockIdx.x, threadID = threadIdx.x;   // threadID is the voxel offset
    const auto& leaf = d_grid->tree().template getFirstNode<0>()[leafID];
    auto&       mask = d_retainMask[leafID];
-   mask.setOff();
-   for (uint32_t vi = 0; vi < 512; ++vi) {
-       if (!leaf.isActive(vi)) continue;          // keep retain ⊆ active
-       const float udf = d_udf[leaf.getValue(vi)];
-       if (udf * udf > 0.75f) mask.setOn(vi);     // drop the surface/barrier shell
+   if (threadID < nanovdb::Mask<3>::WORD_COUNT) mask.words()[threadID] = 0UL; // parallel clear
+   __syncthreads();                                          // REQUIRED: clear-before-set
+   if (auto n = leaf.data()->getValue(threadID)) {           // n != 0 => active voxel
+       const float udf = d_udf[n];
+       if (udf * udf >= barrierSqWorld) mask.setOnAtomic(threadID);  // retain non-barrier
    }
    ```
-   Use `udf*udf > 0.75f` (not `udf > 0.866f`) — exact match to OpenVDB's squared test, no
-   `sqrtf`/literal-precision concern. 1-thread-per-leaf × 512 voxels is the simple first cut;
-   a word-wise mask build is a later optimization.
 4. `PruneGrid<BuildT>(dGrid, dRetainMask).getHandle()` → the derived topology-only grid.
+
+**⚠ UNITS GOTCHA (cost a debugging session):** the barrier is √3/2 *voxels*, but the UDF
+sidecar is in *world* units (see step 1). So the host precomputes
+`barrierSqWorld = 0.75f · voxelSize²` and passes it in; comparing `udf*udf >= 0.75f` directly
+(voxel-unit assumption) makes the predicate always-false at small voxelSize → an **all-zero
+retain mask** → PruneGrid builds an empty grid and then **segfaults** in `processLowerNodes`
+(8 root tiles but 0 upper/lower/leaf nodes). Always sanity-check the retain mask is non-empty.
 
 PruneGrid semantics (confirmed): its `d_srcLeafMask` is "a sidecar array of leaf masks for
 **voxels to retain**" → set bit = keep. After this the UDF sidecar is no longer needed for CC.
+
+Open follow-ups: (a) `MeshToGrid.cuh`'s doc comment says the sidecar is "voxel units" but it's
+world units — worth fixing upstream. (b) `PruneGrid` segfaulting on an all-empty mask instead of
+producing an empty grid / throwing is a robustness bug worth reporting.
 
 ## Build & run
 

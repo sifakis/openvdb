@@ -3918,3 +3918,131 @@ TEST(TestNanoVDBCUDA, MeshToGrid_UnitTetrahedron)
     // getHandle() and getHandleAndUDF() must produce identical grids.
     EXPECT_EQ(grid->mChecksum.full(), topoChecksum);
 }// MeshToGrid_UnitTetrahedron
+
+// CPU-only reference/oracle for the first connected-components milestone: for each
+// NanoVDB leaf independently, count the 6-connected components formed by its active
+// voxels inside the 8^3 leaf (cross-leaf connectivity is ignored). This is host-only
+// (no CUDA, no OpenVDB); it exists to be compared, later, against the device result of
+// nanovdb::tools::cuda::ConnectedComponents::processLeafConnectedComponents()
+// (download deviceLeafComponentCounts() and compare elementwise).
+TEST(TestNanoVDBCUDA, LeafConnectedComponents)
+{
+    using SrcGridT = nanovdb::tools::build::Grid<float>;
+
+    // Build a CPU ValueOnIndex grid from a set of active voxel coordinates, then return
+    // the per-leaf 6-connected component counts (in leaf storage order). The union-find
+    // is local to each leaf: parent[vi]=vi for active voxels, -1 for inactive; each voxel
+    // is unioned only with its active +X/+Y/+Z in-leaf neighbors so each undirected face
+    // edge is visited once; the larger root is attached under the smaller root for a
+    // deterministic forest; the component count is the number of surviving roots.
+    auto componentCounts = [](const std::vector<nanovdb::Coord>& active) -> std::vector<uint16_t> {
+        SrcGridT srcGrid(0.0f);
+        auto srcAcc = srcGrid.getAccessor();
+        for (const auto& ijk : active) srcAcc.setValue(ijk, 1.0f);// setValue activates the voxel
+        auto handle = nanovdb::tools::createNanoGrid<SrcGridT, nanovdb::ValueOnIndex>(srcGrid);
+        const auto* grid = handle.template grid<nanovdb::ValueOnIndex>();
+        EXPECT_TRUE(grid);
+
+        const auto&    tree      = grid->tree();
+        const uint32_t leafCount = tree.nodeCount(0);
+        const auto*    leaves    = tree.getFirstLeaf();
+
+        int parent[512] = {};// re-initialized per leaf below; zero-init quiets "used before set"
+        // Iterative find with path halving (only ever called on active entries).
+        auto find = [&](int i) {
+            while (parent[i] != i) { parent[i] = parent[parent[i]]; i = parent[i]; }
+            return i;
+        };
+        auto unite = [&](int a, int b) {
+            const int ra = find(a), rb = find(b);
+            if (ra == rb) return;
+            if (ra < rb) parent[rb] = ra;// attach larger root under smaller root
+            else         parent[ra] = rb;
+        };
+
+        std::vector<uint16_t> counts(leafCount);
+        for (uint32_t li = 0; li < leafCount; ++li) {
+            const auto& leaf = leaves[li];
+            for (int n = 0; n < 512; ++n) parent[n] = leaf.isActive(uint32_t(n)) ? n : -1;
+            // Leaf voxel offset is x-major: n = (x<<6)|(y<<3)|z, so the in-leaf
+            // +X/+Y/+Z neighbors are n+64/n+8/n+1 (only when not on the +face).
+            for (int n = 0; n < 512; ++n) {
+                if (parent[n] < 0) continue;// inactive
+                const int x = n >> 6, y = (n >> 3) & 7, z = n & 7;
+                if (x < 7 && parent[n + 64] >= 0) unite(n, n + 64);
+                if (y < 7 && parent[n +  8] >= 0) unite(n, n +  8);
+                if (z < 7 && parent[n +  1] >= 0) unite(n, n +  1);
+            }
+            uint16_t c = 0;
+            for (int n = 0; n < 512; ++n) if (parent[n] == n) ++c;// surviving roots == components
+            counts[li] = c;
+        }
+        return counts;
+    };
+
+    { // 1. single active voxel => 1 component
+        const auto c = componentCounts({nanovdb::Coord(2, 2, 2)});
+        ASSERT_EQ(1u, c.size());
+        EXPECT_EQ(uint16_t(1), c[0]);
+    }
+    { // 2. two face-connected voxels => 1 component
+        const auto c = componentCounts({nanovdb::Coord(2, 2, 2), nanovdb::Coord(2, 2, 3)});
+        ASSERT_EQ(1u, c.size());
+        EXPECT_EQ(uint16_t(1), c[0]);
+    }
+    { // 3. two voxels touching only at a corner (diagonal) => 2 components
+        const auto c = componentCounts({nanovdb::Coord(2, 2, 2), nanovdb::Coord(3, 3, 3)});
+        ASSERT_EQ(1u, c.size());
+        EXPECT_EQ(uint16_t(2), c[0]);
+    }
+    { // 4. two separated face-connected clusters in the same leaf => 2 components
+        const auto c = componentCounts({nanovdb::Coord(1, 1, 1), nanovdb::Coord(1, 1, 2),   // cluster A (+Z)
+                                        nanovdb::Coord(5, 5, 5), nanovdb::Coord(5, 6, 5)});  // cluster B (+Y)
+        ASSERT_EQ(1u, c.size());
+        EXPECT_EQ(uint16_t(2), c[0]);
+    }
+    { // 5. fully active leaf (all 512 voxels) => 1 component
+        std::vector<nanovdb::Coord> full;
+        for (int x = 0; x < 8; ++x)
+            for (int y = 0; y < 8; ++y)
+                for (int z = 0; z < 8; ++z)
+                    full.emplace_back(x, y, z);
+        const auto c = componentCounts(full);
+        ASSERT_EQ(1u, c.size());
+        EXPECT_EQ(uint16_t(1), c[0]);
+    }
+    { // 6. 3D checkerboard (parity-even voxels): no two are face-adjacent => 256 components
+        std::vector<nanovdb::Coord> checker;
+        for (int x = 0; x < 8; ++x)
+            for (int y = 0; y < 8; ++y)
+                for (int z = 0; z < 8; ++z)
+                    if (((x + y + z) & 1) == 0) checker.emplace_back(x, y, z);
+        ASSERT_EQ(256u, checker.size());
+        const auto c = componentCounts(checker);
+        ASSERT_EQ(1u, c.size());
+        EXPECT_EQ(uint16_t(256), c[0]);
+    }
+    { // 7. multiple leaves, each counted independently (cross-leaf connectivity ignored).
+      // Counts come back in leaf storage order, so compare order-independently (sorted).
+        const auto c = componentCounts({
+            // leaf @ (0,0,0): two face-connected voxels => 1 component
+            //                 ((7,0,0) is world-adjacent to (8,0,0) in the next leaf)
+            nanovdb::Coord(6, 0, 0), nanovdb::Coord(7, 0, 0),
+            // leaf @ (8,0,0): {(8,0,0),(9,0,0)} connected, plus isolated (8,2,2) => 2 components
+            //                 ((8,0,0) borders (7,0,0) above but in a different leaf => not merged)
+            nanovdb::Coord(8, 0, 0), nanovdb::Coord(9, 0, 0), nanovdb::Coord(8, 2, 2),
+            // leaf @ (0,8,0): single voxel => 1 component
+            nanovdb::Coord(0, 8, 0)});
+        ASSERT_EQ(3u, c.size());
+        std::vector<uint16_t> sorted(c.begin(), c.end());
+        std::sort(sorted.begin(), sorted.end());
+        EXPECT_EQ((std::vector<uint16_t>{1, 1, 2}), sorted);
+    }
+    { // 8. two world-face-adjacent voxels split across a leaf boundary => 2 leaves, 1 each.
+      // Confirms cross-leaf connectivity is ignored (they are NOT merged into one component).
+        const auto c = componentCounts({nanovdb::Coord(7, 3, 3), nanovdb::Coord(8, 3, 3)});
+        ASSERT_EQ(2u, c.size());
+        EXPECT_EQ(uint16_t(1), c[0]);
+        EXPECT_EQ(uint16_t(1), c[1]);
+    }
+}// LeafConnectedComponents

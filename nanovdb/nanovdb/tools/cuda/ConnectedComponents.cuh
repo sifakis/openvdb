@@ -24,6 +24,7 @@
 #include <nanovdb/cuda/DeviceBuffer.h>
 #include <nanovdb/util/cuda/DeviceGridTraits.cuh>
 #include <nanovdb/util/cuda/Timer.h>
+#include <nanovdb/util/cuda/Util.h> // for operatorKernel
 
 namespace nanovdb {
 
@@ -73,6 +74,127 @@ private:
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
+namespace cc_detail {
+
+// Per-leaf connected-components via a Shiloach-Vishkin union-find run in shared memory,
+// one CUDA block per leaf, one thread per voxel offset n in [0, 512). The forest is stored
+// as a parent array of leaf-local voxel offsets: parent[n] = n for active roots, a smaller
+// active offset for non-roots, and -1 for inactive voxels. Connectivity is 6-connected and
+// strictly intra-leaf (cross-leaf edges are ignored at this stage).
+//
+// The three primitives are double-buffered (Jacobi): they read the "cur" buffer and write
+// the "nxt" buffer, then swap. Inactive entries (-1) are carried through unchanged. The
+// pointer swap is performed identically by every thread, so the register copies stay in sync.
+
+constexpr int LEAF_DIM  = 8;            // NanoLeaf DIM
+constexpr int LEAF_SIZE = 512;          // 8^3
+constexpr int CC_INACTIVE = -1;         // parent sentinel for inactive voxels
+
+// Smallest parent among the (up to 6) active in-leaf face neighbors of offset n, floored at
+// the supplied current value. Offset layout is x-major: n = (x<<6)|(y<<3)|z.
+__device__ inline int ccNeighborMin(const int* cur, int n, int current)
+{
+    const int x = n >> 6, y = (n >> 3) & 7, z = n & 7;
+    int m = current;
+    if (x > 0 && cur[n - 64] >= 0) m = ::min(m, cur[n - 64]);   // -X
+    if (x < 7 && cur[n + 64] >= 0) m = ::min(m, cur[n + 64]);   // +X
+    if (y > 0 && cur[n -  8] >= 0) m = ::min(m, cur[n -  8]);   // -Y
+    if (y < 7 && cur[n +  8] >= 0) m = ::min(m, cur[n +  8]);   // +Y
+    if (z > 0 && cur[n -  1] >= 0) m = ::min(m, cur[n -  1]);   // -Z
+    if (z < 7 && cur[n +  1] >= 0) m = ::min(m, cur[n +  1]);   // +Z
+    return m;
+}
+
+// SV root hook: every vertex v whose smallest active neighbor label m is below parent[v]
+// lowers the slot of v's *parent* (its tree root, once flattened) toward m, via atomicMin.
+// Sets *changed (when non-null) iff some root slot was actually lowered.
+__device__ inline void ccHook(int*& cur, int*& nxt, int n, int* changed)
+{
+    const int pn = cur[n];
+    nxt[n] = pn;                                  // Phase A: seed nxt = cur (own slot, no race)
+    __syncthreads();
+    if (pn >= 0) {                                // active voxel
+        const int m = ccNeighborMin(cur, n, pn);
+        if (m < pn) {                             // root slot is data-dependent -> atomicMin
+            const int old = atomicMin(&nxt[pn], m);
+            if (changed && old > m) *changed = 1;
+        }
+    }
+    __syncthreads();
+    int* t = cur; cur = nxt; nxt = t;             // swap (identical on every thread)
+}
+
+// Pointer-jumping compress: parent[v] <- parent[parent[v]]. Halves tree depth per call.
+// Sets *changed (when non-null) iff some entry actually moved.
+__device__ inline void ccCompress(int*& cur, int*& nxt, int n, int* changed)
+{
+    const int pn = cur[n];
+    int v = CC_INACTIVE;
+    if (pn >= 0) {                                // active: grandparent (cur[pn] is valid)
+        v = cur[pn];
+        if (changed && v != pn) *changed = 1;
+    }
+    nxt[n] = v;                                   // own slot, no race
+    __syncthreads();
+    int* t = cur; cur = nxt; nxt = t;             // swap
+}
+
+template <typename BuildT>
+struct LeafComponentCountFunctor
+{
+    static constexpr int MaxThreadsPerBlock         = LEAF_SIZE;
+    static constexpr int MinBlocksPerMultiprocessor = 1;
+
+    // Safety cap on the convergence loop, well above the worst case for an 8^3 leaf
+    // (~log2(depth) + log2(#local minima) <= ~18); guards against a non-terminating bug
+    // rather than limiting any legitimate input.
+    static constexpr int MaxConvergenceIters = 64;
+
+    __device__ void operator()(const NanoGrid<BuildT>* d_grid, uint16_t* d_counts)
+    {
+        __shared__ int bufA[LEAF_SIZE];
+        __shared__ int bufB[LEAF_SIZE];
+        __shared__ int changed;
+        __shared__ int compCount;
+
+        const int   leafID = blockIdx.x;
+        const int   n      = threadIdx.x;
+        const auto& leaf   = d_grid->tree().template getFirstNode<0>()[leafID];
+
+        int* cur = bufA;
+        int* nxt = bufB;
+
+        // Init: active voxels label themselves, inactive get the sentinel.
+        cur[n] = leaf.isActive(uint32_t(n)) ? n : CC_INACTIVE;
+        __syncthreads();
+
+        // Unconditional warm-up: 1 hook + log2(DIM)=3 compresses.
+        ccHook    (cur, nxt, n, nullptr);
+        ccCompress(cur, nxt, n, nullptr);
+        ccCompress(cur, nxt, n, nullptr);
+        ccCompress(cur, nxt, n, nullptr);
+
+        // Then alternate (hook, compress) until a full iteration changes nothing.
+        for (int it = 0; it < MaxConvergenceIters; ++it) {
+            if (n == 0) changed = 0;
+            __syncthreads();
+            ccHook    (cur, nxt, n, &changed);
+            ccCompress(cur, nxt, n, &changed);
+            __syncthreads();
+            if (changed == 0) break;
+        }
+
+        // Component count = number of surviving roots (cur[n] == n; inactive entries are -1).
+        if (n == 0) compCount = 0;
+        __syncthreads();
+        if (cur[n] == n) atomicAdd(&compCount, 1);
+        __syncthreads();
+        if (n == 0) d_counts[leafID] = uint16_t(compCount);
+    }
+}; // LeafComponentCountFunctor
+
+} // namespace cc_detail
+
 template <typename BuildT>
 void ConnectedComponents<BuildT>::processLeafConnectedComponents()
 {
@@ -86,8 +208,16 @@ void ConnectedComponents<BuildT>::processLeafConnectedComponents()
         std::size_t(leafCount) * sizeof(uint16_t), nullptr, false);
     if (mVerbose==1) mTimer.stop();
 
-    // TODO: launch a per-leaf kernel that counts the distinct connected components formed by
-    //       each leaf's active voxels (in isolation) and writes them to mLeafComponentCounts.
+    if (leafCount == 0) return;
+
+    // One block per leaf, one thread per voxel offset; counts the distinct 6-connected
+    // components of each leaf's active voxels (in isolation) into mLeafComponentCounts.
+    using Op = cc_detail::LeafComponentCountFunctor<BuildT>;
+    if (mVerbose==1) mTimer.start("Per-leaf connected-component counting");
+    util::cuda::operatorKernel<Op>
+        <<<leafCount, Op::MaxThreadsPerBlock, 0, mStream>>>(mDeviceSrcGrid, deviceLeafComponentCounts());
+    cudaCheckError();
+    if (mVerbose==1) mTimer.stop();
 }// ConnectedComponents<BuildT>::processLeafConnectedComponents
 
 } // namespace tools::cuda

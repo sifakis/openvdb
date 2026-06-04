@@ -14,8 +14,12 @@ on NanoVDB index grids. This document is the running design notes for that work.
 | File | Role |
 | :--- | :--- |
 | `connected_components_cuda.cpp`         | Host driver: arg parsing, OBJ reader, builds the mesh + `nanovdb::Map`, calls the device entry points. No CUDA *code* (only header-only handle/buffer types). |
-| `connected_components_cuda_kernels.cu`  | CUDA / NanoVDB side: `computeUDF()` and `printGridDiagnostics()` today; CC kernels + derivative-grid step to follow. |
+| `connected_components_cuda_kernels.cu`  | CUDA / NanoVDB side: `computeUDF()`, `printGridDiagnostics()`, `computeDerivedTopology()`, and `computeCC()` (which drives `ConnectedComponents::processLeafConnectedComponents()`). |
 | `MeshToSDFDevelopmentPlan.md`           | This document. |
+| `standalone/cc_vis.cpp`                 | Standalone 2D CPU visualizer of the SV hook/compress primitives (see `standalone/README.md`). **Not** part of the example build — it lives one directory down so the `nanovdb_example` source glob (non-recursive) skips it; otherwise its `main()` would collide with the driver's. |
+
+The actual per-leaf CC kernel lives in the library, not the example:
+`nanovdb/tools/cuda/ConnectedComponents.cuh`.
 
 The host/device seam is a small set of forward-declared functions (à la
 `ex_mesh_to_grid_cuda`'s `mainMeshToGrid`), passing host `std::vector`s + `nanovdb::Map`
@@ -39,10 +43,25 @@ in and returning device buffers (`GridHandle<DeviceBuffer>`, `DeviceBuffer`) out
    topology" below). On the dragon @ 0.0005: 41,492,695 active voxels → **29,512,911** after
    pruning (~12.0M barrier voxels dropped), exit 0.
 
-3. **Connected-components labeling (CUDA)** *(TODO)*
+3. **Per-leaf connected-component counting (CUDA)** *(IMPLEMENTED, ⚠ NOT YET TESTED —
+   `ConnectedComponents::processLeafConnectedComponents()`)*
+   First CC milestone: for every leaf *in isolation*, count the number of distinct
+   6-connected components formed by its active voxels, into a device array of one
+   `uint16_t` per leaf (`deviceLeafComponentCounts()`). Cross-leaf connectivity is
+   ignored at this stage. See "Per-leaf CC kernel" below.
+   **⚠ Correctness is unverified.** The kernel compiles and the example links/builds, but
+   the result has *not* been validated against any oracle or run end-to-end on real data.
+   The CPU oracle exists — `TEST(TestNanoVDBCUDA, LeafConnectedComponents)` in
+   `unittest/TestNanoVDB.cu` (host-only union-find, counts in leaf storage order) — but the
+   device-vs-oracle elementwise comparison is **not yet wired up**. That comparison is the
+   immediate next step and is what will actually confirm the kernel is correct.
+
+4. **Full connected-components labeling (CUDA)** *(TODO)*
    Label active voxels of the derived grid so two voxels share a label iff connected
-   through a path of adjacent active voxels. Output: a per-active-voxel label buffer
-   (a sidecar parallel to the index space).
+   through a path of adjacent active voxels — *including across leaf boundaries*. Output:
+   a per-active-voxel label buffer (a sidecar parallel to the index space). This is the
+   hierarchical step: per-leaf labels (built on the per-leaf machinery above) → merge over
+   +X/+Y/+Z face neighbors → a small global union-find over representatives.
 
 ## Connected-components design (working decisions)
 
@@ -61,6 +80,42 @@ in and returning device buffers (`GridHandle<DeviceBuffer>`, `DeviceBuffer`) out
   neighbor → index is a value-mask bit test + popcount, and cross-leaf access goes
   through a `ValueAccessor` / the CUDA `NodeManager`. (Confirm the exact `ValueOnIndex`
   index layout before leaning on the leaf-local fast path.)
+
+## Per-leaf CC kernel (`processLeafConnectedComponents`)
+
+⚠ **Implemented but UNTESTED** — see milestone 3 above. Compiles and links; correctness
+not yet verified against the oracle.
+
+`LeafComponentCountFunctor` in `nanovdb/tools/cuda/ConnectedComponents.cuh`, launched via
+`operatorKernel`, **one block per leaf, 512 threads (one per voxel offset `n ∈ [0,512)`)**.
+A Shiloach–Vishkin union-find runs entirely in shared memory.
+
+- **Forest representation:** a `parent` array of leaf-local voxel offsets, double-buffered
+  (Jacobi: read `cur`, write `nxt`, swap — the swap is done identically by every thread so
+  the per-thread register pointers stay in sync). `parent[n] = n` for active roots, a smaller
+  active offset for non-roots, `-1` (sentinel) for inactive voxels. Inactive entries are
+  carried through every op unchanged, so `parent[n] >= 0` is a stable "is active" test.
+  Two `int[512]` buffers = 4 KB shared/block.
+- **Three primitives** (`ccHook`, `ccCompress`, plus the neighbor-min helper):
+  - **SV-Hook:** each vertex `v` finds the min label `m` over its (≤6) active in-leaf face
+    neighbors; if `m < parent[v]` it lowers the *root* slot `parent[parent[v]]` via
+    `atomicMin` (shared-memory atomic; deterministic because min is commutative/associative).
+  - **Compress:** pointer-jumping `parent[v] ← parent[parent[v]]`, halves tree depth per call,
+    no atomics (each thread writes only its own slot).
+- **Schedule (as specified):** one **SV-Hook**, then **3 = log₂(8) Compress** steps
+  unconditionally (a warm-up sized to the leaf's `DIM`), then **alternate (Hook, Compress)**
+  until a full iteration changes nothing. Convergence is detected with a shared `changed`
+  flag (`__syncthreads` between phases). A `MaxConvergenceIters = 64` cap guards against a
+  non-terminating bug — it is far above the worst case for an 8³ leaf
+  (~`log₂(depth) + log₂(#local minima) ≲ 18`), not a limit on any legitimate input.
+- **Output:** component count per leaf = number of surviving roots (`parent[n] == n`), summed
+  with a shared `atomicAdd` and written as one `uint16_t` per leaf. Worst case is 256
+  (3D checkerboard in an 8³ leaf), so `uint16_t` suffices.
+- **Offset layout:** x-major, `n = (x<<6)|(y<<3)|z`, so the +X/+Y/+Z in-leaf neighbors are
+  `n±64 / n±8 / n±1` (guarded against the leaf faces). Matches the CPU oracle.
+
+For a 2D, CPU, single-step-at-a-time intuition for exactly these primitives and schedule, see
+`standalone/cc_vis.cpp`.
 
 ## Derivative topology (the CC input)
 

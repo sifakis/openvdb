@@ -43,18 +43,38 @@ in and returning device buffers (`GridHandle<DeviceBuffer>`, `DeviceBuffer`) out
    topology" below). On the dragon @ 0.0005: 41,492,695 active voxels → **29,512,911** after
    pruning (~12.0M barrier voxels dropped), exit 0.
 
-3. **Per-leaf connected-component counting (CUDA)** *(IMPLEMENTED, ⚠ NOT YET TESTED —
-   `ConnectedComponents::processLeafConnectedComponents()`)*
+3. **Per-leaf connected-component counting (CUDA)** *(IMPLEMENTED + VALIDATION HARNESS,
+   ⚠ CURRENTLY FAILING — `ConnectedComponents::processLeafConnectedComponents()`)*
    First CC milestone: for every leaf *in isolation*, count the number of distinct
    6-connected components formed by its active voxels, into a device array of one
    `uint16_t` per leaf (`deviceLeafComponentCounts()`). Cross-leaf connectivity is
    ignored at this stage. See "Per-leaf CC kernel" below.
-   **⚠ Correctness is unverified.** The kernel compiles and the example links/builds, but
-   the result has *not* been validated against any oracle or run end-to-end on real data.
-   The CPU oracle exists — `TEST(TestNanoVDBCUDA, LeafConnectedComponents)` in
-   `unittest/TestNanoVDB.cu` (host-only union-find, counts in leaf storage order) — but the
-   device-vs-oracle elementwise comparison is **not yet wired up**. That comparison is the
-   immediate next step and is what will actually confirm the kernel is correct.
+
+   **Validation (in the example, `computeCC()`):** after the kernel runs, the example
+   copies the device grid blob into a scratch host buffer (NanoVDB grids are
+   position-independent, so a raw byte copy is a valid host grid; the input handle is left
+   untouched — no `deviceDownload` residue), runs a host union-find oracle harvested from
+   `TEST(TestNanoVDBCUDA, LeafConnectedComponents)`, and compares the two per-leaf count
+   arrays elementwise. Prints PASS/FAIL with leaf count, mismatch count, and gpu/cpu totals.
+
+   **⚠ STATUS: FAILS. There is a race condition in the kernel.** On the dragon @ voxelSize
+   0.0005 (220,335 leaves) the device counts disagree with the oracle on ~0.25% of leaves,
+   and — critically — **the mismatch set and count change from run to run** (~541 vs ~618
+   mismatches observed), which is a definitive race signature. The device always *under*-
+   counts (e.g. gpu=1 vs cpu=2, even gpu=0 vs cpu=1), i.e. it spuriously *merges*
+   components.
+
+   **Reasoning that localizes the bug to a race (not an algorithm error):** an SV hook can
+   only ever link a voxel to an *active 6-neighbor*, which is by definition in the same
+   connected component — so a correct execution can never merge two true components, i.e.
+   it can never undercount below the true CC. Observing gpu < cpu *and* run-to-run variation
+   therefore implies state corruption (a data race on the shared parent buffers), not a
+   logic error in the hook/compress schedule. A `gpu=0, cpu=1` case is impossible without
+   corruption: a non-empty component's minimum-index voxel must remain a self-root.
+
+   **Next step:** run `compute-sanitizer --tool racecheck` (on a coarse voxelSize for speed)
+   to localize the offending shared-memory access, then fix. The device-vs-oracle harness
+   above is the regression check once it's fixed.
 
 4. **Full connected-components labeling (CUDA)** *(TODO)*
    Label active voxels of the derived grid so two voxels share a label iff connected
@@ -83,8 +103,9 @@ in and returning device buffers (`GridHandle<DeviceBuffer>`, `DeviceBuffer`) out
 
 ## Per-leaf CC kernel (`processLeafConnectedComponents`)
 
-⚠ **Implemented but UNTESTED** — see milestone 3 above. Compiles and links; correctness
-not yet verified against the oracle.
+⚠ **Implemented; FAILS validation — race condition under investigation.** See milestone 3
+above for the symptom (run-to-run-varying undercount) and the reasoning that pins it to a
+data race on the shared parent buffers rather than an algorithm error.
 
 `LeafComponentCountFunctor` in `nanovdb/tools/cuda/ConnectedComponents.cuh`, launched via
 `operatorKernel`, **one block per leaf, 512 threads (one per voxel offset `n ∈ [0,512)`)**.

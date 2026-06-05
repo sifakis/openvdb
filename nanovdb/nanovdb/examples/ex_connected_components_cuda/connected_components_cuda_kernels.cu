@@ -63,7 +63,7 @@ void printGridDiagnostics(const GridHandleT& handle, const std::string& title)
     using BuildT = nanovdb::ValueOnIndex;
     using Traits = nanovdb::util::cuda::DeviceGridTraits<BuildT>;
 
-    const auto* d_grid = reinterpret_cast<const nanovdb::NanoGrid<BuildT>*>(handle.deviceData());
+    const auto* d_grid = handle.deviceGrid<BuildT>();
 
     const auto     treeData     = Traits::getTreeData(d_grid);
     const uint64_t valueCount   = Traits::getValueCount(d_grid);
@@ -164,13 +164,109 @@ GridHandleT computeDerivedTopology(const GridHandleT& srcHandle, const UDFSideca
     return pruner.getHandle();
 }
 
+namespace {
+
+/// @brief CPU reference for per-leaf 6-connected component counts on a host-resident
+///        ValueOnIndex grid. Harvested from TestNanoVDB.cu's LeafConnectedComponents
+///        oracle: a union-find local to each 8^3 leaf (parent[n]=n for active voxels,
+///        -1 for inactive; union only active +X/+Y/+Z in-leaf neighbors so each undirected
+///        face edge is visited once; larger root attaches under the smaller; the component
+///        count is the number of surviving roots). Counts are in leaf storage order, to
+///        match the device-side deviceLeafComponentCounts().
+template <typename GridT>
+std::vector<uint16_t> cpuLeafComponentCounts(const GridT* grid)
+{
+    const auto&    tree      = grid->tree();
+    const uint32_t leafCount = tree.nodeCount(0);
+    const auto*    leaves    = tree.getFirstLeaf();
+
+    int parent[512] = {};// re-initialized per leaf below
+    auto find = [&](int i) {
+        while (parent[i] != i) { parent[i] = parent[parent[i]]; i = parent[i]; }
+        return i;
+    };
+    auto unite = [&](int a, int b) {
+        const int ra = find(a), rb = find(b);
+        if (ra == rb) return;
+        if (ra < rb) parent[rb] = ra;// attach larger root under smaller root
+        else         parent[ra] = rb;
+    };
+
+    std::vector<uint16_t> counts(leafCount);
+    for (uint32_t li = 0; li < leafCount; ++li) {
+        const auto& leaf = leaves[li];
+        for (int n = 0; n < 512; ++n) parent[n] = leaf.isActive(uint32_t(n)) ? n : -1;
+        // x-major offset n = (x<<6)|(y<<3)|z, so +X/+Y/+Z in-leaf neighbors are n+64/n+8/n+1.
+        for (int n = 0; n < 512; ++n) {
+            if (parent[n] < 0) continue;// inactive
+            const int x = n >> 6, y = (n >> 3) & 7, z = n & 7;
+            if (x < 7 && parent[n + 64] >= 0) unite(n, n + 64);
+            if (y < 7 && parent[n +  8] >= 0) unite(n, n +  8);
+            if (z < 7 && parent[n +  1] >= 0) unite(n, n +  1);
+        }
+        uint16_t c = 0;
+        for (int n = 0; n < 512; ++n) if (parent[n] == n) ++c;// surviving roots == components
+        counts[li] = c;
+    }
+    return counts;
+}
+
+} // anonymous namespace
+
 void computeCC(const GridHandleT& gridHandle)
 {
     using BuildT = nanovdb::ValueOnIndex;
+    using Traits = nanovdb::util::cuda::DeviceGridTraits<BuildT>;
 
     const auto* d_grid = gridHandle.deviceGrid<BuildT>();
 
+    // Device: per-leaf connected-component counts.
     nanovdb::tools::cuda::ConnectedComponents<BuildT> cc(d_grid);
     cc.setVerbose(1);
     cc.processLeafConnectedComponents();
+    cudaCheck(cudaDeviceSynchronize());
+
+    const uint32_t leafCount = Traits::getTreeData(d_grid).mNodeCount[0];
+    if (leafCount == 0) { std::cout << "CC validation: empty grid, nothing to check\n"; return; }
+
+    // GPU result -> host.
+    std::vector<uint16_t> gpuCounts(leafCount);
+    cudaCheck(cudaMemcpy(gpuCounts.data(), cc.deviceLeafComponentCounts(),
+                         std::size_t(leafCount) * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+
+    // CPU validation. NanoVDB grids are position-independent (relative offsets), so a raw
+    // byte copy of the device blob into a (32B-aligned) scratch host buffer is itself a valid
+    // host grid. We don't touch the handle (no deviceDownload residue); the scratch is freed
+    // immediately after the check.
+    const uint64_t gridBytes = gridHandle.bufferSize();
+    void* hostBlob = nullptr;
+    cudaCheck(cudaMallocHost(&hostBlob, gridBytes));   // pinned, >=32B aligned
+    cudaCheck(cudaMemcpy(hostBlob, gridHandle.deviceData(), gridBytes, cudaMemcpyDeviceToHost));
+    const auto* h_grid = reinterpret_cast<const nanovdb::NanoGrid<BuildT>*>(hostBlob);
+
+    const std::vector<uint16_t> cpuCounts = cpuLeafComponentCounts(h_grid);
+
+    std::size_t mismatches = 0;
+    uint64_t    gpuTotal = 0, cpuTotal = 0;
+    for (uint32_t li = 0; li < leafCount; ++li) {
+        gpuTotal += gpuCounts[li];
+        cpuTotal += cpuCounts[li];
+        if (gpuCounts[li] != cpuCounts[li]) {
+            if (mismatches < 10) {
+                // host active popcount for this leaf
+                const auto& hleaf = h_grid->tree().getFirstLeaf()[li];
+                int act = 0; for (int q = 0; q < 512; ++q) if (hleaf.isActive(uint32_t(q))) ++act;
+                std::cerr << "  CC mismatch @ leaf " << li << ": gpu=" << gpuCounts[li]
+                          << " cpu=" << cpuCounts[li] << " (host active voxels=" << act << ")\n";
+            }
+            ++mismatches;
+        }
+    }
+
+    std::cout << "CC per-leaf component-count validation: "
+              << (mismatches == 0 ? "PASS" : "FAIL") << " ("
+              << leafCount << " leaves, " << mismatches << " mismatches; "
+              << "total components gpu=" << gpuTotal << " cpu=" << cpuTotal << ")\n";
+
+    cudaCheck(cudaFreeHost(hostBlob));
 }

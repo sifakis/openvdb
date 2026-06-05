@@ -90,18 +90,27 @@ constexpr int LEAF_DIM  = 8;            // NanoLeaf DIM
 constexpr int LEAF_SIZE = 512;          // 8^3
 constexpr int CC_INACTIVE = -1;         // parent sentinel for inactive voxels
 
+// 3D view over a 512-entry parent buffer. The voxel offset is x-major
+// (n = (x<<6)|(y<<3)|z), so a row-major int[8][8][8] indexed [x][y][z] aliases the flat
+// buffer exactly: element [x][y][z] sits at linear offset x*64 + y*8 + z == n. Accessing
+// individual int elements through this view is well-defined (the storage really is int).
+using ParentsT = int[LEAF_DIM][LEAF_DIM][LEAF_DIM];
+
 // Smallest parent among the (up to 6) active in-leaf face neighbors of offset n, floored at
 // the supplied current value. Offset layout is x-major: n = (x<<6)|(y<<3)|z.
-__device__ inline int ccNeighborMin(const int* cur, int n, int current)
+__device__ inline int ccNeighborMin(const int* parentsPtr, int n, int current)
 {
-    const int x = n >> 6, y = (n >> 3) & 7, z = n & 7;
+    const auto& p = reinterpret_cast<const ParentsT&>(*parentsPtr);
+    const int x =  n >> 6       ;
+    const int y = (n >> 3) & 0x7;
+    const int z =       n  & 0x7;
     int m = current;
-    if (x > 0 && cur[n - 64] >= 0) m = ::min(m, cur[n - 64]);   // -X
-    if (x < 7 && cur[n + 64] >= 0) m = ::min(m, cur[n + 64]);   // +X
-    if (y > 0 && cur[n -  8] >= 0) m = ::min(m, cur[n -  8]);   // -Y
-    if (y < 7 && cur[n +  8] >= 0) m = ::min(m, cur[n +  8]);   // +Y
-    if (z > 0 && cur[n -  1] >= 0) m = ::min(m, cur[n -  1]);   // -Z
-    if (z < 7 && cur[n +  1] >= 0) m = ::min(m, cur[n +  1]);   // +Z
+    if (x > 0 && p[x-1][y][z] != CC_INACTIVE) m = ::min(m, p[x-1][y][z]);   // -X
+    if (x < 7 && p[x+1][y][z] != CC_INACTIVE) m = ::min(m, p[x+1][y][z]);   // +X
+    if (y > 0 && p[x][y-1][z] != CC_INACTIVE) m = ::min(m, p[x][y-1][z]);   // -Y
+    if (y < 7 && p[x][y+1][z] != CC_INACTIVE) m = ::min(m, p[x][y+1][z]);   // +Y
+    if (z > 0 && p[x][y][z-1] != CC_INACTIVE) m = ::min(m, p[x][y][z-1]);   // -Z
+    if (z < 7 && p[x][y][z+1] != CC_INACTIVE) m = ::min(m, p[x][y][z+1]);   // +Z
     return m;
 }
 
@@ -113,10 +122,10 @@ __device__ inline void ccHook(int*& cur, int*& nxt, int n, int* changed)
     const int pn = cur[n];
     nxt[n] = pn;                                  // Phase A: seed nxt = cur (own slot, no race)
     __syncthreads();
-    if (pn >= 0) {                                // active voxel
+    if (pn != CC_INACTIVE) {                      // active voxel
         const int m = ccNeighborMin(cur, n, pn);
         if (m < pn) {                             // root slot is data-dependent -> atomicMin
-            const int old = atomicMin(&nxt[pn], m);
+            const int old = atomicMin_block(&nxt[pn], m);  // block scope: nxt[] is shared
             if (changed && old > m) *changed = 1;
         }
     }
@@ -130,7 +139,7 @@ __device__ inline void ccCompress(int*& cur, int*& nxt, int n, int* changed)
 {
     const int pn = cur[n];
     int v = CC_INACTIVE;
-    if (pn >= 0) {                                // active: grandparent (cur[pn] is valid)
+    if (pn != CC_INACTIVE) {                      // active: grandparent (cur[pn] is valid)
         v = cur[pn];
         if (changed && v != pn) *changed = 1;
     }
@@ -187,7 +196,7 @@ struct LeafComponentCountFunctor
         // Component count = number of surviving roots (cur[n] == n; inactive entries are -1).
         if (n == 0) compCount = 0;
         __syncthreads();
-        if (cur[n] == n) atomicAdd(&compCount, 1);
+        if (cur[n] == n) atomicAdd_block(&compCount, 1);  // block scope: compCount is shared
         __syncthreads();
         if (n == 0) d_counts[leafID] = uint16_t(compCount);
     }

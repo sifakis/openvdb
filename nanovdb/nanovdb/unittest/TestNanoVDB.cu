@@ -20,6 +20,7 @@
 #include <nanovdb/tools/cuda/DilateGrid.cuh>
 #include <nanovdb/tools/cuda/MergeGrids.cuh>
 #include <nanovdb/tools/cuda/PruneGrid.cuh>
+#include <nanovdb/tools/cuda/ConnectedComponents.cuh>
 #include <nanovdb/tools/cuda/CoarsenGrid.cuh>
 #include <nanovdb/tools/cuda/RefineGrid.cuh>
 #include <nanovdb/util/cuda/Injection.cuh>
@@ -36,6 +37,8 @@
 #include <cuda_runtime_api.h>
 #include <gtest/gtest.h>
 #include <algorithm>// for std::sort
+#include <random>   // for fixed-seed random CC test masks
+#include <cmath>    // for spherical-shell CC test masks
 #include <unordered_set>
 #include <iomanip> // for std::setw, std::setfill
 #include <thread> // for std::thread
@@ -3927,25 +3930,50 @@ TEST(TestNanoVDBCUDA, MeshToGrid_UnitTetrahedron)
 // (download deviceLeafComponentCounts() and compare elementwise).
 TEST(TestNanoVDBCUDA, LeafConnectedComponents)
 {
-    using SrcGridT = nanovdb::tools::build::Grid<float>;
+    using BuildT = nanovdb::ValueOnIndex;
 
-    // Build a CPU ValueOnIndex grid from a set of active voxel coordinates, then return
-    // the per-leaf 6-connected component counts (in leaf storage order). The union-find
-    // is local to each leaf: parent[vi]=vi for active voxels, -1 for inactive; each voxel
-    // is unioned only with its active +X/+Y/+Z in-leaf neighbors so each undirected face
-    // edge is visited once; the larger root is attached under the smaller root for a
-    // deterministic forest; the component count is the number of surviving roots.
+    // Build a device ValueOnIndex grid whose active voxels are exactly `active`, run the
+    // device per-leaf connected-components kernel on it, and assert the GPU result equals
+    // the CPU union-find oracle for every leaf. Returns the (agreed) per-leaf 6-connected
+    // component counts in leaf storage order.
+    //
+    // CPU oracle (per leaf, in isolation): parent[vi]=vi for active voxels, -1 for inactive;
+    // each voxel is unioned only with its active +X/+Y/+Z in-leaf neighbors so each undirected
+    // face edge is visited once; the larger root is attached under the smaller for a
+    // deterministic forest; the component count is the number of surviving roots. The GPU and
+    // CPU walk the same grid (the device grid is downloaded for the oracle), so leaf li lines
+    // up between the two count arrays.
     auto componentCounts = [](const std::vector<nanovdb::Coord>& active) -> std::vector<uint16_t> {
-        SrcGridT srcGrid(0.0f);
-        auto srcAcc = srcGrid.getAccessor();
-        for (const auto& ijk : active) srcAcc.setValue(ijk, 1.0f);// setValue activates the voxel
-        auto handle = nanovdb::tools::createNanoGrid<SrcGridT, nanovdb::ValueOnIndex>(srcGrid);
-        const auto* grid = handle.template grid<nanovdb::ValueOnIndex>();
-        EXPECT_TRUE(grid);
+        // No active voxels -> no leaves. (An *empty leaf* cannot be materialized in NanoVDB;
+        // the closest analogue is an empty grid, which has zero leaves and thus no counts.)
+        if (active.empty()) return {};
 
-        const auto&    tree      = grid->tree();
-        const uint32_t leafCount = tree.nodeCount(0);
-        const auto*    leaves    = tree.getFirstLeaf();
+        // Upload the active voxel coordinates and build the device grid.
+        nanovdb::Coord* d_coords = nullptr;
+        cudaCheck(cudaMalloc(&d_coords, active.size() * sizeof(nanovdb::Coord)));
+        cudaCheck(cudaMemcpy(d_coords, active.data(), active.size() * sizeof(nanovdb::Coord),
+                             cudaMemcpyHostToDevice));
+        auto handle = nanovdb::tools::cuda::voxelsToGrid<BuildT>(d_coords, active.size());
+        cudaCheck(cudaFree(d_coords));
+        const auto* d_grid = handle.template deviceGrid<BuildT>();
+        EXPECT_TRUE(d_grid);
+
+        const uint32_t leafCount =
+            nanovdb::util::cuda::DeviceGridTraits<BuildT>::getTreeData(d_grid).mNodeCount[0];
+
+        // --- GPU: per-leaf connected-component counts ---
+        nanovdb::tools::cuda::ConnectedComponents<BuildT> cc(d_grid);
+        cc.processLeafConnectedComponents();
+        cudaCheck(cudaDeviceSynchronize());
+        std::vector<uint16_t> gpu(leafCount);
+        cudaCheck(cudaMemcpy(gpu.data(), cc.deviceLeafComponentCounts(),
+                             std::size_t(leafCount) * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+
+        // --- CPU oracle on the same grid (downloaded to host) ---
+        handle.deviceDownload();
+        const auto* grid = handle.template grid<BuildT>();
+        EXPECT_TRUE(grid);
+        const auto* leaves = grid->tree().getFirstLeaf();
 
         int parent[512] = {};// re-initialized per leaf below; zero-init quiets "used before set"
         // Iterative find with path halving (only ever called on active entries).
@@ -3960,7 +3988,7 @@ TEST(TestNanoVDBCUDA, LeafConnectedComponents)
             else         parent[ra] = rb;
         };
 
-        std::vector<uint16_t> counts(leafCount);
+        std::vector<uint16_t> cpu(leafCount);
         for (uint32_t li = 0; li < leafCount; ++li) {
             const auto& leaf = leaves[li];
             for (int n = 0; n < 512; ++n) parent[n] = leaf.isActive(uint32_t(n)) ? n : -1;
@@ -3975,9 +4003,13 @@ TEST(TestNanoVDBCUDA, LeafConnectedComponents)
             }
             uint16_t c = 0;
             for (int n = 0; n < 512; ++n) if (parent[n] == n) ++c;// surviving roots == components
-            counts[li] = c;
+            cpu[li] = c;
         }
-        return counts;
+
+        // The point of this test: the device SV kernel must match the CPU oracle, per leaf.
+        EXPECT_EQ(cpu, gpu);
+
+        return cpu;// == gpu
     };
 
     { // 1. single active voxel => 1 component
@@ -4044,5 +4076,120 @@ TEST(TestNanoVDBCUDA, LeafConnectedComponents)
         ASSERT_EQ(2u, c.size());
         EXPECT_EQ(uint16_t(1), c[0]);
         EXPECT_EQ(uint16_t(1), c[1]);
+    }
+    { // 9. empty grid: no active voxels => no leaves (an empty leaf cannot exist in NanoVDB).
+        const auto c = componentCounts({});
+        EXPECT_TRUE(c.empty());
+    }
+    { // 10. full 3D checkerboard across two leaves => worst-case 256 components per leaf.
+      // 8 is even, so the (x+y+z) parity pattern repeats identically in every leaf.
+        std::vector<nanovdb::Coord> v;
+        for (int lx = 0; lx < 2; ++lx)              // leaves @ x in {0, 8}
+            for (int x = 0; x < 8; ++x)
+                for (int y = 0; y < 8; ++y)
+                    for (int z = 0; z < 8; ++z)
+                        if (((x + y + z) & 1) == 0) v.emplace_back(lx * 8 + x, y, z);
+        const auto c = componentCounts(v);
+        ASSERT_EQ(2u, c.size());
+        EXPECT_EQ(uint16_t(256), c[0]);
+        EXPECT_EQ(uint16_t(256), c[1]);
+    }
+    { // 11. a long 1-voxel-thick serpentine path within one leaf => 1 connected component.
+      // Boustrophedon in the z=0 plane: full even rows joined by single connectors on odd rows.
+        std::vector<nanovdb::Coord> v;
+        for (int y = 0; y < 8; ++y) {
+            if ((y & 1) == 0) for (int x = 0; x < 8; ++x) v.emplace_back(x, y, 0);
+            else              v.emplace_back((y % 4 == 1) ? 7 : 0, y, 0);// connector alternates side
+        }
+        const auto c = componentCounts(v);
+        ASSERT_EQ(1u, c.size());
+        EXPECT_EQ(uint16_t(1), c[0]);
+    }
+    { // 12. two parallel lines offset diagonally (pass near but never face-adjacent) => 2 comps.
+        std::vector<nanovdb::Coord> v;
+        for (int x = 0; x < 8; ++x) v.emplace_back(x, 1, 1);// line A
+        for (int x = 0; x < 8; ++x) v.emplace_back(x, 2, 2);// line B: steps in BOTH y and z (diagonal)
+        const auto c = componentCounts(v);
+        ASSERT_EQ(1u, c.size());
+        EXPECT_EQ(uint16_t(2), c[0]);
+    }
+    { // 13. comb of 4 parallel 1-voxel lines separated by empty rows => 4 components.
+        std::vector<nanovdb::Coord> v;
+        for (int y = 0; y < 8; y += 2)             // y = 0,2,4,6 with an empty row between each
+            for (int x = 0; x < 8; ++x) v.emplace_back(x, y, 0);
+        const auto c = componentCounts(v);
+        ASSERT_EQ(1u, c.size());
+        EXPECT_EQ(uint16_t(4), c[0]);
+    }
+    { // 14. a 2x2x2 block straddling the corner where 8 leaves meet => 8 leaves, 1 voxel each.
+        std::vector<nanovdb::Coord> v;
+        for (int dx = 0; dx < 2; ++dx)
+            for (int dy = 0; dy < 2; ++dy)
+                for (int dz = 0; dz < 2; ++dz)
+                    v.emplace_back(7 + dx, 7 + dy, 7 + dz);// each axis in {7,8} -> 8 distinct leaves
+        const auto c = componentCounts(v);
+        ASSERT_EQ(8u, c.size());
+        for (auto cc : c) EXPECT_EQ(uint16_t(1), cc);// leaf-local: each leaf holds its single voxel
+    }
+    { // 15. an 8x8 slab straddling an X leaf boundary => 2 leaves; each leaf-local half is 1 comp.
+        std::vector<nanovdb::Coord> v;
+        for (int y = 0; y < 8; ++y)
+            for (int z = 0; z < 8; ++z) { v.emplace_back(7, y, z); v.emplace_back(8, y, z); }
+        const auto c = componentCounts(v);
+        ASSERT_EQ(2u, c.size());
+        EXPECT_EQ(uint16_t(1), c[0]);
+        EXPECT_EQ(uint16_t(1), c[1]);
+    }
+    { // 16. fixed-seed random masks at several occupancy densities in a single leaf.
+      // No literal expectation: the oracle defines truth and componentCounts() asserts gpu==cpu.
+        std::mt19937 rng(12345u);
+        for (double density : {0.1, 0.3, 0.5, 0.7, 0.9}) {
+            std::vector<nanovdb::Coord> v;
+            std::bernoulli_distribution coin(density);
+            for (int x = 0; x < 8; ++x)
+                for (int y = 0; y < 8; ++y)
+                    for (int z = 0; z < 8; ++z)
+                        if (coin(rng)) v.emplace_back(x, y, z);
+            if (v.empty()) continue;// vanishingly unlikely; skip a degenerate all-empty draw
+            const auto c = componentCounts(v);
+            ASSERT_EQ(1u, c.size());
+        }
+    }
+    { // 17. fixed-seed random over a 2x2x2 block of leaves (multi-leaf) at two densities.
+        std::mt19937 rng(67890u);
+        for (double density : {0.3, 0.6}) {
+            std::vector<nanovdb::Coord> v;
+            std::bernoulli_distribution coin(density);
+            for (int X = 0; X < 16; ++X)
+                for (int Y = 0; Y < 16; ++Y)
+                    for (int Z = 0; Z < 16; ++Z)
+                        if (coin(rng)) v.emplace_back(X, Y, Z);
+            const auto c = componentCounts(v);// componentCounts() asserts gpu==cpu per leaf
+            EXPECT_GT(c.size(), 1u);// occupies multiple leaves
+        }
+    }
+    { // 18. a thin spherical shell spanning multiple leaves (oracle defines truth).
+        std::vector<nanovdb::Coord> v;
+        const double R = 10.0, cx = 8.0, cy = 8.0, cz = 8.0;
+        for (int x = 0; x < 20; ++x)
+            for (int y = 0; y < 20; ++y)
+                for (int z = 0; z < 20; ++z) {
+                    const double d = std::sqrt((x-cx)*(x-cx) + (y-cy)*(y-cy) + (z-cz)*(z-cz));
+                    if (std::fabs(d - R) < 0.5) v.emplace_back(x, y, z);
+                }
+        const auto c = componentCounts(v);
+        EXPECT_GT(c.size(), 1u);
+    }
+    { // 19. two disconnected concentric spherical shells over multiple leaves.
+        std::vector<nanovdb::Coord> v;
+        const double cx = 12.0, cy = 12.0, cz = 12.0;
+        for (int x = 0; x < 24; ++x)
+            for (int y = 0; y < 24; ++y)
+                for (int z = 0; z < 24; ++z) {
+                    const double d = std::sqrt((x-cx)*(x-cx) + (y-cy)*(y-cy) + (z-cz)*(z-cz));
+                    if (std::fabs(d - 6.0) < 0.5 || std::fabs(d - 10.0) < 0.5) v.emplace_back(x, y, z);
+                }
+        const auto c = componentCounts(v);
+        EXPECT_GT(c.size(), 1u);
     }
 }// LeafConnectedComponents

@@ -191,6 +191,7 @@ struct LeafComponentCountFunctor
             ccCompress(cur, nxt, n, &changed);
             __syncthreads();
             if (changed == 0) break;
+            __syncthreads();  // all threads have read `changed`; safe for thread 0 to reset it next iteration
         }
 
         // Component count = number of surviving roots (cur[n] == n; inactive entries are -1).

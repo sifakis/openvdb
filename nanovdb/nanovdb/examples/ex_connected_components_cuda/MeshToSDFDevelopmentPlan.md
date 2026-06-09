@@ -158,64 +158,79 @@ A Shiloach–Vishkin union-find runs entirely in shared memory.
 For a 2D, CPU, single-step-at-a-time intuition for exactly these primitives and schedule, see
 `standalone/cc_vis.cpp`.
 
-## Planned next stage: leaf-local component masks and inter-leaf merge
+## Leaf-local component masks and face flags (`processLeafConnectedComponents`, continued)
 
-> **Status: planned / not yet implemented.** This is the design for the step *after*
-> `processLeafConnectedComponents()` validates correctly (it currently does not — see above).
-> Per-leaf counts are only an intermediate result; the end goal is a *global* labeling in which
-> two active voxels share a label iff they are connected through active voxels **across** leaf
-> boundaries, not just within a single 8³ leaf.
+Steps 1–4 below are **✅ implemented** (2026-06). Steps 5–6 are still TODO.
 
 The plan promotes each leaf-local component to a first-class record, detects which records touch
 across leaf faces, and then runs the same hook/compress union-find one level up — on a graph
 whose vertices are leaf-local components rather than voxels.
 
-1. **Inclusive sum over `leafComponentCounts`.** Once the per-leaf counts are correct, scan them
-   with an inclusive sum. This follows the same count / scan / allocate / scatter pattern used in
-   MeshToGrid's pair enumeration: write the inclusive sum into a `[leafCount + 1]` offsets array
-   shifted by one (element `0` set to `0`), so element `i` becomes leaf `i`'s compact output
-   *start* offset and the final element is the grand total. That total
-   `K = sum(leafComponentCounts)` is the number of leaf-local component records, and the offsets
-   array gives each leaf's contiguous output range in the record list.
+1. **Inclusive sum over `leafComponentCounts`.** ✅
+   Scans the per-leaf uint16_t counts with CUB `DeviceScan::InclusiveSum` into a
+   `[leafCount + 1]` offsets array of `uint64_t` (element `0` = 0 via `cudaMemsetAsync`; elements
+   `1..leafCount` upcast from uint16_t via `lambdaKernel` then summed in-place). Element `leafCount`
+   is the aggregate `mLeafComponentAggregateCount = K`. The offsets array is `mLeafComponentOffsets`.
 
-2. **Allocate `K` `nanovdb::Mask<3>` objects.** Each `Mask<3>` is an 8×8×8 = 512-bit bitmap, and
-   each one represents exactly one connected component *inside* one leaf. A leaf with two local
-   components therefore contributes two masks (occupying two adjacent slots within that leaf's
-   range from step 1).
+2. **Allocate `K` `nanovdb::Mask<3>` objects.** ✅
+   `mLeafComponentMasks` (`K × sizeof(Mask<3>)`). No zero-init needed: the mask-fill kernel
+   writes all 16 uint32_t words of every mask unconditionally.
 
-3. **Second leaf-local pass to fill the masks.** Re-run a per-leaf kernel structured like the
-   current count kernel (one block per leaf, the same shared-memory parent forest). Instead of
-   only counting the surviving roots, *enumerate* them: assign each surviving root a dense
-   local index within the leaf, then scatter every active voxel into the `Mask<3>` of its root
-   (set the bit at the voxel's offset `n`). Alongside each component-mask slot, store enough
-   metadata to map it back to its source leaf and its local/root id (see open questions).
+3. **Mask-fill kernel (`LeafComponentMaskFunctor`).** ✅
+   One block per leaf, 512 threads. Re-runs the SV union-find in shared memory (identical schedule
+   to the count kernel). Then enumerates leaf-local components in ascending root-label order using
+   a while-true loop:
 
-4. **Per-component face flags.** For each component mask, compute six face bitmaps — `-X`, `+X`,
-   `-Y`, `+Y`, `-Z`, `+Z`. Each face is an 8×8 = 64-bit plane, so it fits in a single `uint64_t`.
-   Given the x-major offset layout (`n = (x<<6)|(y<<3)|z`, word index = x), the `-X`/`+X` faces are
-   whole `Mask<3>` words (`words[0]` / `words[7]`) and fall out naturally; the `±Y`/`±Z` faces are
-   strided across all eight words and need a bit-gather / transpose-style extraction. Both sides of
-   a shared boundary must encode their 8×8 plane in the *same* `(·,·)` bit order so the comparison
-   in step 5 is meaningful.
+   - **Block-wide min** via `cub::BlockReduce<uint32_t, LEAF_SIZE>` with `::cuda::minimum<uint32_t>{}`.
+     `CC_INACTIVE = -1` recasts to `0xFFFFFFFF` and thus never wins. When the min equals
+     `0xFFFFFFFF` all entries are inactive and the loop exits.
+   - **`__ballot_sync`** collects the 32-bit membership word for each warp. Written to
+     `sMaskWords_u32[warpID]` in shared memory by `laneID == 0`.
+   - **Coalesced GMEM write:** after `__syncthreads()`, `tID < 8` writes
+     `mask.words()[tID] = sMaskWords[tID]` via the `uint64_t` union view — one 64-byte transaction
+     for the whole mask.
+   - **Erase:** matched entries set to `CC_INACTIVE` so they don't win a future min. `++localCompIdx`.
 
-5. **Detect cross-leaf connectivity via face flags.** For each leaf, inspect only its `+X`, `+Y`,
-   and `+Z` neighboring leaves — this visits each undirected leaf-leaf boundary exactly once. For
-   every pair of component masks on the two adjacent leaves, compare the touching face flags (e.g.
-   this leaf's `+X` face against the neighbor's `-X` face). If `(faceA & faceB) != 0`, at least one
-   pair of voxels is face-adjacent across the boundary, so the two leaf-local components touch and
-   form an **edge** in the higher-level component graph.
+   Key shared-memory layout: an **anonymous union** holds both views over the same 64 bytes:
+   ```cpp
+   __shared__ union {
+       uint32_t sMaskWords_u32[16];  // ballot granularity (one u32 per warp)
+       uint64_t sMaskWords[8];       // Mask<3>::words() granularity (for GMEM write + face extraction)
+   };
+   ```
+   Two `__syncthreads()` per component iteration: SYNC1 after the ballot writes + erase (makes
+   `sMaskWords_u32` visible and `cur` erases committed); SYNC2 after the GMEM mask write + face
+   extraction (orders those global writes before the next `BlockReduce` call).
 
-6. **Hook/compress on the component graph.** With the inter-leaf edges in hand, run the same
-   Shiloach–Vishkin schedule used per leaf, but now over component representatives: **hook**
-   connected representatives across leaf boundaries, and **compress** with the identical
-   pointer-jumping op. The algorithm is unchanged from the per-leaf case; the hard part is
-   *discovering* the inter-leaf edges efficiently (steps 4–5), not the union-find itself.
+4. **Per-component face flags.** ✅
+   Allocated as `mLeafComponentFaceMasks` (`K × 6 × sizeof(uint64_t)`), cast as `uint64_t(*)[6]`.
+   Face indices are named by `LeafNeighborTap` enum: `{minusX, plusX, minusY, plusY, minusZ, plusZ}`.
+
+   Extracted by `tID == 0` inside the same while-true loop, reading from `sMaskWords[x]`
+   immediately after SYNC1 (no global read-back needed):
+
+   - **±X:** `face[minusX] = sMaskWords[0]`, `face[plusX] = sMaskWords[7]` (trivial — whole words).
+   - **±Y:** shift-accumulate the bottom / top byte of each word from `x=7` downto `0`; result bit
+     index `= x*8 + z` (x major, z minor).
+   - **±Z:** shift-accumulate `w & 0x0101…` / `(w >> 7) & 0x0101…` from `x=7` downto `0`; result
+     bit index `= y*8 + x` (y major, x minor).
+
+   Cross-leaf connectivity check (step 5) then reduces to a single `(faceA & faceB) != 0` bitwise AND.
+
+5. **Detect cross-leaf connectivity via face flags.** *(TODO)*
+   For each leaf, inspect only its `+X`, `+Y`, and `+Z` neighboring leaves (visits each undirected
+   boundary exactly once). For every pair of components on the two adjacent leaves, compare the
+   touching face flags (e.g. this leaf's `+X` against the neighbor's `minusX`). If
+   `(faceA & faceB) != 0` the two components touch and form an edge in the higher-level graph.
+
+6. **Hook/compress on the component graph.** *(TODO)*
+   Same Shiloach–Vishkin schedule used per leaf, but over component representatives. The hard part
+   is discovering the inter-leaf edges (step 5), not the union-find itself.
 
 **Open design questions**
 
 - exact metadata layout for component-mask slots: source leaf id, local root id, global
   representative id;
-- how to derive per-leaf output start offsets cleanly from the inclusive sum;
 - whether to materialize all cross-leaf edges explicitly or hook directly while scanning
   neighboring leaves;
 - how to find sparse neighboring leaves efficiently, likely using `ValueAccessor` / the CUDA

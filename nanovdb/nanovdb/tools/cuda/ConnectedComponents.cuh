@@ -292,10 +292,11 @@ struct LeafComponentMaskFunctor
         __shared__ typename cub::BlockReduce<uint32_t, LEAF_SIZE>::TempStorage reduceTmp;
         __shared__ int      changed;
         __shared__ uint32_t sMinLabel;
-        __shared__ union {
-            uint32_t sMaskWords_u32[16];  // ballot granularity: one u32 per warp, written by laneID==0
-            uint64_t sMaskWords[8];       // Mask<3>::words() granularity: used for face extraction + GMEM write
-        };
+        // Ballot words (u32/warp) aliased to the Mask<3> u64 words. NAMED union: an anonymous
+        // __shared__ union compiled to per-thread local storage, breaking cross-warp sharing.
+        __shared__ union { uint32_t u32[16]; uint64_t u64[8]; } sMaskU;
+        uint32_t* sMaskWords_u32 = sMaskU.u32;
+        uint64_t* sMaskWords     = sMaskU.u64;
 
         const int   leafID = blockIdx.x;
         const int   tID    = threadIdx.x;

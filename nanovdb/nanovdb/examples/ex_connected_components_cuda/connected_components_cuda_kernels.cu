@@ -211,6 +211,82 @@ std::vector<uint16_t> cpuLeafComponentCounts(const GridT* grid)
     return counts;
 }
 
+/// @brief CPU reference for the per-component leaf masks and 6 face bitmasks, mirroring
+///        cpuLeafComponentCounts(): the same per-leaf 6-connected union-find, then components
+///        enumerated in ascending root-label order (which matches the GPU kernel's repeated
+///        BlockReduce-min enumeration, so global component slots line up). For each component
+///        it builds the Mask<3> footprint and the 6 face bitmasks directly from voxel
+///        coordinates -- intentionally NOT mirroring the kernel's shift/0x0101... extraction,
+///        so this is an independent check. Bit conventions follow the LeafNeighborTap enum in
+///        tools/cuda/ConnectedComponents.cuh:
+///          +/-X face: bit y*8+z ;  +/-Y face: bit x*8+z ;  +/-Z face: bit y*8+x.
+struct CpuMasksFaces {
+    std::vector<nanovdb::Mask<3>> masks;  // K masks, one per leaf-local component (global slot order)
+    std::vector<uint64_t>         faces;  // 6*K: face t of component c at faces[6*c + t]
+    uint64_t                      K{0};   // total leaf-local components (== deviceLeafComponentOffsets()[leafCount])
+};
+
+template <typename GridT>
+CpuMasksFaces cpuMasksFaces(const GridT* grid)
+{
+    namespace cc = nanovdb::tools::cuda;  // for the LeafNeighborTap enumerators (minusX..plusZ)
+    const auto&    tree      = grid->tree();
+    const uint32_t leafCount = tree.nodeCount(0);
+    const auto*    leaves    = tree.getFirstLeaf();
+
+    int parent[512] = {};// re-initialized per leaf below
+    auto find = [&](int i) {
+        while (parent[i] != i) { parent[i] = parent[parent[i]]; i = parent[i]; }
+        return i;
+    };
+    auto unite = [&](int a, int b) {
+        const int ra = find(a), rb = find(b);
+        if (ra == rb) return;
+        if (ra < rb) parent[rb] = ra;// attach larger root under smaller root
+        else         parent[ra] = rb;
+    };
+
+    CpuMasksFaces out;
+    int rootIdx[512];
+    for (uint32_t li = 0; li < leafCount; ++li) {
+        const auto& leaf = leaves[li];
+        for (int n = 0; n < 512; ++n) parent[n] = leaf.isActive(uint32_t(n)) ? n : -1;
+        for (int n = 0; n < 512; ++n) {
+            if (parent[n] < 0) continue;// inactive
+            const int x = n >> 6, y = (n >> 3) & 7, z = n & 7;
+            if (x < 7 && parent[n + 64] >= 0) unite(n, n + 64);
+            if (y < 7 && parent[n +  8] >= 0) unite(n, n +  8);
+            if (z < 7 && parent[n +  1] >= 0) unite(n, n +  1);
+        }
+        // Dense local component indices in ascending root-label (== ascending offset) order.
+        int localCount = 0;
+        for (int n = 0; n < 512; ++n) rootIdx[n] = -1;
+        for (int n = 0; n < 512; ++n) if (parent[n] == n) rootIdx[n] = localCount++;
+
+        std::vector<nanovdb::Mask<3>> lmask(localCount);
+        for (auto& m : lmask) m.setOff();
+        std::vector<uint64_t> lface(std::size_t(6) * localCount, 0);
+
+        for (int n = 0; n < 512; ++n) {
+            if (parent[n] < 0) continue;
+            const int k = rootIdx[find(n)];
+            const int x = n >> 6, y = (n >> 3) & 7, z = n & 7;
+            lmask[k].setOn(uint32_t(n));
+            uint64_t* f = &lface[6 * k];
+            if (x == 0) f[cc::minusX] |= uint64_t(1) << (y * 8 + z);
+            if (x == 7) f[cc::plusX ] |= uint64_t(1) << (y * 8 + z);
+            if (y == 0) f[cc::minusY] |= uint64_t(1) << (x * 8 + z);
+            if (y == 7) f[cc::plusY ] |= uint64_t(1) << (x * 8 + z);
+            if (z == 0) f[cc::minusZ] |= uint64_t(1) << (y * 8 + x);
+            if (z == 7) f[cc::plusZ ] |= uint64_t(1) << (y * 8 + x);
+        }
+        out.masks.insert(out.masks.end(), lmask.begin(), lmask.end());
+        out.faces.insert(out.faces.end(), lface.begin(), lface.end());
+        out.K += uint64_t(localCount);
+    }
+    return out;
+}
+
 } // anonymous namespace
 
 void computeCC(const GridHandleT& gridHandle)
@@ -267,6 +343,46 @@ void computeCC(const GridHandleT& gridHandle)
               << (mismatches == 0 ? "PASS" : "FAIL") << " ("
               << leafCount << " leaves, " << mismatches << " mismatches; "
               << "total components gpu=" << gpuTotal << " cpu=" << cpuTotal << ")\n";
+
+    // ---- Validate per-component leaf masks and face flags (pipeline step 4) ----
+    // Offsets give K (total components) and each leaf's slot range; masks/faces are flat,
+    // indexed by global component slot = offsets[leafID] + localIdx.
+    std::vector<uint64_t> gpuOffsets(std::size_t(leafCount) + 1);
+    cudaCheck(cudaMemcpy(gpuOffsets.data(), cc.deviceLeafComponentOffsets(),
+                         (std::size_t(leafCount) + 1) * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+    const uint64_t K = gpuOffsets[leafCount];
+
+    std::vector<nanovdb::Mask<3>> gpuMasks(K);
+    cudaCheck(cudaMemcpy(gpuMasks.data(), cc.deviceLeafComponentMasks(),
+                         std::size_t(K) * sizeof(nanovdb::Mask<3>), cudaMemcpyDeviceToHost));
+    std::vector<uint64_t> gpuFaces(std::size_t(6) * K);
+    cudaCheck(cudaMemcpy(gpuFaces.data(), cc.deviceLeafComponentFaceMasks(),
+                         std::size_t(6) * K * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+
+    const CpuMasksFaces cmf = cpuMasksFaces(h_grid);
+
+    std::size_t maskMismatch = 0, faceMismatch = 0, shownMF = 0;
+    for (uint64_t c = 0; c < K; ++c) {
+        bool mbad = false;
+        for (int w = 0; w < 8; ++w)
+            if (gpuMasks[c].words()[w] != cmf.masks[c].words()[w]) { mbad = true; break; }
+        bool fbad = false;
+        for (int t = 0; t < 6; ++t)
+            if (gpuFaces[6 * c + t] != cmf.faces[6 * c + t]) { fbad = true; break; }
+        if (mbad) ++maskMismatch;
+        if (fbad) ++faceMismatch;
+        if ((mbad || fbad) && shownMF++ < 10) {
+            uint32_t li = 0; while (li < leafCount && gpuOffsets[li + 1] <= c) ++li;
+            std::cerr << "  CC mask/face mismatch @ component " << c << " (leaf " << li
+                      << ", local " << (c - gpuOffsets[li]) << ")"
+                      << (mbad ? " [mask]" : "") << (fbad ? " [face]" : "") << "\n";
+        }
+    }
+
+    std::cout << "CC per-component mask/face validation:  "
+              << ((maskMismatch == 0 && faceMismatch == 0) ? "PASS" : "FAIL") << " ("
+              << K << " components, " << maskMismatch << " mask mismatches, "
+              << faceMismatch << " face mismatches)\n";
 
     cudaCheck(cudaFreeHost(hostBlob));
 }

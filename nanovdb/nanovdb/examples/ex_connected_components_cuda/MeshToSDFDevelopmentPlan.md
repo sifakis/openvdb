@@ -57,7 +57,7 @@ in and returning device buffers (`GridHandle<DeviceBuffer>`, `DeviceBuffer`) out
    `TEST(TestNanoVDBCUDA, LeafConnectedComponents)`, and compares the two per-leaf count
    arrays elementwise. Prints PASS/FAIL with leaf count, mismatch count, and gpu/cpu totals.
 
-   **✅ STATUS: PASSES (resolved 2026-06).** Validates deterministically against the oracle
+   **✅ STATUS: PASSES (resolved 2026-06-08).** Validates deterministically against the oracle
    across runs and resolutions: dragon @ 0.005 (2,013 leaves), 0.002 (13,442 leaves), and
    0.0005 (220,335 leaves) all report 0 mismatches with gpu total == cpu total on every run.
 
@@ -160,7 +160,18 @@ For a 2D, CPU, single-step-at-a-time intuition for exactly these primitives and 
 
 ## Leaf-local component masks and face flags (`processLeafConnectedComponents`, continued)
 
-Steps 1–4 below are **✅ implemented** (2026-06). Steps 5–6 are still TODO.
+Steps 1–4 below are **✅ implemented (2026-06-09) and validated (2026-06-11)**. Steps 5–6 are still TODO.
+
+> **✅ Validated against a CPU oracle (2026-06-11).** `computeCC()` in the example now runs a host
+> oracle (`cpuMasksFaces`) that independently rebuilds each component's `Mask<3>` and its six face
+> bitmasks **directly from voxel coordinates** (deliberately *not* mirroring the kernel's
+> shift/`0x0101…` extraction), then compares them elementwise against the device buffers.
+> This caught and fixed a shared-memory bug: the mask-fill kernel's **anonymous** `__shared__`
+> union was compiled to per-thread *local* storage, so each warp-leader's ballot was invisible to
+> the threads doing the global write — every component mask came out empty. Fixed by making it a
+> **named** `__shared__` union (see step 3). With the fix, the GPU per-component masks **and** the
+> six-face extraction match the oracle with **0 mismatches** up to the dragon @ 0.0005
+> (337,563 components / 220,335 leaves).
 
 The plan promotes each leaf-local component to a first-class record, detects which records touch
 across leaf faces, and then runs the same hook/compress union-find one level up — on a graph
@@ -191,12 +202,13 @@ whose vertices are leaf-local components rather than voxels.
      for the whole mask.
    - **Erase:** matched entries set to `CC_INACTIVE` so they don't win a future min. `++localCompIdx`.
 
-   Key shared-memory layout: an **anonymous union** holds both views over the same 64 bytes:
+   Key shared-memory layout: a **named** `__shared__` union holds both views over the same 64 bytes.
+   It must be *named* — an anonymous `__shared__` union was miscompiled to per-thread local storage,
+   making each warp-leader's ballot invisible to the threads doing the global write (fixed 2026-06-11):
    ```cpp
-   __shared__ union {
-       uint32_t sMaskWords_u32[16];  // ballot granularity (one u32 per warp)
-       uint64_t sMaskWords[8];       // Mask<3>::words() granularity (for GMEM write + face extraction)
-   };
+   __shared__ union { uint32_t u32[16]; uint64_t u64[8]; } sMaskU;  // u32: ballot/warp; u64: Mask<3> words
+   uint32_t* sMaskWords_u32 = sMaskU.u32;
+   uint64_t* sMaskWords     = sMaskU.u64;
    ```
    Two `__syncthreads()` per component iteration: SYNC1 after the ballot writes + erase (makes
    `sMaskWords_u32` visible and `cur` erases committed); SYNC2 after the GMEM mask write + face

@@ -22,6 +22,7 @@
 
 #include <thrust/universal_vector.h>
 
+#include <algorithm>  // std::sort
 #include <iostream>
 #include <string>
 #include <utility>
@@ -287,6 +288,54 @@ CpuMasksFaces cpuMasksFaces(const GridT* grid)
     return out;
 }
 
+/// @brief CPU reference for the cross-leaf connectivity edges (pipeline step 5). Mirrors the device
+///        CrossLeafEdge[] output: for each leaf and each of its +X/+Y/+Z neighbor leaves, pairs every
+///        local component with every neighbor local component and emits a canonical (a<b) edge over
+///        global component slots iff their touching face masks intersect. Uses the already-validated
+///        per-component face masks (cmf.faces) and component offsets (compOffsets), and the same host
+///        probeLeaf neighbor walk the kernel uses, so the two sides match bit-for-bit. Returned
+///        unsorted; the caller sorts both sides and compares as a set.
+template <typename GridT>
+std::vector<nanovdb::tools::cuda::CrossLeafEdge>
+cpuCrossLeafEdges(const GridT* grid, const CpuMasksFaces& cmf, const std::vector<uint64_t>& compOffsets)
+{
+    namespace cc = nanovdb::tools::cuda;
+    const auto&    tree      = grid->tree();
+    const uint32_t leafCount = tree.nodeCount(0);
+    const auto*    leaves    = tree.getFirstLeaf();
+
+    const int faceL[3] = { cc::plusX,  cc::plusY,  cc::plusZ  };  // this leaf's +axis face
+    const int faceN[3] = { cc::minusX, cc::minusY, cc::minusZ };  // neighbor's matching -axis face
+
+    std::vector<cc::CrossLeafEdge> edges;
+    for (uint32_t L = 0; L < leafCount; ++L) {
+        const uint64_t baseL  = compOffsets[L];
+        const int      countL = int(compOffsets[L + 1] - baseL);
+        const nanovdb::Coord o = leaves[L].origin();
+        for (int axis = 0; axis < 3; ++axis) {
+            const nanovdb::Coord no = (axis == 0) ? o.offsetBy(8, 0, 0)
+                                    : (axis == 1) ? o.offsetBy(0, 8, 0)
+                                                  : o.offsetBy(0, 0, 8);
+            const auto* nptr = tree.root().probeLeaf(no);
+            if (!nptr) continue;
+            const uint64_t N = uint64_t(nptr - leaves);
+            const uint64_t baseN  = compOffsets[N];
+            const int      countN = int(compOffsets[N + 1] - baseN);
+            const int fL = faceL[axis], fN = faceN[axis];
+            for (int i = 0; i < countL; ++i)
+                for (int j = 0; j < countN; ++j)
+                    if (cmf.faces[6 * (baseL + i) + fL] & cmf.faces[6 * (baseN + j) + fN]) {
+                        const uint32_t ga = uint32_t(baseL + i), gb = uint32_t(baseN + j);
+                        cc::CrossLeafEdge e;
+                        e.a = (ga < gb) ? ga : gb;
+                        e.b = (ga < gb) ? gb : ga;
+                        edges.push_back(e);
+                    }
+        }
+    }
+    return edges;
+}
+
 } // anonymous namespace
 
 void computeCC(const GridHandleT& gridHandle)
@@ -300,6 +349,14 @@ void computeCC(const GridHandleT& gridHandle)
     nanovdb::tools::cuda::ConnectedComponents<BuildT> cc(d_grid);
     cc.setVerbose(1);
     cc.processLeafConnectedComponents();
+    cudaCheck(cudaDeviceSynchronize());
+
+    // Step 5: cross-leaf connectivity edges over the leaf-local components.
+    cc.processCrossLeafEdges();
+    cudaCheck(cudaDeviceSynchronize());
+
+    // Step 6: global union-find over the edges -> per-component representative.
+    cc.processComponentLabels();
     cudaCheck(cudaDeviceSynchronize());
 
     const uint32_t leafCount = Traits::getTreeData(d_grid).mNodeCount[0];
@@ -383,6 +440,82 @@ void computeCC(const GridHandleT& gridHandle)
               << ((maskMismatch == 0 && faceMismatch == 0) ? "PASS" : "FAIL") << " ("
               << K << " components, " << maskMismatch << " mask mismatches, "
               << faceMismatch << " face mismatches)\n";
+
+    // ---- Validate cross-leaf connectivity edges (pipeline step 5) ----
+    // GPU emits edges in atomic-driven (nondeterministic) order, so compare as a SET: sort both
+    // sides canonically and compare. Component offsets (gpuOffsets) double as the per-leaf slot
+    // ranges the oracle needs.
+    using Edge = nanovdb::tools::cuda::CrossLeafEdge;
+    const uint64_t E = cc.crossLeafEdgeCount();
+    std::vector<Edge> gpuEdges(E);
+    if (E) cudaCheck(cudaMemcpy(gpuEdges.data(), cc.deviceCrossLeafEdges(),
+                                std::size_t(E) * sizeof(Edge), cudaMemcpyDeviceToHost));
+
+    std::vector<Edge> cpuEdges = cpuCrossLeafEdges(h_grid, cmf, gpuOffsets);
+
+    auto edgeLess = [](const Edge& x, const Edge& y) { return x.a != y.a ? x.a < y.a : x.b < y.b; };
+    std::sort(gpuEdges.begin(), gpuEdges.end(), edgeLess);
+    std::sort(cpuEdges.begin(), cpuEdges.end(), edgeLess);
+
+    std::size_t edgeMismatch = 0;
+    if (gpuEdges.size() != cpuEdges.size()) {
+        edgeMismatch = (gpuEdges.size() > cpuEdges.size()) ? gpuEdges.size() - cpuEdges.size()
+                                                           : cpuEdges.size() - gpuEdges.size();
+        std::cerr << "  CC cross-leaf edge count mismatch: gpu E=" << gpuEdges.size()
+                  << " cpu E=" << cpuEdges.size() << "\n";
+    } else {
+        std::size_t shownE = 0;
+        for (std::size_t e = 0; e < gpuEdges.size(); ++e)
+            if (gpuEdges[e].a != cpuEdges[e].a || gpuEdges[e].b != cpuEdges[e].b) {
+                if (shownE++ < 10)
+                    std::cerr << "  CC cross-leaf edge mismatch @ " << e
+                              << ": gpu(" << gpuEdges[e].a << "," << gpuEdges[e].b << ")"
+                              << " cpu(" << cpuEdges[e].a << "," << cpuEdges[e].b << ")\n";
+                ++edgeMismatch;
+            }
+    }
+
+    std::cout << "CC cross-leaf edge validation:          "
+              << (edgeMismatch == 0 ? "PASS" : "FAIL") << " ("
+              << E << " edges, " << edgeMismatch << " mismatches)\n";
+
+    // ---- Validate global component labels (pipeline step 6) ----
+    // Host union-find over the SAME edge list, same larger->smaller linking, so the flattened
+    // representative (each class's minimum slot) matches the GPU elementwise. Path-halving in the
+    // host find only shortens paths; it never changes the (minimum) root.
+    std::vector<uint64_t> hostParent(K);
+    for (uint64_t s = 0; s < K; ++s) hostParent[s] = s;
+    auto hFind = [&](uint64_t x) {
+        while (hostParent[x] != x) { hostParent[x] = hostParent[hostParent[x]]; x = hostParent[x]; }
+        return x;
+    };
+    for (const Edge& e : gpuEdges) {
+        const uint64_t ra = hFind(e.a), rb = hFind(e.b);
+        if (ra == rb) continue;
+        if (ra < rb) hostParent[rb] = ra; else hostParent[ra] = rb;  // larger root under smaller
+    }
+    for (uint64_t s = 0; s < K; ++s) hostParent[s] = hFind(s);       // flatten
+
+    std::vector<uint64_t> gpuParent(K);
+    cudaCheck(cudaMemcpy(gpuParent.data(), cc.deviceComponentParent(),
+                         std::size_t(K) * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+
+    std::size_t labelMismatch = 0, shownL = 0;
+    uint64_t    distinct = 0;  // representatives (gpuParent[s]==s) = true global component count
+    for (uint64_t s = 0; s < K; ++s) {
+        if (gpuParent[s] == s) ++distinct;
+        if (gpuParent[s] != hostParent[s]) {
+            if (shownL++ < 10)
+                std::cerr << "  CC label mismatch @ component " << s
+                          << ": gpu=" << gpuParent[s] << " cpu=" << hostParent[s] << "\n";
+            ++labelMismatch;
+        }
+    }
+
+    std::cout << "CC component-label validation:          "
+              << (labelMismatch == 0 ? "PASS" : "FAIL") << " ("
+              << K << " components, " << distinct << " global labels, "
+              << labelMismatch << " mismatches)\n";
 
     cudaCheck(cudaFreeHost(hostBlob));
 }

@@ -75,6 +75,12 @@ enum LeafNeighborTap : int {
     plusZ  = 5
 };
 
+/// @brief An undirected edge of the cross-leaf component graph: two leaf-local components (each a
+///        global slot = leafComponentOffsets[leaf] + localIdx) that touch across a shared leaf face.
+///        Stored canonically with a < b. uint32_t suffices: the total component count
+///        K <= 256 * leafCount stays well below 2^32 for any realistic grid.
+struct CrossLeafEdge { uint32_t a, b; };
+
 template <typename BuildT>
 class ConnectedComponents
 {
@@ -127,6 +133,30 @@ public:
         return reinterpret_cast<uint64_t(*)[6]>(mLeafComponentFaceMasks.deviceData());
     }
 
+    /// @brief Compute the cross-leaf connectivity edges of the component graph (step 5): for every
+    ///        pair of leaf-local components on face-adjacent leaves whose touching face masks
+    ///        intersect, emit one edge (global slot a, global slot b) with a < b. Requires
+    ///        processLeafConnectedComponents() to have been called first. Edges are produced in an
+    ///        unspecified order — compare as a set.
+    void processCrossLeafEdges();
+
+    /// @brief Device pointer to the cross-leaf edge array (crossLeafEdgeCount() entries),
+    ///        valid after processCrossLeafEdges().
+    CrossLeafEdge* deviceCrossLeafEdges() { return static_cast<CrossLeafEdge*>(mCrossLeafEdges.deviceData()); }
+
+    /// @brief Number of cross-leaf edges E, valid after processCrossLeafEdges().
+    uint64_t crossLeafEdgeCount() const { return mCrossLeafEdgeCount; }
+
+    /// @brief Compute global component labels (step 6): union-find over the cross-leaf edges so two
+    ///        leaf-local components share a representative iff they are connected across leaves.
+    ///        Requires processCrossLeafEdges() first. After flatten, deviceComponentParent()[s] is
+    ///        the global representative of component s (the minimum global slot in its class).
+    void processComponentLabels();
+
+    /// @brief Device pointer to the per-component global representative array (K entries),
+    ///        valid after processComponentLabels().
+    uint64_t* deviceComponentParent() { return static_cast<uint64_t*>(mComponentParent.deviceData()); }
+
 private:
 
     cudaStream_t                 mStream{0};
@@ -141,6 +171,12 @@ private:
     nanovdb::cuda::DeviceBuffer  mLeafComponentOffsets;     // (leafCount+1)                × uint64_t:      exclusive+inclusive prefix sums
     nanovdb::cuda::DeviceBuffer  mLeafComponentMasks;       // mLeafComponentAggregateCount × Mask<3>:       per-component active-voxel footprint
     nanovdb::cuda::DeviceBuffer  mLeafComponentFaceMasks;   // mLeafComponentAggregateCount × uint64_t[6]:   per-component face bitmasks (0=-X,1=+X,2=-Y,3=+Y,4=-Z,5=+Z)
+
+    uint64_t                     mCrossLeafEdgeCount{0};    // total cross-leaf edges (E)
+    nanovdb::cuda::DeviceBuffer  mCrossLeafEdgeOffsets;     // (leafCount+1) × uint64_t:  per-leaf edge prefix sums
+    nanovdb::cuda::DeviceBuffer  mCrossLeafEdges;           // E × CrossLeafEdge (a<b)
+
+    nanovdb::cuda::DeviceBuffer  mComponentParent;          // K × uint64_t: per-component global representative
 
 }; // tools::cuda::ConnectedComponents<BuildT>
 
@@ -395,6 +431,139 @@ struct LeafComponentMaskFunctor
     }
 }; // LeafComponentMaskFunctor
 
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Step 5: cross-leaf connectivity edges.
+//
+// One block per leaf. For each of the leaf's +X/+Y/+Z neighbor leaves (so each undirected leaf-leaf
+// boundary is visited exactly once, from its -side), pair every local component of this leaf with
+// every local component of the neighbor and test whether their touching face masks intersect. The
+// component "global slot" is leafComponentOffsets[leaf] + localIdx.
+
+/// @brief Linear leaf index of leaf's +axis neighbor (axis: 0=+X, 1=+Y, 2=+Z), or -1 if none.
+template <typename BuildT>
+__device__ inline int ccNeighborLeafIndex(const NanoGrid<BuildT>* d_grid,
+                                           const NanoLeaf<BuildT>&  leaf, int axis)
+{
+    const nanovdb::Coord o  = leaf.origin();
+    const nanovdb::Coord no = (axis == 0) ? o.offsetBy(8, 0, 0)
+                            : (axis == 1) ? o.offsetBy(0, 8, 0)
+                                          : o.offsetBy(0, 0, 8);
+    const auto* nptr = d_grid->tree().root().probeLeaf(no);
+    if (!nptr) return -1;
+    const auto* base = d_grid->tree().template getFirstNode<0>();
+    return int(nptr - base);  // leaves are contiguous breadth-first; typed diff = linear index
+}
+
+/// @brief Enumerate this leaf's cross-leaf component pairs whose touching faces intersect, invoking
+///        emit(globalSlotThisLeaf, globalSlotNeighbor) for each. Shared by the count and scatter
+///        passes so their iteration + AND test cannot drift. Threads of the block stride the pair
+///        grid; emit() must be safe under concurrent calls (it uses a block-scoped atomic).
+template <typename BuildT, typename EdgeFn>
+__device__ inline void ccForEachCrossLeafEdge(
+    const NanoGrid<BuildT>* d_grid, const uint64_t* d_offsets, const uint64_t (*d_faces)[6],
+    int leafID, int tID, int nThreads, EdgeFn&& emit)
+{
+    const auto&    leaf   = d_grid->tree().template getFirstNode<0>()[leafID];
+    const uint64_t baseL  = d_offsets[leafID];
+    const int      countL = int(d_offsets[leafID + 1] - baseL);
+    if (countL == 0) return;
+
+    const int faceL[3] = { plusX,  plusY,  plusZ  };  // this leaf's +axis face
+    const int faceN[3] = { minusX, minusY, minusZ };  // neighbor's matching -axis face
+
+    for (int axis = 0; axis < 3; ++axis) {
+        const int N = ccNeighborLeafIndex<BuildT>(d_grid, leaf, axis);
+        if (N < 0) continue;
+        const uint64_t baseN  = d_offsets[N];
+        const int      countN = int(d_offsets[N + 1] - baseN);
+        if (countN == 0) continue;
+        const int fL = faceL[axis], fN = faceN[axis];
+        const int total = countL * countN;
+        for (int p = tID; p < total; p += nThreads) {
+            const int i = p / countN, j = p % countN;
+            if (d_faces[baseL + i][fL] & d_faces[baseN + j][fN])
+                emit(uint32_t(baseL + i), uint32_t(baseN + j));
+        }
+    }
+}
+
+template <typename BuildT>
+struct CrossLeafEdgeCountFunctor
+{
+    static constexpr int MaxThreadsPerBlock         = 128;
+    static constexpr int MinBlocksPerMultiprocessor = 1;
+
+    // d_outCount is (leafComponentEdgeOffsets + 1), so writing [leafID] lands at offsets[leafID+1].
+    __device__ void operator()(const NanoGrid<BuildT>* d_grid, const uint64_t* d_offsets,
+                               const uint64_t (*d_faces)[6], uint64_t* d_outCount)
+    {
+        __shared__ int sEdges;
+        const int leafID = blockIdx.x, tID = threadIdx.x;
+        if (tID == 0) sEdges = 0;
+        __syncthreads();
+        ccForEachCrossLeafEdge<BuildT>(d_grid, d_offsets, d_faces, leafID, tID, blockDim.x,
+            [&] __device__ (uint32_t, uint32_t) { atomicAdd_block(&sEdges, 1); });
+        __syncthreads();
+        if (tID == 0) d_outCount[leafID] = uint64_t(sEdges);
+    }
+};
+
+template <typename BuildT>
+struct CrossLeafEdgeScatterFunctor
+{
+    static constexpr int MaxThreadsPerBlock         = 128;
+    static constexpr int MinBlocksPerMultiprocessor = 1;
+
+    __device__ void operator()(const NanoGrid<BuildT>* d_grid, const uint64_t* d_offsets,
+                               const uint64_t (*d_faces)[6], const uint64_t* d_edgeOffsets,
+                               CrossLeafEdge* d_edges)
+    {
+        __shared__ unsigned long long sWrite;
+        const int leafID = blockIdx.x, tID = threadIdx.x;
+        if (tID == 0) sWrite = (unsigned long long)d_edgeOffsets[leafID];
+        __syncthreads();
+        ccForEachCrossLeafEdge<BuildT>(d_grid, d_offsets, d_faces, leafID, tID, blockDim.x,
+            [&] __device__ (uint32_t ga, uint32_t gb) {
+                const unsigned long long slot = atomicAdd_block(&sWrite, 1ull);
+                CrossLeafEdge e;
+                e.a = (ga < gb) ? ga : gb;  // canonical a < b
+                e.b = (ga < gb) ? gb : ga;
+                d_edges[slot] = e;
+            });
+        __syncthreads();
+    }
+};
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Step 6: global union-find over the cross-leaf edge list (representative = min slot in the class).
+
+/// @brief Walk parent pointers to the root of x. Links always point larger->smaller slot, so the
+///        forest is acyclic and this terminates; the root is the minimum slot in x's class.
+__device__ inline uint64_t ccFind(const uint64_t* parent, uint64_t x)
+{
+    while (parent[x] != x) x = parent[x];
+    return x;
+}
+
+/// @brief Lock-free union of the classes of a and b: find both roots and CAS-link the larger root
+///        under the smaller (parent[hi] : hi -> lo). Retries if hi ceased to be a root meanwhile.
+///        Order-independent result: a class's minimum slot is never the "hi", so it stays the root.
+__device__ inline void ccUnite(uint64_t* parent, uint64_t a, uint64_t b)
+{
+    while (true) {
+        const uint64_t ra = ccFind(parent, a);
+        const uint64_t rb = ccFind(parent, b);
+        if (ra == rb) return;
+        const uint64_t hi = (ra > rb) ? ra : rb;
+        const uint64_t lo = (ra < rb) ? ra : rb;
+        const unsigned long long old = atomicCAS(
+            reinterpret_cast<unsigned long long*>(&parent[hi]),
+            static_cast<unsigned long long>(hi),
+            static_cast<unsigned long long>(lo));
+        if (old == static_cast<unsigned long long>(hi)) return;  // linked; else hi moved -> retry
+    }
+}
+
 } // namespace cc_detail
 
 template <typename BuildT>
@@ -479,6 +648,97 @@ void ConnectedComponents<BuildT>::processLeafConnectedComponents()
     cudaCheckError();
     if (mVerbose==1) mTimer.stop();
 }// ConnectedComponents<BuildT>::processLeafConnectedComponents
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+template <typename BuildT>
+void ConnectedComponents<BuildT>::processCrossLeafEdges()
+{
+    const uint32_t leafCount =
+        util::cuda::DeviceGridTraits<BuildT>::getTreeData(mDeviceSrcGrid).mNodeCount[0];
+    mCrossLeafEdgeCount = 0;
+    if (leafCount == 0) return;
+
+    // Per-leaf edge offsets: offsets[0]=0, offsets[1..leafCount] filled by the count pass then
+    // scanned in place; offsets[leafCount] = E (total cross-leaf edges).
+    mCrossLeafEdgeOffsets = nanovdb::cuda::DeviceBuffer::create(
+        (std::size_t(leafCount) + 1) * sizeof(uint64_t), nullptr, false);
+    uint64_t* d_offsets = static_cast<uint64_t*>(mCrossLeafEdgeOffsets.deviceData());
+    cudaCheck(cudaMemsetAsync(d_offsets, 0, sizeof(uint64_t), mStream));
+
+    // Count pass: one block per leaf, writing each leaf's edge count into offsets[leafID+1].
+    using CountOp = cc_detail::CrossLeafEdgeCountFunctor<BuildT>;
+    if (mVerbose==1) mTimer.start("Cross-leaf edge count");
+    util::cuda::operatorKernel<CountOp>
+        <<<leafCount, CountOp::MaxThreadsPerBlock, 0, mStream>>>(
+            mDeviceSrcGrid, deviceLeafComponentOffsets(), deviceLeafComponentFaceMasks(), d_offsets + 1);
+    cudaCheckError();
+    if (mVerbose==1) mTimer.stop();
+
+    // Inclusive prefix sum over offsets[1..leafCount]; offsets[leafCount] = E.
+    if (mVerbose==1) mTimer.start("Cross-leaf edge offset prefix sum");
+    CALL_CUBS(DeviceScan::InclusiveSum, d_offsets + 1, d_offsets + 1, int(leafCount));
+    cudaCheckError();
+    if (mVerbose==1) mTimer.stop();
+
+    cudaCheck(cudaMemcpyAsync(&mCrossLeafEdgeCount, d_offsets + leafCount,
+                              sizeof(uint64_t), cudaMemcpyDeviceToHost, mStream));
+    cudaCheck(cudaStreamSynchronize(mStream));
+    if (mCrossLeafEdgeCount == 0) return;  // single-leaf grid / no touching components
+
+    // Scatter pass: write each leaf's edges into [offsets[leafID], offsets[leafID+1]).
+    mCrossLeafEdges = nanovdb::cuda::DeviceBuffer::create(
+        mCrossLeafEdgeCount * sizeof(CrossLeafEdge), nullptr, false);
+    using ScatterOp = cc_detail::CrossLeafEdgeScatterFunctor<BuildT>;
+    if (mVerbose==1) mTimer.start("Cross-leaf edge scatter");
+    util::cuda::operatorKernel<ScatterOp>
+        <<<leafCount, ScatterOp::MaxThreadsPerBlock, 0, mStream>>>(
+            mDeviceSrcGrid, deviceLeafComponentOffsets(), deviceLeafComponentFaceMasks(),
+            d_offsets, deviceCrossLeafEdges());
+    cudaCheckError();
+    if (mVerbose==1) mTimer.stop();
+}// ConnectedComponents<BuildT>::processCrossLeafEdges
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+template <typename BuildT>
+void ConnectedComponents<BuildT>::processComponentLabels()
+{
+    const uint64_t K = mLeafComponentAggregateCount;
+    mComponentParent = nanovdb::cuda::DeviceBuffer::create(
+        std::size_t(K ? K : 1) * sizeof(uint64_t), nullptr, false);  // avoid 0-byte alloc
+    if (K == 0) return;
+    uint64_t* d_parent = deviceComponentParent();
+
+    auto blocks = [](uint64_t n) { return (unsigned int)((n + 255) / 256); };
+
+    // (a) init: every component is its own root.
+    if (mVerbose==1) mTimer.start("Component-label init");
+    util::cuda::lambdaKernel<<<blocks(K), 256, 0, mStream>>>(
+        K, [] __device__(size_t s, uint64_t* p) { p[s] = uint64_t(s); }, d_parent);
+    cudaCheckError();
+    if (mVerbose==1) mTimer.stop();
+
+    // (b) unite: one thread per edge; each ccUnite has its own CAS-retry, so one pass suffices.
+    if (mCrossLeafEdgeCount) {
+        if (mVerbose==1) mTimer.start("Component-label unite");
+        util::cuda::lambdaKernel<<<blocks(mCrossLeafEdgeCount), 256, 0, mStream>>>(
+            mCrossLeafEdgeCount,
+            [] __device__(size_t e, uint64_t* p, const CrossLeafEdge* edges) {
+                cc_detail::ccUnite(p, uint64_t(edges[e].a), uint64_t(edges[e].b));
+            },
+            d_parent, deviceCrossLeafEdges());
+        cudaCheckError();
+        if (mVerbose==1) mTimer.stop();
+    }
+
+    // (c) flatten: point every component directly at its representative (class minimum slot).
+    if (mVerbose==1) mTimer.start("Component-label flatten");
+    util::cuda::lambdaKernel<<<blocks(K), 256, 0, mStream>>>(
+        K, [] __device__(size_t s, uint64_t* p) { p[s] = cc_detail::ccFind(p, uint64_t(s)); }, d_parent);
+    cudaCheckError();
+    if (mVerbose==1) mTimer.stop();
+}// ConnectedComponents<BuildT>::processComponentLabels
 
 } // namespace tools::cuda
 

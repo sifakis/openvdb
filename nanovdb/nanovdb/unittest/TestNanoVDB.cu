@@ -4193,3 +4193,95 @@ TEST(TestNanoVDBCUDA, LeafConnectedComponents)
         EXPECT_GT(c.size(), 1u);
     }
 }// LeafConnectedComponents
+
+// Synthetic, fully-procedural validation of the *global* connected-components pipeline
+// (steps 1-6: per-leaf CC -> masks/faces -> cross-leaf edges -> global union-find). Builds a dense
+// box of active voxels with a thin shell carved out at each sphere surface, so the active topology
+// has a known closed-form component count, independent of any mesh or rasterizer. The removed shell
+// half-width t > 1/2 voxel guarantees no interior voxel is 6-adjacent to an exterior voxel.
+TEST(TestNanoVDBCUDA, ConnectedComponentsMultiSphere)
+{
+    using BuildT = nanovdb::ValueOnIndex;
+    using Traits = nanovdb::util::cuda::DeviceGridTraits<BuildT>;
+
+    // Run the full CC pipeline on a set of active voxels; return the number of distinct global
+    // components (= union-find representatives, parent[s] == s after flatten).
+    auto globalComponents = [](const std::vector<nanovdb::Coord>& coords) -> uint64_t {
+        nanovdb::Coord* d_coords = nullptr;
+        cudaCheck(cudaMalloc(&d_coords, coords.size() * sizeof(nanovdb::Coord)));
+        cudaCheck(cudaMemcpy(d_coords, coords.data(), coords.size() * sizeof(nanovdb::Coord),
+                             cudaMemcpyHostToDevice));
+        auto handle = nanovdb::tools::cuda::voxelsToGrid<BuildT>(d_coords, coords.size());
+        cudaCheck(cudaFree(d_coords));
+        const auto* d_grid = handle.template deviceGrid<BuildT>();
+
+        nanovdb::tools::cuda::ConnectedComponents<BuildT> cc(d_grid);
+        cc.processLeafConnectedComponents();
+        cc.processCrossLeafEdges();
+        cc.processComponentLabels();
+        cudaCheck(cudaDeviceSynchronize());
+
+        const uint32_t leafCount = Traits::getTreeData(d_grid).mNodeCount[0];
+        std::vector<uint64_t> offs(std::size_t(leafCount) + 1);
+        cudaCheck(cudaMemcpy(offs.data(), cc.deviceLeafComponentOffsets(),
+                             (std::size_t(leafCount) + 1) * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+        const uint64_t K = offs[leafCount];
+        std::vector<uint64_t> parent(K);
+        cudaCheck(cudaMemcpy(parent.data(), cc.deviceComponentParent(),
+                             std::size_t(K) * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+        uint64_t distinct = 0;
+        for (uint64_t s = 0; s < K; ++s) if (parent[s] == s) ++distinct;
+        return distinct;
+    };
+
+    // Reproduce the connected_components pipeline's CC input: the rasterized *narrow band* of a
+    // closed surface with the surface shell removed. computeDerivedTopology prunes voxels whose
+    // unsigned distance to the surface is within sqrt(3)/2 voxels (the barrier), leaving, for a
+    // solid sphere, two disjoint concentric shells (inner + outer) => 2 components. N well-separated
+    // spheres each contribute their own two shells (their narrow bands never touch) => 2N.
+    const float band  = 3.0f;        // narrow-band half-width (voxels), matches the default bandWidth
+    const float shell = 0.8660254f;  // sqrt(3)/2: the barrier shell computeDerivedTopology removes
+
+    auto sphereShells = [&](int N, float R, int spacing) {
+        const int margin = int(band) + 2;
+        const int x0 = -int(R) - margin, x1 = (N - 1) * spacing + int(R) + margin;
+        const int yz = int(R) + margin;
+        std::vector<nanovdb::Coord> coords;
+        for (int x = x0; x <= x1; ++x)
+            for (int y = -yz; y <= yz; ++y)
+                for (int z = -yz; z <= yz; ++z)
+                    for (int i = 0; i < N; ++i) {  // a separated voxel is in <=1 sphere's band
+                        const float dx = float(x - i * spacing), dy = float(y), dz = float(z);
+                        const float dd = std::fabs(std::sqrt(dx * dx + dy * dy + dz * dz) - R);
+                        if (dd > shell && dd <= band) { coords.emplace_back(x, y, z); break; }
+                    }
+        return coords;
+    };
+
+    EXPECT_EQ(globalComponents(sphereShells(1, 8.f, 30)), 2u);  // inner shell + outer shell
+    EXPECT_EQ(globalComponents(sphereShells(2, 8.f, 30)), 4u);  // 2 disjoint spheres -> 2*2
+    EXPECT_EQ(globalComponents(sphereShells(3, 8.f, 30)), 6u);  // 3 disjoint spheres -> 2*3
+
+    // Two heavily-overlapping spheres are a single connected solid (a "peanut") with one boundary
+    // surface, so the pruned narrow band of its union is one inner shell + one outer shell => 2.
+    // The overlap merges what would be 4 (two separated spheres) down to 2. The narrow band follows
+    // the *union* surface, i.e. the union SDF min(sdfA,sdfB); a small center separation (D = R) keeps
+    // the neck fat so the inner shell does not pinch.
+    {
+        const float R = 8.f, D = 8.f;  // D < 2R => overlap
+        const int   margin = int(band) + 2;
+        const int   x0 = -int(R) - margin, x1 = int(D) + int(R) + margin;
+        const int   yz = int(R) + margin;
+        std::vector<nanovdb::Coord> coords;
+        for (int x = x0; x <= x1; ++x)
+            for (int y = -yz; y <= yz; ++y)
+                for (int z = -yz; z <= yz; ++z) {
+                    const float dxA = float(x), dxB = float(x) - D, fy = float(y), fz = float(z);
+                    const float sdfA = std::sqrt(dxA*dxA + fy*fy + fz*fz) - R;
+                    const float sdfB = std::sqrt(dxB*dxB + fy*fy + fz*fz) - R;
+                    const float a    = std::fabs(std::min(sdfA, sdfB));  // |union SDF|
+                    if (a > shell && a <= band) coords.emplace_back(x, y, z);
+                }
+        EXPECT_EQ(globalComponents(coords), 2u);  // overlap merges -> inner shell + outer shell
+    }
+}// ConnectedComponentsMultiSphere

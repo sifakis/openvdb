@@ -14,7 +14,7 @@ on NanoVDB index grids. This document is the running design notes for that work.
 | File | Role |
 | :--- | :--- |
 | `connected_components_cuda.cpp`         | Host driver: arg parsing, OBJ reader, builds the mesh + `nanovdb::Map`, calls the device entry points. No CUDA *code* (only header-only handle/buffer types). |
-| `connected_components_cuda_kernels.cu`  | CUDA / NanoVDB side: `computeUDF()`, `printGridDiagnostics()`, `computeDerivedTopology()`, and `computeCC()` (which drives `ConnectedComponents::processLeafConnectedComponents()`). |
+| `connected_components_cuda_kernels.cu`  | CUDA / NanoVDB side: `computeUDF()`, `printGridDiagnostics()`, `computeDerivedTopology()`, and `computeCC()` (drives the full `ConnectedComponents` pipeline — `processLeafConnectedComponents()` → `processCrossLeafEdges()` → `processComponentLabels()` — and validates each stage against a host oracle). |
 | `MeshToSDFDevelopmentPlan.md`           | This document. |
 | `standalone/cc_vis.cpp`                 | Standalone 2D CPU visualizer of the SV hook/compress primitives (see `standalone/README.md`). **Not** part of the example build — it lives one directory down so the `nanovdb_example` source glob (non-recursive) skips it; otherwise its `main()` would collide with the driver's. |
 
@@ -91,12 +91,17 @@ in and returning device buffers (`GridHandle<DeviceBuffer>`, `DeviceBuffer`) out
    the block and the loop's barriers can no longer diverge. The device-vs-oracle harness in
    `computeCC()` is the standing regression guard.
 
-4. **Full connected-components labeling (CUDA)** *(TODO)*
-   Label active voxels of the derived grid so two voxels share a label iff connected
-   through a path of adjacent active voxels — *including across leaf boundaries*. Output:
-   a per-active-voxel label buffer (a sidecar parallel to the index space). This is the
-   hierarchical step: per-leaf labels (built on the per-leaf machinery above) → merge over
-   +X/+Y/+Z face neighbors → a small global union-find over representatives.
+4. **Global connected-components labeling (CUDA)** *(IMPLEMENTED + VALIDATED — `processCrossLeafEdges`
+   + `processComponentLabels`)*
+   Merge the leaf-local components across leaf boundaries so two components share a global label iff
+   connected through adjacent active voxels — *including across leaves*. Two stages, both validated
+   against host oracles in `computeCC()` (0 mismatches up to the dragon @ 0.0005): **step 5** ANDs the
+   touching per-component face masks over each leaf's +X/+Y/+Z neighbors to emit a cross-leaf edge
+   list, and **step 6** runs a lock-free union-find over those edges to assign each component a
+   representative (its class's minimum slot). The number of distinct representatives is the true
+   global component count. See "Leaf-local component masks and face flags" steps 5–6 below.
+   **Remaining follow-up:** the per-active-voxel label scatter (voxel → its component's
+   representative) — not yet implemented.
 
 ## Connected-components design (working decisions)
 
@@ -160,7 +165,7 @@ For a 2D, CPU, single-step-at-a-time intuition for exactly these primitives and 
 
 ## Leaf-local component masks and face flags (`processLeafConnectedComponents`, continued)
 
-Steps 1–4 below are **✅ implemented (2026-06-09) and validated (2026-06-11)**. Steps 5–6 are still TODO.
+Steps 1–6 below are **✅ implemented and validated** (steps 1–4: 2026-06-09/11; steps 5–6: 2026-06-12).
 
 > **✅ Validated against a CPU oracle (2026-06-11).** `computeCC()` in the example now runs a host
 > oracle (`cpuMasksFaces`) that independently rebuilds each component's `Mask<3>` and its six face
@@ -229,26 +234,48 @@ whose vertices are leaf-local components rather than voxels.
 
    Cross-leaf connectivity check (step 5) then reduces to a single `(faceA & faceB) != 0` bitwise AND.
 
-5. **Detect cross-leaf connectivity via face flags.** *(TODO)*
-   For each leaf, inspect only its `+X`, `+Y`, and `+Z` neighboring leaves (visits each undirected
-   boundary exactly once). For every pair of components on the two adjacent leaves, compare the
-   touching face flags (e.g. this leaf's `+X` against the neighbor's `minusX`). If
-   `(faceA & faceB) != 0` the two components touch and form an edge in the higher-level graph.
+5. **Detect cross-leaf connectivity via face flags (`processCrossLeafEdges`).** ✅ *(2026-06-12)*
+   One block per leaf. For each `+X`/`+Y`/`+Z` neighbor leaf — located by
+   `root().probeLeaf(origin.offsetBy(±8))` and mapped back to a linear leaf index by typed pointer
+   difference against `getFirstNode<0>()` — pair every local component of this leaf with every local
+   component of the neighbor and test `faceL[+axis] & faceN[-axis] != 0`. Visiting only `+axis`
+   neighbors visits each undirected boundary (and each component pair across it) exactly once, so no
+   dedup is needed. Materialized with the **count → scan → scatter** idiom; a shared
+   `ccForEachCrossLeafEdge` helper drives both passes so their iteration + AND test cannot drift.
+   Output: `mCrossLeafEdges` = E × `CrossLeafEdge{uint32_t a,b}` (canonical `a<b`, global slots).
+   **Validated:** the example recomputes the edge set from the (already-validated) face masks via the
+   same host `probeLeaf` walk and compares as a *sorted set* (GPU emit order is atomic-nondeterministic);
+   0 mismatches up to the dragon @ 0.0005 (692,411 edges).
 
-6. **Hook/compress on the component graph.** *(TODO)*
-   Same Shiloach–Vishkin schedule used per leaf, but over component representatives. The hard part
-   is discovering the inter-leaf edges (step 5), not the union-find itself.
+6. **Global union-find on the component graph (`processComponentLabels`).** ✅ *(2026-06-12)*
+   Lock-free union-find over the edge list: `cc_detail::ccUnite` finds both roots and CAS-links the
+   larger root under the smaller (64-bit `atomicCAS`, retry on contention). Three `lambdaKernel`
+   passes: init (`parent[s]=s`), unite (1 thread per edge — a single pass suffices since each
+   `ccUnite` self-retries), flatten (`parent[s]=ccFind(s)`). Each class's representative is its
+   **minimum slot** (the minimum is never the "larger" root, so it stays put), making the result
+   order-independent and deterministic. Output: `deviceComponentParent()` = K × uint64; the number of
+   distinct representatives (`parent[s]==s`) is the true **global component count**.
+   **Validated:** a host union-find over the same edges (same min-linking) matches `parent[s]`
+   elementwise; 0 mismatches. **Remaining follow-up:** per-voxel label scatter (voxel → its
+   component's representative) to emit a per-active-voxel label sidecar — not yet implemented.
+
+**Synthetic regression test.** `TEST(TestNanoVDBCUDA, ConnectedComponentsMultiSphere)` (in
+`unittest/TestNanoVDB.cu`) runs steps 1–6 on procedurally built **pruned narrow bands** with known
+closed-form component counts — no mesh, fully deterministic: one sphere → 2 (inner + outer shell),
+N well-separated spheres → 2N, and two heavily-overlapping spheres → 2 (merged into one solid). It
+exercises both disjoint components and cross-leaf merging. (The live mesh path is validated in the
+example's `computeCC()`; e.g. `sphere.obj` reports 2 global labels at voxelSize 0.02/0.01/0.005.)
 
 **Open design questions**
 
-- exact metadata layout for component-mask slots: source leaf id, local root id, global
-  representative id;
-- whether to materialize all cross-leaf edges explicitly or hook directly while scanning
-  neighboring leaves;
-- how to find sparse neighboring leaves efficiently, likely using `ValueAccessor` / the CUDA
-  `NodeManager`;
-- whether to lift the same idea to the lower/upper internal-node levels, or first build a flat
-  representative graph and union-find over that.
+- exact metadata to attach per component-slot if needed downstream (source leaf id, local root id) —
+  currently the global representative array suffices;
+- *(resolved)* materialize cross-leaf edges explicitly vs. hook directly while scanning — we
+  **materialize** an explicit edge list, so each stage is independently CPU-oracle-validated;
+- *(resolved)* neighbor-leaf lookup — `root().probeLeaf(origin.offsetBy(±8))` + pointer-diff index
+  (no `NodeManager` needed);
+- whether to lift the same idea to the lower/upper internal-node levels, or keep the current flat
+  representative graph + union-find (current choice).
 
 ## Derivative topology (the CC input)
 

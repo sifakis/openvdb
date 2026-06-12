@@ -3,6 +3,11 @@
 A NanoVDB / CUDA example that builds toward a **connected-components (CC) labeling**
 on NanoVDB index grids. This document is the running design notes for that work.
 
+> **Umbrella plan:** CC is step 3 of the larger mesh-to-SDF pipeline. The overall
+> trajectory — UDF + triangle-index sidecar, barrier-voxel signing (replicating
+> OpenVDB's `ComputeIntersectingVoxelSign`), and the per-level `invertMask` level-set
+> representation extension — lives in [`MeshToSDF_PipelinePlan.md`](./MeshToSDF_PipelinePlan.md).
+
 > **No OpenVDB.** Unlike `ex_mesh_to_grid_cuda`, this example is pure NanoVDB + CUDA.
 > The index↔world transform uses `nanovdb::Map::set(scale, translation, taper)`
 > directly, the OBJ reader uses NanoVDB types, and the target is registered without

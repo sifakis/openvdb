@@ -47,9 +47,11 @@ void printGridDiagnostics(const GridHandleT& handle, const std::string& title);
 GridHandleT computeDerivedTopology(const GridHandleT& srcHandle, const UDFSidecarT& udfSidecar,
                                    float voxelSize);
 
-/// @brief Implemented on the CUDA side: run connected-components labeling on the (derived)
-///        topology-only index grid. Initially just enumerates per-leaf component counts.
-void computeCC(const GridHandleT& gridHandle);
+/// @brief Implemented on the CUDA side: run connected-components labeling + signing on the derived
+///        (barrier-pruned) grid, then inject the per-voxel signs back onto the original grid.
+/// @param origHandle    the original (pre-prune) UDF index grid — injection target.
+/// @param derivedHandle the barrier-pruned grid CC + signing run on.
+void computeCC(const GridHandleT& origHandle, const GridHandleT& derivedHandle);
 
 /// @brief Minimal Wavefront .obj reader (vertices + faces) using NanoVDB types.
 ///
@@ -133,8 +135,9 @@ int main(int argc, char* argv[])
         auto derivedHandle = computeDerivedTopology(handle, sidecar, voxelSize);
         printGridDiagnostics(derivedHandle, "Derived CC-input grid");
 
-        // Step 3: connected-components labeling on the derived grid.
-        computeCC(derivedHandle);
+        // Steps 3–4: connected-components labeling + signing on the derived grid, then inject the
+        // signs back onto the original grid (so step 5 / barrier signing can run on the original).
+        computeCC(handle, derivedHandle);
 
         return 0;
     }

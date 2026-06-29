@@ -566,6 +566,20 @@ __device__ inline void ccUnite(uint64_t* parent, uint64_t a, uint64_t b)
 
 } // namespace cc_detail
 
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+/// @brief Global slot of the leaf-local component that active voxel n belongs to (scans the leaf's
+///        component masks; each active voxel is in exactly one). Generic CC utility — reused by
+///        downstream tools (e.g. MeshToSDF) to map a voxel to its component and thence its label.
+__device__ inline uint64_t ccVoxelComponentSlot(const nanovdb::Mask<3>* masks, const uint64_t* offsets,
+                                                uint32_t leafID, uint32_t n)
+{
+    const uint64_t base = offsets[leafID], end = offsets[leafID + 1];
+    for (uint64_t s = base; s < end; ++s)
+        if (masks[s].isOn(n)) return s;
+    return base;  // unreachable for an active voxel
+}
+
 template <typename BuildT>
 void ConnectedComponents<BuildT>::processLeafConnectedComponents()
 {

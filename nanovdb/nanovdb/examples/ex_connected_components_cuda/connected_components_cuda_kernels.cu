@@ -15,8 +15,8 @@
 
 #include <nanovdb/NanoVDB.h>
 #include <nanovdb/tools/cuda/MeshToGrid.cuh>
-#include <nanovdb/tools/cuda/PruneGrid.cuh>
 #include <nanovdb/tools/cuda/ConnectedComponents.cuh>
+#include <nanovdb/tools/cuda/MeshToSDF.cuh>
 #include <nanovdb/util/cuda/DeviceGridTraits.cuh>
 #include <nanovdb/util/cuda/Util.h>
 
@@ -91,78 +91,16 @@ void printGridDiagnostics(const GridHandleT& handle, const std::string& title)
     std::cout << "Memory usage                          : " << gridSize << " bytes\n";
 }
 
-namespace {
-
-/// @brief CUDA functor: build a per-leaf retain bitmask that drops the surface/barrier
-///        shell. A voxel is PRUNED iff it is within √3/2 voxels of the surface (half a
-///        voxel space-diagonal - the same barrier OpenVDB's MeshToVolume uses); every
-///        other active voxel is RETAINED. Because the UDF sidecar is in WORLD units, the
-///        test is udf^2 < (√3/2 · voxelSize)^2 = 0.75 · voxelSize^2, passed in precomputed.
-///
-///        Mirrors Benchmark.cu's PruneNarrowBandFunctor: launched via operatorKernel, one
-///        block per leaf, 512 threads per block (one thread per voxel in the 8^3 leaf).
-template <typename BuildT>
-struct UDFBarrierPruneMaskFunctor
-{
-    static constexpr int MaxThreadsPerBlock         = 512;
-    static constexpr int MinBlocksPerMultiprocessor = 1;
-
-    __device__ void operator()(
-        const nanovdb::NanoGrid<BuildT>* d_grid,
-        const float*                     d_udf,           // UDF sidecar, WORLD units
-        float                            barrierSqWorld,  // (√3/2 · voxelSize)^2, world^2 units
-        nanovdb::Mask<3>*                d_dstLeafMasks)
-    {
-        const int leafID   = blockIdx.x;
-        const int threadID = threadIdx.x;
-
-        const auto& leaf       = d_grid->tree().template getFirstNode<0>()[leafID];
-        auto&       resultMask = d_dstLeafMasks[leafID];
-
-        // Clear the leaf's mask words in parallel, then fill the retain bits.
-        if (threadID < nanovdb::Mask<3>::WORD_COUNT)
-            resultMask.words()[threadID] = 0UL;
-        __syncthreads();
-
-        if (auto n = leaf.data()->getValue(threadID)) {  // n != 0 => active voxel
-            const float udf = d_udf[n];
-            if (udf * udf >= barrierSqWorld)            // retain non-barrier voxels
-                resultMask.setOnAtomic(threadID);
-        }
-    }
-};
-
-} // anonymous namespace
-
+// Step 2 (SDF domain): prune the surface/barrier shell into the derived CC-input grid. The barrier
+// test, retain mask, and PruneGrid call all live in the MeshToSDF library tool; this is a thin seam.
 GridHandleT computeDerivedTopology(const GridHandleT& srcHandle, const UDFSidecarT& udfSidecar,
                                    float voxelSize)
 {
-    using BuildT  = nanovdb::ValueOnIndex;
-    using PruneOp = UDFBarrierPruneMaskFunctor<BuildT>;
-
-    // Barrier threshold √3/2 voxels expressed in the sidecar's WORLD units, squared.
-    const float barrierSqWorld = 0.75f * voxelSize * voxelSize;
-
-    const auto*  d_srcGrid = srcHandle.deviceGrid<BuildT>();
-    const float* d_udf     = static_cast<const float*>(udfSidecar.deviceData());
-
-    const uint32_t srcLeafCount =
-        nanovdb::util::cuda::DeviceGridTraits<BuildT>::getTreeData(d_srcGrid).mNodeCount[0];
-
-    // Leaf-indexed retain mask: one Mask<3> (512 bits) per source leaf (device-only).
-    auto retainMask = nanovdb::cuda::DeviceBuffer::create(
-        std::size_t(srcLeafCount) * sizeof(nanovdb::Mask<3>), nullptr, false);
-    auto* d_retainMask = static_cast<nanovdb::Mask<3>*>(retainMask.deviceData());
-
-    // Build the retain mask (drop voxels within √3/2 voxels of the surface).
-    nanovdb::util::cuda::operatorKernel<PruneOp>
-        <<<srcLeafCount, PruneOp::MaxThreadsPerBlock>>>(d_srcGrid, d_udf, barrierSqWorld, d_retainMask);
-    cudaCheck(cudaGetLastError());
-
-    // Topological pruning -> clean, topology-only derived index grid (UDF no longer needed).
-    nanovdb::tools::cuda::PruneGrid<BuildT> pruner(d_srcGrid, d_retainMask);
-    pruner.setVerbose(1);
-    return pruner.getHandle();
+    using BuildT = nanovdb::ValueOnIndex;
+    nanovdb::tools::cuda::MeshToSDF<BuildT> sdf;
+    sdf.setVerbose(1);
+    return sdf.computeDerivedTopology(srcHandle.deviceGrid<BuildT>(),
+                                      static_cast<const float*>(udfSidecar.deviceData()), voxelSize);
 }
 
 namespace {
@@ -338,25 +276,33 @@ cpuCrossLeafEdges(const GridT* grid, const CpuMasksFaces& cmf, const std::vector
 
 } // anonymous namespace
 
-void computeCC(const GridHandleT& gridHandle)
+void computeCC(const GridHandleT& origHandle, const GridHandleT& derivedHandle)
 {
     using BuildT = nanovdb::ValueOnIndex;
     using Traits = nanovdb::util::cuda::DeviceGridTraits<BuildT>;
 
-    const auto* d_grid = gridHandle.deviceGrid<BuildT>();
+    const auto* d_grid = derivedHandle.deviceGrid<BuildT>();
 
-    // Device: per-leaf connected-component counts.
+    // Pure connected-components labeling (domain-agnostic): per-leaf CC -> cross-leaf edges ->
+    // global union-find. Steps 3/5/6 of the pipeline.
     nanovdb::tools::cuda::ConnectedComponents<BuildT> cc(d_grid);
     cc.setVerbose(1);
     cc.processLeafConnectedComponents();
     cudaCheck(cudaDeviceSynchronize());
-
-    // Step 5: cross-leaf connectivity edges over the leaf-local components.
     cc.processCrossLeafEdges();
     cudaCheck(cudaDeviceSynchronize());
-
-    // Step 6: global union-find over the edges -> per-component representative.
     cc.processComponentLabels();
+    cudaCheck(cudaDeviceSynchronize());
+
+    // Step 4 (SDF domain): sign the non-barrier voxels (+ exterior / - interior) from the labeling.
+    nanovdb::tools::cuda::MeshToSDF<BuildT> sdf;
+    sdf.setVerbose(1);
+    sdf.signNonBarrier(d_grid, cc);
+    cudaCheck(cudaDeviceSynchronize());
+
+    // Injection: carry the derived (non-barrier) signs back onto the original grid; barrier voxels
+    // (present only in the original) stay sentinel 0 for the future step-5 barrier signing.
+    sdf.injectSignsToOriginal(origHandle.deviceGrid<BuildT>(), d_grid);
     cudaCheck(cudaDeviceSynchronize());
 
     const uint32_t leafCount = Traits::getTreeData(d_grid).mNodeCount[0];
@@ -371,10 +317,10 @@ void computeCC(const GridHandleT& gridHandle)
     // byte copy of the device blob into a (32B-aligned) scratch host buffer is itself a valid
     // host grid. We don't touch the handle (no deviceDownload residue); the scratch is freed
     // immediately after the check.
-    const uint64_t gridBytes = gridHandle.bufferSize();
+    const uint64_t gridBytes = derivedHandle.bufferSize();
     void* hostBlob = nullptr;
     cudaCheck(cudaMallocHost(&hostBlob, gridBytes));   // pinned, >=32B aligned
-    cudaCheck(cudaMemcpy(hostBlob, gridHandle.deviceData(), gridBytes, cudaMemcpyDeviceToHost));
+    cudaCheck(cudaMemcpy(hostBlob, derivedHandle.deviceData(), gridBytes, cudaMemcpyDeviceToHost));
     const auto* h_grid = reinterpret_cast<const nanovdb::NanoGrid<BuildT>*>(hostBlob);
 
     const std::vector<uint16_t> cpuCounts = cpuLeafComponentCounts(h_grid);
@@ -516,6 +462,92 @@ void computeCC(const GridHandleT& gridHandle)
               << (labelMismatch == 0 ? "PASS" : "FAIL") << " ("
               << K << " components, " << distinct << " global labels, "
               << labelMismatch << " mismatches)\n";
+
+    // ---- Validate non-barrier voxel signs (pipeline step 4) ----
+    // Independently pick the exterior component (the one holding the global min-x active voxel),
+    // sign every active voxel (+ exterior / - interior), and compare to the GPU per-voxel buffer.
+    // Reuses the already-validated component offsets, masks, and parent array.
+    const uint64_t activeCount = Traits::getActiveVoxelCount(d_grid);
+    const auto* leaves = h_grid->tree().getFirstLeaf();
+
+    // voxel -> its global component slot (scan the leaf's component masks)
+    auto voxelSlot = [&](uint32_t li, uint32_t n) -> uint64_t {
+        for (uint64_t s = gpuOffsets[li]; s < gpuOffsets[li + 1]; ++s)
+            if (gpuMasks[s].isOn(n)) return s;
+        return gpuOffsets[li];
+    };
+
+    // exterior representative = parent of the component holding the global minimum-x active voxel
+    uint64_t exteriorRepCpu = 0; int32_t bestX = 0; bool found = false;
+    for (uint32_t li = 0; li < leafCount; ++li) {
+        const auto& leaf = leaves[li];
+        for (uint32_t n = 0; n < 512; ++n) {
+            if (!leaf.isActive(n)) continue;
+            const auto ijk = leaf.origin() + nanovdb::NanoLeaf<BuildT>::OffsetToLocalCoord(n);
+            if (!found || ijk[0] < bestX) { bestX = ijk[0]; exteriorRepCpu = gpuParent[voxelSlot(li, n)]; found = true; }
+        }
+    }
+
+    // host per-voxel signs (slot 0 = background +1)
+    std::vector<int8_t> cpuSign(activeCount + 1, int8_t(1));
+    for (uint32_t li = 0; li < leafCount; ++li) {
+        const auto& leaf = leaves[li];
+        for (uint32_t n = 0; n < 512; ++n) {
+            if (!leaf.isActive(n)) continue;
+            cpuSign[leaf.getValue(n)] = (gpuParent[voxelSlot(li, n)] == exteriorRepCpu) ? int8_t(1) : int8_t(-1);
+        }
+    }
+
+    std::vector<int8_t> gpuSign(activeCount + 1);
+    cudaCheck(cudaMemcpy(gpuSign.data(), sdf.deviceVoxelSign(),
+                         std::size_t(activeCount + 1) * sizeof(int8_t), cudaMemcpyDeviceToHost));
+
+    std::size_t signMismatch = 0; uint64_t nInterior = 0, nExterior = 0;
+    for (uint64_t i = 1; i <= activeCount; ++i) {
+        if (gpuSign[i] > 0) ++nExterior; else ++nInterior;
+        if (gpuSign[i] != cpuSign[i]) ++signMismatch;
+    }
+    const bool signPass = (signMismatch == 0) && (sdf.exteriorRepresentative() == exteriorRepCpu);
+    std::cout << "CC non-barrier sign validation:         " << (signPass ? "PASS" : "FAIL") << " ("
+              << activeCount << " voxels, exteriorRep gpu=" << sdf.exteriorRepresentative()
+              << " cpu=" << exteriorRepCpu << ", interior=" << nInterior << " exterior=" << nExterior
+              << ", " << signMismatch << " mismatches)\n";
+
+    // ---- Validate sign injection (derived -> original grid) ----
+    // Every original active voxel must hold: the derived sign if it is non-barrier (present in the
+    // derived grid), or the sentinel 0 if it is a barrier voxel (present only in the original).
+    const auto*    d_orig     = origHandle.deviceGrid<BuildT>();
+    const uint64_t origActive = Traits::getActiveVoxelCount(d_orig);
+
+    const uint64_t origBytes = origHandle.bufferSize();
+    void* origBlob = nullptr;
+    cudaCheck(cudaMallocHost(&origBlob, origBytes));
+    cudaCheck(cudaMemcpy(origBlob, origHandle.deviceData(), origBytes, cudaMemcpyDeviceToHost));
+    const auto* h_orig = reinterpret_cast<const nanovdb::NanoGrid<BuildT>*>(origBlob);
+
+    std::vector<int8_t> gpuOrigSign(origActive + 1);
+    cudaCheck(cudaMemcpy(gpuOrigSign.data(), sdf.deviceOriginalVoxelSign(),
+                         std::size_t(origActive + 1) * sizeof(int8_t), cudaMemcpyDeviceToHost));
+
+    std::size_t injMismatch = 0; uint64_t nBarrier = 0, nSigned = 0;
+    const uint32_t origLeafCount = h_orig->tree().nodeCount(0);
+    const auto*    origLeaves    = h_orig->tree().getFirstLeaf();
+    for (uint32_t li = 0; li < origLeafCount; ++li) {
+        const auto& oleaf = origLeaves[li];
+        const auto* dleaf = h_grid->tree().root().probeLeaf(oleaf.origin());  // derived leaf, same origin
+        for (uint32_t n = 0; n < 512; ++n) {
+            if (!oleaf.isActive(n)) continue;
+            int8_t expected;
+            if (dleaf && dleaf->isActive(n)) { expected = gpuSign[dleaf->getValue(n)]; ++nSigned; }
+            else                             { expected = int8_t(0);                   ++nBarrier; }
+            if (gpuOrigSign[oleaf.getValue(n)] != expected) ++injMismatch;
+        }
+    }
+    const bool injPass = (injMismatch == 0) && (gpuOrigSign[0] == int8_t(1));
+    std::cout << "CC sign-injection validation:           " << (injPass ? "PASS" : "FAIL") << " ("
+              << origActive << " orig voxels, signed(non-barrier)=" << nSigned
+              << " barrier(sentinel)=" << nBarrier << ", " << injMismatch << " mismatches)\n";
+    cudaCheck(cudaFreeHost(origBlob));
 
     cudaCheck(cudaFreeHost(hostBlob));
 }

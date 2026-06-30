@@ -20,6 +20,11 @@
 #include <nanovdb/util/cuda/DeviceGridTraits.cuh>
 #include <nanovdb/util/cuda/Util.h>
 
+#ifdef NANOVDB_USE_OPENVDB
+#include <openvdb/openvdb.h>
+#include <openvdb/tools/MeshToVolume.h>  // meshToLevelSet — independent sign cross-check
+#endif
+
 #include <thrust/universal_vector.h>
 
 #include <algorithm>  // std::sort
@@ -34,6 +39,18 @@
 using GridHandleT   = nanovdb::GridHandle<nanovdb::cuda::DeviceBuffer>;
 using UDFSidecarT   = nanovdb::cuda::DeviceBuffer;
 using IndexSidecarT = nanovdb::cuda::DeviceBuffer;
+
+// Summary of computeCC's validators, returned so the in-code analytic self-tests can assert on it.
+// (Definition must match in connected_components_cuda.cpp.)
+struct CCResult {
+    uint64_t globalComponents            = 0;      // distinct global CC labels
+    bool     openvdbChecked              = false;  // OpenVDB cross-check ran (needs NANOVDB_USE_OPENVDB)
+    uint64_t confidentSignMismatches     = 0;      // OpenVDB cross-check, beyond-shell (must be 0)
+    uint64_t inShellTies                 = 0;      // OpenVDB cross-check, within √3/2-voxel shell
+    bool     analyticChecked             = false;  // sphere ground-truth check ran
+    uint64_t analyticConfidentMismatches = 0;      // sphere ground-truth, beyond-shell (must be 0)
+    uint64_t analyticInShellTies         = 0;      // sphere ground-truth, within √3/2-voxel shell
+};
 
 std::pair<GridHandleT, UDFSidecarT> computeUDF(
     const std::vector<nanovdb::Vec3f>& points,
@@ -379,10 +396,107 @@ cpuCrossLeafEdges(const GridT* grid, const CpuMasksFaces& cmf, const std::vector
     return edges;
 }
 
+/// @brief CPU reference for barrier signing (pipeline step 5), validating MeshToSDF::signBarrier.
+///        Non-barrier voxels (signIn != 0) must be carried through unchanged. For each barrier voxel
+///        (signIn == 0) the GPU's order-independent outcome is "exterior (+1) iff some exterior (+1,
+///        non-INVALID) neighbor's signed dot is > 0, else interior (-1)" — the early-out / two passes
+///        in the kernel are only an optimization and cannot change that OR. The oracle scans all 26
+///        active neighbors (one host ReadAccessor), reusing the SAME __hostdev__ math, and tracks the
+///        MAXIMUM signed dot over the exterior anchors; expected = (maxDot > 0) ? +1 : -1.
+///
+///        The decision is a sign-of-dot test, so a voxel exactly on the surface tangent plane
+///        (|maxDot| within float noise of 0) is genuinely ambiguous. With the double-precision sign
+///        test (matching the GPU) host/device agree to ~1e-13, so this band is essentially empty; the
+///        tiny guard (|maxDot| <= kDotTieEps) still reports any such exact tie as @a ambiguous rather
+///        than a mismatch. Any disagreement OUTSIDE that band is a real mismatch.
+template <typename GridT>
+std::size_t cpuSignBarrier(const GridT* g,
+                           const std::vector<int8_t>&        signIn,    // post-injection snapshot (anchors)
+                           const std::vector<int8_t>&        gpuSigned, // GPU result to validate
+                           const std::vector<uint32_t>&      index,     // nearest-triangle-index sidecar
+                           const std::vector<nanovdb::Vec3f>& points,
+                           const std::vector<nanovdb::Vec3i>& triangles,
+                           const nanovdb::Map&               map,
+                           std::size_t& barrierCount, std::size_t& residualZeros, std::size_t& ambiguous)
+{
+    constexpr double kDotTieEps = 1e-9;  // |signed dot| below this == exact surface-tangent tie
+    const auto&    tree      = g->tree();
+    const uint32_t leafCount = tree.nodeCount(0);
+    const auto*    leaves    = tree.getFirstLeaf();
+    auto           acc       = g->getAccessor();
+
+    std::size_t mism = 0; barrierCount = 0; residualZeros = 0; ambiguous = 0; std::size_t shown = 0;
+    for (uint32_t li = 0; li < leafCount; ++li) {
+        const auto&          leaf   = leaves[li];
+        const nanovdb::Coord origin = leaf.origin();
+        for (int nn = 0; nn < 512; ++nn) {
+            if (!leaf.isActive(uint32_t(nn))) continue;
+            const uint64_t qv = leaf.getValue(uint32_t(nn));
+            if (gpuSigned[qv] == int8_t(0)) ++residualZeros;
+
+            if (signIn[qv] != int8_t(0)) {                 // non-barrier: must be carried through
+                if (gpuSigned[qv] != signIn[qv]) ++mism;
+                continue;
+            }
+
+            ++barrierCount;
+            const int lx = nn >> 6, ly = (nn >> 3) & 7, lz = nn & 7;
+            const nanovdb::Vec3d q_xyz(double(origin[0] + lx), double(origin[1] + ly), double(origin[2] + lz));
+
+            // Maximum signed dot over the 26 active exterior anchors (-1 sentinel = no anchor), in
+            // double precision to match the GPU's barrierExteriorProof.
+            double maxDot = -1.0;
+            for (int dx = -1; dx <= 1; ++dx)
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dz = -1; dz <= 1; ++dz) {
+                        if (dx == 0 && dy == 0 && dz == 0) continue;
+                        const nanovdb::Coord nijk(origin[0] + lx + dx, origin[1] + ly + dy, origin[2] + lz + dz);
+                        if (!acc.isActive(nijk)) continue;
+                        const uint64_t nv = acc.getValue(nijk);
+                        if (signIn[nv] != int8_t(1)) continue;            // only exterior anchors
+                        const uint32_t tid = index[nv]; if (tid == 0xFFFFFFFFu) continue;
+                        const nanovdb::Vec3i& T  = triangles[tid];
+                        const nanovdb::Vec3f& p0 = points[T[0]];
+                        const nanovdb::Vec3f& p1 = points[T[1]];
+                        const nanovdb::Vec3f& p2 = points[T[2]];
+                        const nanovdb::Vec3d  v0 = map.applyInverseMap(nanovdb::Vec3d(p0[0], p0[1], p0[2]));
+                        const nanovdb::Vec3d  v1 = map.applyInverseMap(nanovdb::Vec3d(p1[0], p1[1], p1[2]));
+                        const nanovdb::Vec3d  v2 = map.applyInverseMap(nanovdb::Vec3d(p2[0], p2[1], p2[2]));
+                        const nanovdb::Vec3d  nxyz(static_cast<double>(nijk[0]), static_cast<double>(nijk[1]), static_cast<double>(nijk[2]));
+                        double a, b;
+                        const nanovdb::Vec3d cp = nanovdb::math::closestPointOnTriangleToPoint(v0, v1, v2, nxyz, a, b);
+                        nanovdb::Vec3d dn = nxyz - cp; dn.normalize();
+                        nanovdb::Vec3d dq = q_xyz - cp; dq.normalize();
+                        const double d = dn.dot(dq);
+                        if (d > maxDot) maxDot = d;
+                    }
+
+            const int8_t expected = (maxDot > 0.0) ? int8_t(1) : int8_t(-1);
+            if (gpuSigned[qv] == expected) continue;
+            if (std::fabs(maxDot) <= kDotTieEps) { ++ambiguous; continue; }  // exact surface-tangent tie
+
+            ++mism;
+            if (shown++ < 10)
+                std::cerr << "  barrier mismatch @ (" << q_xyz[0] << "," << q_xyz[1] << "," << q_xyz[2]
+                          << ") gpu=" << int(gpuSigned[qv]) << " cpu=" << int(expected)
+                          << " maxDot=" << maxDot << "\n";
+        }
+    }
+    return mism;
+}
+
 } // anonymous namespace
 
-void computeCC(const GridHandleT& origHandle, const GridHandleT& derivedHandle)
+CCResult computeCC(const GridHandleT& origHandle, const GridHandleT& derivedHandle,
+               const IndexSidecarT&               indexSidecar,
+               const std::vector<nanovdb::Vec3f>& points,
+               const std::vector<nanovdb::Vec3i>& triangles,
+               const nanovdb::Map&                map,
+               [[maybe_unused]] float             bandWidth,    // used only by the OpenVDB cross-check
+               const double*                      analyticSpheres,   // numSpheres × {Cx,Cy,Cz,R} world, or nullptr
+               int                                numAnalyticSpheres)
 {
+    CCResult result;
     using BuildT = nanovdb::ValueOnIndex;
     using Traits = nanovdb::util::cuda::DeviceGridTraits<BuildT>;
 
@@ -410,8 +524,18 @@ void computeCC(const GridHandleT& origHandle, const GridHandleT& derivedHandle)
     sdf.injectSignsToOriginal(origHandle.deviceGrid<BuildT>(), d_grid);
     cudaCheck(cudaDeviceSynchronize());
 
+    // Step 5 (SDF domain): sign the barrier voxels in place on the original grid (faithful mirror of
+    // OpenVDB ComputeIntersectingVoxelSign). Needs the mesh on the device (the per-UDF transformed-
+    // triangle buffer was freed) and the nearest-triangle-index sidecar.
+    thrust::universal_vector<nanovdb::Vec3f> dPoints(points.begin(), points.end());
+    thrust::universal_vector<nanovdb::Vec3i> dTriangles(triangles.begin(), triangles.end());
+    sdf.signBarrier(origHandle.deviceGrid<BuildT>(),
+                    static_cast<const uint32_t*>(indexSidecar.deviceData()),
+                    dPoints.data().get(), dTriangles.data().get(), map);
+    cudaCheck(cudaDeviceSynchronize());
+
     const uint32_t leafCount = Traits::getTreeData(d_grid).mNodeCount[0];
-    if (leafCount == 0) { std::cout << "CC validation: empty grid, nothing to check\n"; return; }
+    if (leafCount == 0) { std::cout << "CC validation: empty grid, nothing to check\n"; return result; }
 
     // GPU result -> host.
     std::vector<uint16_t> gpuCounts(leafCount);
@@ -567,6 +691,7 @@ void computeCC(const GridHandleT& origHandle, const GridHandleT& derivedHandle)
               << (labelMismatch == 0 ? "PASS" : "FAIL") << " ("
               << K << " components, " << distinct << " global labels, "
               << labelMismatch << " mismatches)\n";
+    result.globalComponents = distinct;
 
     // ---- Validate non-barrier voxel signs (pipeline step 4) ----
     // Independently pick the exterior component (the one holding the global min-x active voxel),
@@ -652,7 +777,136 @@ void computeCC(const GridHandleT& origHandle, const GridHandleT& derivedHandle)
     std::cout << "CC sign-injection validation:           " << (injPass ? "PASS" : "FAIL") << " ("
               << origActive << " orig voxels, signed(non-barrier)=" << nSigned
               << " barrier(sentinel)=" << nBarrier << ", " << injMismatch << " mismatches)\n";
+
+    // ---- Validate barrier signing (pipeline step 5) ----
+    // The post-injection signs (gpuOrigSign: +1/-1 non-barrier, 0 barrier) are the anchor snapshot.
+    // Re-run the identical faithful-mirror logic on the host and check the GPU signed array; assert
+    // no sentinel-0 remains (slot 0 stays +1).
+    std::vector<int8_t> gpuSigned(origActive + 1);
+    cudaCheck(cudaMemcpy(gpuSigned.data(), sdf.deviceSignedVoxelSign(),
+                         std::size_t(origActive + 1) * sizeof(int8_t), cudaMemcpyDeviceToHost));
+    std::vector<uint32_t> hIndex(origActive + 1);
+    cudaCheck(cudaMemcpy(hIndex.data(), static_cast<const uint32_t*>(indexSidecar.deviceData()),
+                         std::size_t(origActive + 1) * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+    std::size_t barrierCount = 0, residualZeros = 0, ambiguous = 0;
+    const std::size_t barrierMism = cpuSignBarrier(h_orig, gpuOrigSign, gpuSigned, hIndex,
+                                                   points, triangles, map, barrierCount, residualZeros, ambiguous);
+    const bool barrierPass = (barrierMism == 0) && (residualZeros == 0) && (gpuSigned[0] == int8_t(1));
+    std::cout << "CC barrier sign validation:             " << (barrierPass ? "PASS" : "FAIL") << " ("
+              << barrierCount << " barrier voxels, " << barrierMism << " mismatches, "
+              << ambiguous << " surface-tangent ties, " << residualZeros << " residual zeros)\n";
+
+#ifdef NANOVDB_USE_OPENVDB
+    // ---- Independent cross-check: our final signs vs OpenVDB meshToLevelSet (same mesh + transform) ----
+    // Build an OpenVDB narrow-band level set from the identical points/triangles and voxel size, then
+    // compare the SIGN of OpenVDB's value at each of our original grid's active index coords against our
+    // final per-voxel sign. Conventions match (+ outside / - inside). meshToLevelSet signed-flood-fills,
+    // so the sign is defined at every coord (band gives true distance; beyond it, ±background). Voxels
+    // essentially on the surface (|value| within a tiny tie band) are reported separately, not counted.
+    {
+        openvdb::initialize();
+        const double voxelSize = map.getVoxelSize()[0];
+        openvdb::math::Transform::Ptr xform = openvdb::math::Transform::createLinearTransform(voxelSize);
+
+        std::vector<openvdb::Vec3s> ovPoints(points.size());
+        for (std::size_t i = 0; i < points.size(); ++i)
+            ovPoints[i] = openvdb::Vec3s(points[i][0], points[i][1], points[i][2]);
+        std::vector<openvdb::Vec3I> ovTris(triangles.size());
+        for (std::size_t i = 0; i < triangles.size(); ++i)
+            ovTris[i] = openvdb::Vec3I(uint32_t(triangles[i][0]), uint32_t(triangles[i][1]), uint32_t(triangles[i][2]));
+
+        // Match our band width (exterior + interior); the signed flood fill makes signs valid everywhere.
+        const float halfWidth = std::max(bandWidth, 3.0f);
+        openvdb::FloatGrid::Ptr ls =
+            openvdb::tools::meshToLevelSet<openvdb::FloatGrid>(*xform, ovPoints, ovTris, halfWidth);
+        auto ovAcc = ls->getConstAccessor();
+
+        // Sign is inherently method-dependent within the barrier shell (|distance| < √3/2 voxel — the
+        // same half-diagonal our pipeline prunes & barrier-signs), so a disagreement there is a tie. A
+        // disagreement OUTSIDE the shell, where OpenVDB confidently places the voxel inside/outside, is
+        // a real error (e.g. a flipped component) and fails the check.
+        const float vs       = float(voxelSize);
+        const float shellVox = std::sqrt(0.75f);  // √3/2 ≈ 0.866 voxels
+        std::size_t realMismatch = 0, shellTie = 0, shownO = 0;
+        uint64_t nOutside = 0, nInside = 0; float maxRealVox = 0.0f;
+        for (uint32_t li = 0; li < origLeafCount; ++li) {
+            const auto&          oleaf = origLeaves[li];
+            const nanovdb::Coord o     = oleaf.origin();
+            for (uint32_t n = 0; n < 512; ++n) {
+                if (!oleaf.isActive(n)) continue;
+                const nanovdb::Coord ijk = o + nanovdb::NanoLeaf<BuildT>::OffsetToLocalCoord(n);
+                const float  val     = ovAcc.getValue(openvdb::Coord(ijk[0], ijk[1], ijk[2]));
+                const int8_t ourSign = gpuSigned[oleaf.getValue(n)];
+                const int8_t ovSign  = (val < 0.0f) ? int8_t(-1) : int8_t(1);
+                if (ovSign > 0) ++nOutside; else ++nInside;
+                if (ovSign == ourSign) continue;
+                const float v = std::fabs(val) / vs;       // distance to surface, in voxels
+                if (v < shellVox) { ++shellTie; continue; } // within barrier shell: method-dependent
+                ++realMismatch;
+                if (v > maxRealVox) maxRealVox = v;
+                if (shownO++ < 10)
+                    std::cerr << "  OpenVDB sign mismatch @ (" << ijk[0] << "," << ijk[1] << "," << ijk[2]
+                              << ") ours=" << int(ourSign) << " openvdb=" << int(ovSign)
+                              << " val=" << val << " (" << v << " vox)\n";
+            }
+        }
+        std::cout << "OpenVDB sign cross-check:               " << (realMismatch == 0 ? "PASS" : "FAIL")
+                  << " (" << origActive << " orig voxels, outside=" << nOutside << " inside=" << nInside
+                  << "; " << realMismatch << " mismatches beyond shell";
+        if (realMismatch) std::cout << " (max " << maxRealVox << " vox)";
+        std::cout << ", " << shellTie << " in-shell sign ties)\n";
+        result.openvdbChecked          = true;
+        result.confidentSignMismatches = realMismatch;
+        result.inShellTies             = shellTie;
+    }
+#endif
+
+    // ---- Optional independent ground truth: analytic signed distance to a UNION of spheres ----
+    // A second, OpenVDB-free check (used by the in-code sphere self-tests): a point is inside the union
+    // iff it is inside ANY ball, so the true signed distance is min_i(|p - Ci| - Ri) world units
+    // (+ outside / - inside). Compare our sign in the confident region (|d| >= √3/2 voxel); the shell is
+    // method-dependent and only reported.
+    if (analyticSpheres && numAnalyticSpheres > 0) {
+        const double vs         = map.getVoxelSize()[0];
+        const double shellWorld = std::sqrt(0.75) * vs;
+        std::size_t aMis = 0, aTie = 0, shownA = 0; double maxAVox = 0.0;
+        for (uint32_t li = 0; li < origLeafCount; ++li) {
+            const auto&          oleaf = origLeaves[li];
+            const nanovdb::Coord o     = oleaf.origin();
+            for (uint32_t n = 0; n < 512; ++n) {
+                if (!oleaf.isActive(n)) continue;
+                const nanovdb::Coord ijk = o + nanovdb::NanoLeaf<BuildT>::OffsetToLocalCoord(n);
+                const double px = double(ijk[0]) * vs, py = double(ijk[1]) * vs, pz = double(ijk[2]) * vs;
+                double dist = HUGE_VAL;                              // union of balls = min over balls
+                for (int s = 0; s < numAnalyticSpheres; ++s) {
+                    const double Cx = analyticSpheres[4*s+0], Cy = analyticSpheres[4*s+1],
+                                 Cz = analyticSpheres[4*s+2], R  = analyticSpheres[4*s+3];
+                    const double di = std::sqrt((px-Cx)*(px-Cx) + (py-Cy)*(py-Cy) + (pz-Cz)*(pz-Cz)) - R;
+                    if (di < dist) dist = di;
+                }
+                const int8_t truth   = (dist < 0.0) ? int8_t(-1) : int8_t(1);
+                const int8_t ourSign = gpuSigned[oleaf.getValue(n)];
+                if (truth == ourSign) continue;
+                if (std::fabs(dist) < shellWorld) { ++aTie; continue; }
+                ++aMis; const double v = std::fabs(dist) / vs; if (v > maxAVox) maxAVox = v;
+                if (shownA++ < 10)
+                    std::cerr << "  analytic sign mismatch @ (" << ijk[0] << "," << ijk[1] << "," << ijk[2]
+                              << ") ours=" << int(ourSign) << " truth=" << int(truth)
+                              << " d=" << dist << " (" << v << " vox)\n";
+            }
+        }
+        result.analyticChecked             = true;
+        result.analyticConfidentMismatches = aMis;
+        result.analyticInShellTies         = aTie;
+        std::cout << "Analytic union sign check:              " << (aMis == 0 ? "PASS" : "FAIL")
+                  << " (" << origActive << " orig voxels, " << aMis << " mismatches beyond shell";
+        if (aMis) std::cout << " (max " << maxAVox << " vox)";
+        std::cout << ", " << aTie << " in-shell ties)\n";
+    }
+
     cudaCheck(cudaFreeHost(origBlob));
 
     cudaCheck(cudaFreeHost(hostBlob));
+    return result;
 }

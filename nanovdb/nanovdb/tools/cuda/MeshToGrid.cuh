@@ -28,6 +28,7 @@
 #include <nanovdb/util/cuda/DeviceGridTraits.cuh>
 
 #include <utility>
+#include <tuple>
 
 namespace nanovdb {
 
@@ -133,6 +134,18 @@ public:
     std::pair<GridHandle<GridBufferT>, SidecarBufferT>
     getHandleAndUDF(const GridBufferT&    buffer        = GridBufferT(),
                     const SidecarBufferT& sidecarBuffer = SidecarBufferT());
+
+    /// @brief Like getHandleAndUDF, but additionally returns a per-active-voxel nearest-triangle
+    ///        index sidecar (uint32). The UDF and the index are produced together from a single
+    ///        packed atomic-min, so the kept distance and its winning triangle id stay consistent.
+    ///          - udf  [k>0] = UDF at voxel k (world units); udf[0] = mBandWidth*voxelSize background
+    ///          - index[k]   = nearest triangle id, or 0xFFFFFFFF (INVALID) for background / no-hit
+    /// @return std::tuple of { grid handle, float UDF sidecar, uint32 nearest-triangle-index sidecar }
+    template<typename GridBufferT    = nanovdb::cuda::DeviceBuffer,
+             typename SidecarBufferT = nanovdb::cuda::DeviceBuffer>
+    std::tuple<GridHandle<GridBufferT>, SidecarBufferT, SidecarBufferT>
+    getHandleAndUDFAndIndex(const GridBufferT&    buffer        = GridBufferT(),
+                            const SidecarBufferT& sidecarBuffer = SidecarBufferT());
 
 private:
     void transformTriangles();
@@ -1034,6 +1047,33 @@ struct FinalizeSidecarFunctor
     }
 };
 
+/// @brief Init for the packed (distSqr-bits << 32 | triangleID) sidecar: high = the 0x7F7FFFFF
+///        "no-hit" UDF sentinel (matches InitSidecarFunctor), low = INVALID triangle id 0xFFFFFFFF.
+struct InitPackedSidecarFunctor
+{
+    uint64_t *dPacked;
+    __device__ void operator()(size_t i) const
+    {
+        dPacked[i] = (static_cast<uint64_t>(0x7F7FFFFFu) << 32) | static_cast<uint64_t>(0xFFFFFFFFu);
+    }
+};
+
+/// @brief Split the packed (distSqr-bits << 32 | triangleID) sidecar into a float UDF sidecar
+///        (raw distSqr bit pattern, or the 0x7F7FFFFF sentinel — ready for FinalizeSidecarFunctor)
+///        and a uint32 nearest-triangle-index sidecar (or 0xFFFFFFFF for no-hit / background).
+struct SplitPackedSidecarFunctor
+{
+    const uint64_t *dPacked;
+    float          *dUDF;
+    uint32_t       *dIndex;
+    __device__ void operator()(size_t i) const
+    {
+        const uint64_t p = dPacked[i];
+        dUDF[i]   = __uint_as_float(uint32_t(p >> 32));
+        dIndex[i] = uint32_t(p);
+    }
+};
+
 } // namespace topology::detail
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -1173,6 +1213,164 @@ MeshToGrid<BuildT>::getHandleAndUDF(const GridBufferT& buffer, const SidecarBuff
 
     return { std::move(handle), std::move(sidecarBuffer) };
 } // MeshToGrid<BuildT>::getHandleAndUDF
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+template<typename BuildT>
+template<typename GridBufferT, typename SidecarBufferT>
+std::tuple<GridHandle<GridBufferT>, SidecarBufferT, SidecarBufferT>
+MeshToGrid<BuildT>::getHandleAndUDFAndIndex(const GridBufferT& buffer, const SidecarBufferT&)
+{
+    cudaStreamSynchronize(mStream);
+
+    // ---- Topology pipeline (mirrors getHandle) ----
+    // duplicated from getHandleAndUDF — keep in sync
+
+    if (mVerbose==1) mTimer.start("Transforming triangles to grid index space");
+    transformTriangles();
+    if (mVerbose==1) mTimer.stop();
+
+    if (mVerbose==1) mTimer.start("Computing candidate RootTile-Triangle intersection pairs");
+    processRootTrianglePairs();
+    if (mVerbose==1) mTimer.stop();
+
+    if (mVerbose==1) mTimer.start("Enumerating unique root tiles");
+    enumerateRootTiles();
+    if (mVerbose==1) mTimer.stop();
+
+    if (mVerbose==1) mTimer.start("Computing candidate LeafNode-Triangle intersection pairs");
+    processLeafTrianglePairs();
+    if (mVerbose==1) mTimer.stop();
+
+    if (mVerbose==1) mTimer.start("Building rasterized root node");
+    buildRasterizedRoot();
+    if (mVerbose==1) mTimer.stop();
+
+    if (mVerbose==1) mTimer.start("Allocating internal mask buffers");
+    mBuilder.allocateInternalMaskBuffers(mStream);
+    if (mVerbose==1) mTimer.stop();
+
+    if (mVerbose==1) mTimer.start("Rasterizing internal nodes");
+    rasterizeInternalNodes();
+    if (mVerbose==1) mTimer.stop();
+
+    if (mVerbose==1) mTimer.start("Counting nodes");
+    mBuilder.countNodes(mStream);
+    cudaStreamSynchronize(mStream);
+    if (mVerbose==1) mTimer.stop();
+
+    if (mVerbose==1) mTimer.start("Allocating grid buffer");
+    auto gridBuffer = mBuilder.getBuffer(buffer, mStream);
+    if (mVerbose==1) mTimer.stop();
+
+    if (mVerbose==1) mTimer.start("Processing grid/tree/root");
+    processGridTreeRoot();
+    if (mVerbose==1) mTimer.stop();
+
+    if (mVerbose==1) mTimer.start("Processing upper nodes");
+    mBuilder.processUpperNodes(mStream);
+    if (mVerbose==1) mTimer.stop();
+
+    if (mVerbose==1) mTimer.start("Processing lower nodes");
+    mBuilder.processLowerNodes(mStream);
+    if (mVerbose==1) mTimer.stop();
+
+    if (mVerbose==1) mTimer.start("Rasterizing leaf nodes");
+    rasterizeLeafNodes();
+    if (mVerbose==1) mTimer.stop();
+
+    if (mVerbose==1) mTimer.start("Processing leaf offsets");
+    mBuilder.processLeafOffsets(mStream);
+    if (mVerbose==1) mTimer.stop();
+
+    if (mVerbose==1) mTimer.start("Processing bounding boxes");
+    mBuilder.processBBox(mStream);
+    if (mVerbose==1) mTimer.stop();
+
+    if (mVerbose==1) mTimer.start("Post-processing grid/tree data");
+    mBuilder.postProcessGridTree(mStream);
+    cudaStreamSynchronize(mStream);
+    if (mVerbose==1) mTimer.stop();
+
+    if (mVerbose==1) mTimer.start("Pruning empty leaves");
+    int device = 0; cudaGetDevice(&device);
+    const uint32_t leafCount = mBuilder.data()->nodeCount[0];
+    auto handle = GridHandle<GridBufferT>(std::move(gridBuffer));
+    if (leafCount) {
+        nanovdb::cuda::DeviceBuffer retainMaskBuffer = nanovdb::cuda::DeviceBuffer::create(
+            uint64_t(leafCount) * sizeof(nanovdb::Mask<3>), nullptr, device, mStream);
+        cudaCheck(cudaMemsetAsync(retainMaskBuffer.deviceData(), 0xFF,
+            uint64_t(leafCount) * sizeof(nanovdb::Mask<3>), mStream));
+        tools::cuda::PruneGrid<BuildT> pruner(
+            static_cast<const GridT*>(handle.deviceData()),
+            static_cast<nanovdb::Mask<3>*>(retainMaskBuffer.deviceData()),
+            mStream);
+        handle = pruner.template getHandle<GridBufferT>(buffer);
+    }
+    if (mVerbose==1) mTimer.stop();
+    // ---- end duplicated topology block ----
+
+    // ---- UDF + nearest-triangle-index sidecars (one packed atomic-min) ----
+
+    const float voxelSize = (float)mMap.getVoxelSize()[0];
+
+    const uint64_t activeVoxelCount = util::cuda::DeviceGridTraits<BuildT>::getActiveVoxelCount(
+        handle.template deviceGrid<BuildT>());
+
+    // Packed sidecar: (float-bits(distSqr) << 32) | triangleID, per active voxel (+ slot 0 background).
+    auto packedBuffer = nanovdb::cuda::DeviceBuffer::create(
+        (activeVoxelCount + 1) * sizeof(uint64_t), nullptr, device, mStream);
+    auto *dPacked = static_cast<uint64_t*>(packedBuffer.deviceData());
+
+    if (mVerbose==1) mTimer.start("Initializing packed UDF+index sidecar");
+    util::cuda::lambdaKernel<<<numBlocks(activeVoxelCount + 1), mNumThreads, 0, mStream>>>(
+        activeVoxelCount + 1,
+        topology::detail::InitPackedSidecarFunctor{ dPacked });
+    cudaCheckError();
+    if (mVerbose==1) mTimer.stop();
+
+    if (mVerbose==1) mTimer.start("Computing UDF+index via leaf/triangle pairs");
+    if (mBoxTrianglePairCount) {
+        using FunctorT = util::rasterization::cuda::ComputeUDFAndIndexFunctor<BuildT, BoxTrianglePair, Triangle>;
+        util::cuda::operatorKernelInstance<FunctorT>
+            <<<mBoxTrianglePairCount, FunctorT::MaxThreadsPerBlock, 0, mStream>>>(
+                FunctorT{ deviceBoxTrianglePairs(), deviceXformedTriangles(),
+                          handle.template deviceGrid<BuildT>(), dPacked,
+                          mBandWidth * mBandWidth });
+        cudaCheckError();
+        mXformedTriangles.clear(mStream);
+        mBoxTrianglePairsBuffer.clear(mStream);
+    }
+    if (mVerbose==1) mTimer.stop();
+
+    // Split the packed sidecar into a float UDF sidecar (raw distSqr bits) and a uint32 index sidecar.
+    auto udfBuffer   = nanovdb::cuda::DeviceBuffer::create(
+        (activeVoxelCount + 1) * sizeof(float), nullptr, device, mStream);
+    auto indexBuffer = nanovdb::cuda::DeviceBuffer::create(
+        (activeVoxelCount + 1) * sizeof(uint32_t), nullptr, device, mStream);
+    auto *dUDF   = static_cast<float*>(udfBuffer.deviceData());
+    auto *dIndex = static_cast<uint32_t*>(indexBuffer.deviceData());
+
+    if (mVerbose==1) mTimer.start("Splitting packed sidecar -> UDF + index");
+    util::cuda::lambdaKernel<<<numBlocks(activeVoxelCount + 1), mNumThreads, 0, mStream>>>(
+        activeVoxelCount + 1,
+        topology::detail::SplitPackedSidecarFunctor{ dPacked, dUDF, dIndex });
+    cudaCheckError();
+    packedBuffer.clear(mStream);
+    if (mVerbose==1) mTimer.stop();
+
+    // Finalize the float UDF exactly as getHandleAndUDF (sqrt + clamp; 0x7F7FFFFF sentinel -> background).
+    if (mVerbose==1) mTimer.start("Finalizing UDF sidecar (sqrt + clamp)");
+    util::cuda::lambdaKernel<<<numBlocks(activeVoxelCount + 1), mNumThreads, 0, mStream>>>(
+        activeVoxelCount + 1,
+        topology::detail::FinalizeSidecarFunctor{ dUDF, mBandWidth * voxelSize, voxelSize });
+    cudaCheckError();
+    if (mVerbose==1) mTimer.stop();
+
+    cudaStreamSynchronize(mStream);
+
+    return { std::move(handle), std::move(udfBuffer), std::move(indexBuffer) };
+} // MeshToGrid<BuildT>::getHandleAndUDFAndIndex
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 

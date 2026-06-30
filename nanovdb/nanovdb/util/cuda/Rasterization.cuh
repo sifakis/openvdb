@@ -186,6 +186,53 @@ struct ComputeUDFFunctor
     }
 };
 
+/// @brief UDF variant that ALSO records the nearest triangle's index, via a single packed 64-bit
+///        atomicMin. The high 32 bits hold the (non-negative) squared-distance float bit pattern and
+///        the low 32 bits hold the triangle id, so an unsigned min on the 64-bit word keeps the
+///        minimum distance together with its winning triangle id (distSqr >= 0 ⇒ high-bits order ==
+///        distance order). dPacked must be pre-initialized so the high bits hold the "no-hit" UDF
+///        sentinel and the low bits hold the INVALID triangle id.
+///        // duplicated from ComputeUDFFunctor — keep in sync
+template<typename BuildT, typename PairT, typename TriangleT>
+struct ComputeUDFAndIndexFunctor
+{
+    static constexpr int MaxThreadsPerBlock = 512;
+    static constexpr int MinBlocksPerMultiprocessor = 1;
+
+    const PairT *dPairs;
+    const TriangleT *dTriangles;
+    const NanoGrid<BuildT> *dGrid;
+    uint64_t *dPacked;       // per active voxel: (float-bits(distSqr) << 32) | triangleID
+    float bandWidthSqr;
+
+    __device__ void operator()() const
+    {
+        const uint64_t pairID   = blockIdx.x;
+        const int threadID = threadIdx.x;
+
+        const auto &pair = dPairs[pairID];
+        const auto *leaf = dGrid->tree().root().probeLeaf(pair.origin);
+        if (!leaf) return;
+        if (!leaf->isActive(threadID)) return;
+
+        const nanovdb::Coord local = nanovdb::NanoLeaf<BuildT>::OffsetToLocalCoord(threadID);
+        const nanovdb::Vec3f voxelCenter(float(pair.origin[0] + local[0]),
+                                         float(pair.origin[1] + local[1]),
+                                         float(pair.origin[2] + local[2]));
+
+        const auto &tri = dTriangles[pair.triangleID];
+        const float distSqr = nanovdb::math::pointToTriangleDistSqr(tri[0], tri[1], tri[2], voxelCenter);
+
+        if (distSqr >= bandWidthSqr) return;
+
+        const uint64_t sidecarIdx = leaf->getValue(threadID);
+        const unsigned long long packed =
+            (static_cast<unsigned long long>(__float_as_uint(distSqr)) << 32) |
+             static_cast<unsigned long long>(pair.triangleID);
+        atomicMin(reinterpret_cast<unsigned long long*>(&dPacked[sidecarIdx]), packed);
+    }
+};
+
 } // namespace cuda
 
 } // namespace rasterization

@@ -23,14 +23,17 @@
 #include <thrust/universal_vector.h>
 
 #include <algorithm>  // std::sort
+#include <cmath>      // std::sqrt, std::fabs
 #include <iostream>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
 // Must match the aliases in connected_components_cuda.cpp.
-using GridHandleT = nanovdb::GridHandle<nanovdb::cuda::DeviceBuffer>;
-using UDFSidecarT = nanovdb::cuda::DeviceBuffer;
+using GridHandleT   = nanovdb::GridHandle<nanovdb::cuda::DeviceBuffer>;
+using UDFSidecarT   = nanovdb::cuda::DeviceBuffer;
+using IndexSidecarT = nanovdb::cuda::DeviceBuffer;
 
 std::pair<GridHandleT, UDFSidecarT> computeUDF(
     const std::vector<nanovdb::Vec3f>& points,
@@ -53,6 +56,108 @@ std::pair<GridHandleT, UDFSidecarT> computeUDF(
 
     // { index-grid handle, UDF sidecar }, both backed by DeviceBuffer.
     return converter.getHandleAndUDF();
+}
+
+/// @brief Step 1 (additive sibling of computeUDF): rasterize the mesh into the index grid + UDF
+///        sidecar AND a per-active-voxel NEAREST-TRIANGLE-INDEX sidecar (uint32), needed by step 5
+///        (barrier signing). See MeshToGrid::getHandleAndUDFAndIndex. After building, a CPU oracle
+///        re-derives each active voxel's distance from its stored triangle and checks it against the
+///        UDF, and confirms background / no-hit voxels carry the INVALID (0xFFFFFFFF) index.
+/// @return { index-grid handle, UDF sidecar, nearest-triangle-index sidecar } (device buffers)
+std::tuple<GridHandleT, UDFSidecarT, IndexSidecarT> computeUDFAndIndex(
+    const std::vector<nanovdb::Vec3f>& points,
+    const std::vector<nanovdb::Vec3i>& triangles,
+    const nanovdb::Map&                map,
+    float                              bandWidth)
+{
+    using BuildT = nanovdb::ValueOnIndex;
+
+    thrust::universal_vector<nanovdb::Vec3f> dPoints(points.begin(), points.end());
+    thrust::universal_vector<nanovdb::Vec3i> dTriangles(triangles.begin(), triangles.end());
+
+    nanovdb::tools::cuda::MeshToGrid<BuildT> converter(
+        dPoints.data().get(),    uint32_t(dPoints.size()),
+        dTriangles.data().get(), uint32_t(dTriangles.size()),
+        map);
+    converter.setVerbose(1);
+    converter.setNarrowBandWidth(bandWidth);
+
+    auto result = converter.getHandleAndUDFAndIndex();
+    auto& handle       = std::get<0>(result);
+    auto& udfSidecar   = std::get<1>(result);
+    auto& indexSidecar = std::get<2>(result);
+
+    // ---- CPU oracle: the stored nearest-triangle index must reproduce the UDF (pipeline step 1) ----
+    const float        voxelSize      = float(map.getVoxelSize()[0]);
+    const float        bandWidthWorld = bandWidth * voxelSize;
+    constexpr uint32_t INVALID        = 0xFFFFFFFFu;
+
+    const uint64_t        n = udfSidecar.size() / sizeof(float);  // activeVoxelCount + 1 (slot 0 = background)
+    std::vector<float>    udf(n);
+    std::vector<uint32_t> index(n);
+    cudaCheck(cudaMemcpy(udf.data(),   udfSidecar.deviceData(),   n * sizeof(float),    cudaMemcpyDeviceToHost));
+    cudaCheck(cudaMemcpy(index.data(), indexSidecar.deviceData(), n * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+    // Byte-copy the device grid blob to a pinned host buffer (NanoVDB is position-independent).
+    const uint64_t gridBytes = handle.bufferSize();
+    void* hostBlob = nullptr;
+    cudaCheck(cudaMallocHost(&hostBlob, gridBytes));
+    cudaCheck(cudaMemcpy(hostBlob, handle.deviceData(), gridBytes, cudaMemcpyDeviceToHost));
+    const auto* h_grid = reinterpret_cast<const nanovdb::NanoGrid<BuildT>*>(hostBlob);
+
+    const auto&    tree      = h_grid->tree();
+    const uint32_t leafCount = tree.nodeCount(0);
+    const auto*    leaves    = tree.getFirstLeaf();
+    const float    tol       = 1e-3f * bandWidthWorld + 1e-6f;  // generous vs host/device float divergence
+
+    std::size_t mismatches = 0, hits = 0, misses = 0, oob = 0, shown = 0;
+
+    // Background slot 0 must carry the INVALID index.
+    if (index[0] != INVALID) { ++mismatches; std::cerr << "  index[0] (background) != INVALID\n"; }
+
+    for (uint32_t li = 0; li < leafCount; ++li) {
+        const auto&         leaf = leaves[li];
+        const nanovdb::Coord o   = leaf.origin();
+        for (int q = 0; q < 512; ++q) {
+            if (!leaf.isActive(uint32_t(q))) continue;
+            const uint64_t vIdx = leaf.getValue(uint32_t(q));
+            const uint32_t tid  = index[vIdx];
+            const float    d    = udf[vIdx];
+            if (tid == INVALID) {
+                // No-hit (false-positive) voxel: the UDF is clamped to the band width.
+                ++misses;
+                if (std::fabs(d - bandWidthWorld) > tol) {
+                    ++mismatches;
+                    if (shown++ < 10)
+                        std::cerr << "  no-hit voxel udf=" << d << " != bandWidth=" << bandWidthWorld << "\n";
+                }
+                continue;
+            }
+            if (tid >= triangles.size()) { ++oob; ++mismatches; continue; }
+            ++hits;
+            // Recompute the distance to the stored triangle in index space (mirrors the device).
+            const nanovdb::Vec3i& T  = triangles[tid];
+            const nanovdb::Vec3f  v0 = map.applyInverseMap(points[T[0]]);
+            const nanovdb::Vec3f  v1 = map.applyInverseMap(points[T[1]]);
+            const nanovdb::Vec3f  v2 = map.applyInverseMap(points[T[2]]);
+            const nanovdb::Vec3f  c(float(o[0] + (q >> 6)), float(o[1] + ((q >> 3) & 7)), float(o[2] + (q & 7)));
+            const float dRecomp = std::sqrt(nanovdb::math::pointToTriangleDistSqr(v0, v1, v2, c)) * voxelSize;
+            if (std::fabs(dRecomp - d) > tol) {
+                ++mismatches;
+                if (shown++ < 10)
+                    std::cerr << "  voxel @ leaf " << li << " off " << q << ": stored tri " << tid
+                              << " dist " << dRecomp << " != udf " << d << "\n";
+            }
+        }
+    }
+    cudaCheck(cudaFreeHost(hostBlob));
+
+    std::cout << "UDF nearest-triangle index validation:  " << (mismatches == 0 ? "PASS" : "FAIL")
+              << " (" << (n - 1) << " active voxels: " << hits << " hits, " << misses << " no-hit; "
+              << mismatches << " mismatches"
+              << (oob ? ", " + std::to_string(oob) + " out-of-range" : "") << ")\n";
+
+    return result;
 }
 
 /// @brief Print topology diagnostics for a device-resident ValueOnIndex grid, in the

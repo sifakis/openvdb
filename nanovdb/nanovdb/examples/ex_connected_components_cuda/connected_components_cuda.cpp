@@ -19,18 +19,30 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
 // Types of the rasterization result handed across the host/device seam.
-using GridHandleT = nanovdb::GridHandle<nanovdb::cuda::DeviceBuffer>;
-using UDFSidecarT = nanovdb::cuda::DeviceBuffer;
+using GridHandleT   = nanovdb::GridHandle<nanovdb::cuda::DeviceBuffer>;
+using UDFSidecarT   = nanovdb::cuda::DeviceBuffer;
+using IndexSidecarT = nanovdb::cuda::DeviceBuffer;
 
 /// @brief Implemented on the CUDA side (connected_components_cuda_kernels.cu):
 ///        uploads the mesh and voxelizes it into a ValueOnIndex grid plus a per-active-
 ///        voxel unsigned-distance-field sidecar.
 /// @return { index-grid handle, UDF sidecar } (device buffers)
 std::pair<GridHandleT, UDFSidecarT> computeUDF(
+    const std::vector<nanovdb::Vec3f>& points,
+    const std::vector<nanovdb::Vec3i>& triangles,
+    const nanovdb::Map&                map,
+    float                              bandWidth);
+
+/// @brief Implemented on the CUDA side: like computeUDF, but also returns a per-active-voxel
+///        nearest-triangle-index sidecar (uint32; 0xFFFFFFFF for background / no-hit) needed by the
+///        later barrier-signing step. A built-in CPU oracle validates the index against the UDF.
+/// @return { index-grid handle, UDF sidecar, nearest-triangle-index sidecar } (device buffers)
+std::tuple<GridHandleT, UDFSidecarT, IndexSidecarT> computeUDFAndIndex(
     const std::vector<nanovdb::Vec3f>& points,
     const std::vector<nanovdb::Vec3i>& triangles,
     const nanovdb::Map&                map,
@@ -124,12 +136,15 @@ int main(int argc, char* argv[])
         nanovdb::Map map;
         map.set(double(voxelSize), nanovdb::Vec3d(0.0), 1.0);
 
-        // Step 1: rasterize the mesh into an index grid + UDF sidecar.
-        auto [handle, sidecar] = computeUDF(points, triangles, map, bandWidth);
+        // Step 1: rasterize the mesh into an index grid + UDF sidecar + nearest-triangle-index sidecar.
+        // (The index sidecar is just carried for now; step 5 / barrier signing will consume it.)
+        auto [handle, sidecar, indexSidecar] = computeUDFAndIndex(points, triangles, map, bandWidth);
 
         printGridDiagnostics(handle, "Rasterized UDF grid");
         std::cout << "UDF sidecar                           : "
                   << (sidecar.size() / sizeof(float)) << " floats\n";
+        std::cout << "Nearest-triangle-index sidecar        : "
+                  << (indexSidecar.size() / sizeof(uint32_t)) << " uint32\n";
 
         // Step 2: derive the CC-input topology by pruning the surface/barrier shell.
         auto derivedHandle = computeDerivedTopology(handle, sidecar, voxelSize);

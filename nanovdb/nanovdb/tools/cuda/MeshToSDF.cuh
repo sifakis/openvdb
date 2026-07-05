@@ -251,6 +251,287 @@ struct SignBarrierFunctor
     }
 };
 
+/// @brief Step 6 (chunk A, leaf level): build one invert Mask<3> per materialized leaf that signs the
+///        INACTIVE voxels — bit ON => interior (-background), bit OFF => exterior (+background, the
+///        default). One block per leaf, 512 threads (one per voxel), shared-memory Jacobi flood:
+///          - injectors  = ACTIVE voxels with sign -1 (the interior side of the signed band);
+///          - walls      = ALL active voxels (exterior/barrier active neighbors never turn a bit on);
+///          - propagation runs through INACTIVE voxels only, via the 6 face neighbors, entirely
+///            within the leaf. The active band bounds the flood, so it cannot leak from
+///            interior-inactive to exterior-inactive.
+///        A leaf with no interior voxels stays all-0. Cross-leaf / coarser-level fill is a later chunk.
+template <typename BuildT>
+struct FillLeafInvertMaskFunctor
+{
+    static constexpr int MaxThreadsPerBlock         = LEAF_SIZE;
+    static constexpr int MinBlocksPerMultiprocessor = 1;
+
+    __device__ void operator()(const NanoGrid<BuildT>* d_grid,
+                               const int8_t*           d_sign,        // full sign sidecar (post step 5)
+                               nanovdb::Mask<3>*       d_invertMasks) // one Mask<3> per leaf, output
+    {
+        const int leafID = blockIdx.x, n = threadIdx.x;
+        const auto& leaf = d_grid->tree().template getFirstNode<0>()[leafID];
+
+        __shared__ uint8_t sAct[LEAF_SIZE];  // active voxel (wall)
+        __shared__ uint8_t sInj[LEAF_SIZE];  // interior active voxel (flood source)
+        __shared__ uint8_t sInv[LEAF_SIZE];  // result: inactive voxel marked interior
+        __shared__ int     sChanged;
+
+        const bool act = leaf.isActive(uint32_t(n));
+        sAct[n] = act ? 1 : 0;
+        sInj[n] = (act && d_sign[leaf.getValue(uint32_t(n))] == int8_t(-1)) ? 1 : 0;
+        sInv[n] = 0;
+        __syncthreads();
+
+        // Voxel offset layout n = (x<<6)|(y<<3)|z; face neighbors are n±64 / n±8 / n±1.
+        const int x = n >> 6, y = (n >> 3) & 7, z = n & 7;
+        auto feeds = [&](int m) { return sInj[m] || (!sAct[m] && sInv[m]); };
+
+        // Jacobi flood to convergence. Sources are ≤1 band-thickness away through smooth inactive
+        // pockets, so convergence takes far fewer than 64 sweeps; 64 is a safety cap.
+        for (int it = 0; it < 64; ++it) {
+            if (n == 0) sChanged = 0;
+            __syncthreads();
+            bool turnOn = false;
+            if (!act && !sInv[n]) {
+                if ((x > 0 && feeds(n - 64)) || (x < 7 && feeds(n + 64)) ||
+                    (y > 0 && feeds(n -  8)) || (y < 7 && feeds(n +  8)) ||
+                    (z > 0 && feeds(n -  1)) || (z < 7 && feeds(n +  1)))
+                    turnOn = true;
+            }
+            __syncthreads();                          // all reads of sInv precede this sweep's writes
+            if (turnOn) { sInv[n] = 1; sChanged = 1; }
+            __syncthreads();                          // writes (incl. sChanged) visible to the break test
+            const bool done = (sChanged == 0);        // latch into a register...
+            __syncthreads();                          // ...so thread 0's next-iter reset can't race the read
+            if (done) break;
+        }
+
+        // Pack the 512 result bits into the leaf's Mask<3> (bit n lives in word n>>6, bit n&63).
+        if (n < int(nanovdb::Mask<3>::WORD_COUNT)) {
+            uint64_t w = 0;
+            for (int b = 0; b < 64; ++b)
+                if (sInv[(n << 6) | b]) w |= (uint64_t(1) << b);
+            d_invertMasks[leafID].words()[n] = w;
+        }
+    }
+};
+
+/// @brief Descend root -> upper -> lower for the 8^3 leaf-region at coord @a c and report where the
+///        finest CHILDLESS tile containing it lives (the face->coarser seeding target, plan §7a).
+/// @return 0 = skip: root-level tile / unmapped space (chunk C) or refined all the way to a leaf
+///         (handled at the finer level); 1 = childless LOWER slot; 2 = childless UPPER slot.
+///         On 1/2, @a nodeIdx = linear node index at that level and @a slot = child-slot offset.
+template <typename BuildT>
+__hostdev__ inline int
+probeChildlessSlot(const NanoGrid<BuildT>& grid, const nanovdb::Coord& c,
+                   uint64_t& nodeIdx, uint32_t& slot)
+{
+    using UpperT = NanoUpper<BuildT>;
+    using LowerT = NanoLower<BuildT>;
+    const auto& tree = grid.tree();
+    const auto* tile = tree.root().probeTile(c);
+    if (!tile || !tile->isChild()) return 0;                    // root-level: deferred to chunk C
+    const UpperT* upper = tree.root().getChild(tile);
+    const LowerT* lower = upper->probeChild(c);
+    if (!lower) {                                               // childless upper slot
+        nodeIdx = util::PtrDiff(upper, tree.template getFirstNode<2>()) / sizeof(UpperT);
+        slot    = UpperT::CoordToOffset(c);
+        return 2;
+    }
+    const uint32_t lOff = LowerT::CoordToOffset(c);
+    if (!lower->childMask().isOn(lOff)) {                       // childless lower slot
+        nodeIdx = util::PtrDiff(lower, tree.template getFirstNode<1>()) / sizeof(LowerT);
+        slot    = lOff;
+        return 1;
+    }
+    return 0;                                                   // refined to a leaf
+}
+
+/// @brief Chunk-B seeding pass 1 (plan §7a): each leaf classifies its 6 faces and accumulates
+///        interior/exterior evidence into the childless coarse tile across each face. One block per
+///        leaf, 384 threads = 6 faces × 64 face voxels. Face voxel classification:
+///          interior = (active && sign == -1) || (inactive && leaf invert bit ON)
+///          exterior = (active && sign == +1) || (inactive && leaf invert bit OFF)
+///        (No barrier special-case: a face abutting a CHILDLESS tile is barrier-free by construction —
+///        a barrier voxel forces the neighbor across to be refined, §6d rule 3.)
+///        The whole 8×8 face abuts exactly one 8^3 region across, so one probe per face decides the
+///        target: childless lower/upper slot -> atomically OR the per-tile sawInterior/sawExterior
+///        bits; refined or root-level -> skip. The final seed gate (sawInt && !sawExt) is applied by
+///        the flood kernel.
+template <typename BuildT>
+struct LeafFaceSeedFunctor
+{
+    static constexpr int MaxThreadsPerBlock         = 384;  // 6 faces × 64 cells
+    static constexpr int MinBlocksPerMultiprocessor = 1;
+
+    __device__ void operator()(const NanoGrid<BuildT>*  d_grid,
+                               const int8_t*            d_sign,        // completed signs (post step 5)
+                               const nanovdb::Mask<3>*  d_leafInvert,  // chunk-A leaf invert masks
+                               nanovdb::Mask<4>* d_lowerSawInt, nanovdb::Mask<4>* d_lowerSawExt,
+                               nanovdb::Mask<5>* d_upperSawInt, nanovdb::Mask<5>* d_upperSawExt)
+    {
+        const int leafID = blockIdx.x, t = threadIdx.x;
+        const auto& leaf = d_grid->tree().template getFirstNode<0>()[leafID];
+
+        __shared__ int sInt[6], sExt[6];
+        if (t < 6) { sInt[t] = 0; sExt[t] = 0; }
+        __syncthreads();
+
+        // Face voxel of this thread: face = t/64 (0..5 = -x,+x,-y,+y,-z,+z), (a,b) = 8×8 position.
+        const int face = t >> 6, a = (t >> 3) & 7, b = t & 7;
+        int n;  // voxel offset n = (x<<6)|(y<<3)|z
+        switch (face) {
+            case 0:  n = (0 << 6) | (a << 3) | b; break;
+            case 1:  n = (7 << 6) | (a << 3) | b; break;
+            case 2:  n = (a << 6) | (0 << 3) | b; break;
+            case 3:  n = (a << 6) | (7 << 3) | b; break;
+            case 4:  n = (a << 6) | (b << 3) | 0; break;
+            default: n = (a << 6) | (b << 3) | 7; break;
+        }
+        const bool act      = leaf.isActive(uint32_t(n));
+        const bool interior = act ? (d_sign[leaf.getValue(uint32_t(n))] == int8_t(-1))
+                                  : d_leafInvert[leafID].isOn(uint32_t(n));
+        if (interior) sInt[face] = 1; else sExt[face] = 1;  // benign race: all writers store 1
+        __syncthreads();
+
+        if (t < 6) {  // one probe per face
+            const int off[6][3] = {{-8,0,0},{8,0,0},{0,-8,0},{0,8,0},{0,0,-8},{0,0,8}};
+            const nanovdb::Coord c = leaf.origin().offsetBy(off[t][0], off[t][1], off[t][2]);
+            uint64_t nodeIdx; uint32_t slot;
+            const int level = probeChildlessSlot(*d_grid, c, nodeIdx, slot);
+            if (level == 1) {
+                if (sInt[t]) d_lowerSawInt[nodeIdx].setOnAtomic(slot);
+                if (sExt[t]) d_lowerSawExt[nodeIdx].setOnAtomic(slot);
+            } else if (level == 2) {
+                if (sInt[t]) d_upperSawInt[nodeIdx].setOnAtomic(slot);
+                if (sExt[t]) d_upperSawExt[nodeIdx].setOnAtomic(slot);
+            }
+        }
+    }
+};
+
+/// @brief Chunk-B seeding pass 2 (plan §7a): each LOWER node classifies the childless slots on its 6
+///        faces (via the already-flooded lower invert mask) and accumulates into the childless UPPER
+///        tile across each face. Refined face slots are skipped — their finer content contributed via
+///        LeafFaceSeedFunctor. A probe landing on another lower node's slot is a SAME-level neighbor:
+///        cross-node same-level propagation is deferred (like leaf<->leaf), not chunk B. One block per
+///        lower node, 512 threads striding 6 faces × 16×16 = 1536 face cells.
+template <typename BuildT>
+struct LowerFaceSeedFunctor
+{
+    static constexpr int MaxThreadsPerBlock         = 512;
+    static constexpr int MinBlocksPerMultiprocessor = 1;
+
+    __device__ void operator()(const NanoGrid<BuildT>*  d_grid,
+                               const nanovdb::Mask<4>*  d_lowerInvert,  // flooded lower invert masks
+                               nanovdb::Mask<5>* d_upperSawInt, nanovdb::Mask<5>* d_upperSawExt)
+    {
+        const int nodeID = blockIdx.x, t = threadIdx.x;
+        const auto& node = d_grid->tree().template getFirstNode<1>()[nodeID];
+
+        __shared__ int sInt[6], sExt[6];
+        if (t < 6) { sInt[t] = 0; sExt[t] = 0; }
+        __syncthreads();
+
+        for (int u = t; u < 6 * 256; u += blockDim.x) {
+            const int face = u >> 8, a = (u >> 4) & 15, b = u & 15;
+            int n;  // lower slot offset n = (x<<8)|(y<<4)|z
+            switch (face) {
+                case 0:  n = ( 0 << 8) | (a << 4) | b; break;
+                case 1:  n = (15 << 8) | (a << 4) | b; break;
+                case 2:  n = (a << 8) | ( 0 << 4) | b; break;
+                case 3:  n = (a << 8) | (15 << 4) | b; break;
+                case 4:  n = (a << 8) | (b << 4) |  0; break;
+                default: n = (a << 8) | (b << 4) | 15; break;
+            }
+            if (node.childMask().isOn(uint32_t(n))) continue;  // refined: leaf faces already contributed
+            if (d_lowerInvert[nodeID].isOn(uint32_t(n))) sInt[face] = 1; else sExt[face] = 1;
+        }
+        __syncthreads();
+
+        if (t < 6) {  // whole 128×128 face abuts exactly one 128^3 region across
+            const int off[6][3] = {{-128,0,0},{128,0,0},{0,-128,0},{0,128,0},{0,0,-128},{0,0,128}};
+            const nanovdb::Coord c = node.origin().offsetBy(off[t][0], off[t][1], off[t][2]);
+            uint64_t nodeIdx; uint32_t slot;
+            if (probeChildlessSlot(*d_grid, c, nodeIdx, slot) == 2) {
+                if (sInt[t]) d_upperSawInt[nodeIdx].setOnAtomic(slot);
+                if (sExt[t]) d_upperSawExt[nodeIdx].setOnAtomic(slot);
+            }
+        }
+    }
+};
+
+/// @brief Chunk-B finalize + within-node flood at a coarse level (LEVEL 1 = lower/16^3, 2 = upper/
+///        32^3), the coarse-granularity analogue of FillLeafInvertMaskFunctor. Per node: seed =
+///        childless slots passing the §6d.4 gate (sawInterior && !sawExterior — errs to exterior on
+///        mixed evidence, the safe side), then a monotone ON-flood over 6-adjacent CHILDLESS slots;
+///        REFINED slots are walls. Safety invariant: two adjacent childless slots can never be on
+///        opposite sides of the surface (the surface between them would force refinement), so the
+///        flood cannot leak interior -> exterior. One block per node, 512 threads striding the slots;
+///        slot bits live in shared memory as packed words (Mask<4> 512 B / Mask<5> 4 KB).
+template <typename BuildT, int LEVEL>
+struct CoarseInvertFloodFunctor
+{
+    static constexpr int LOG2DIM = (LEVEL == 1) ? 4 : 5;
+    static constexpr int DIM     = 1 << LOG2DIM;             // 16 / 32
+    static constexpr int SLOTS   = 1 << (3 * LOG2DIM);       // 4096 / 32768
+    static constexpr int WORDS   = SLOTS >> 6;               // 64 / 512
+    using MaskT = nanovdb::Mask<LOG2DIM>;
+
+    static constexpr int MaxThreadsPerBlock         = 512;
+    static constexpr int MinBlocksPerMultiprocessor = 1;
+
+    __device__ void operator()(const NanoGrid<BuildT>* d_grid,
+                               const MaskT* d_sawInt, const MaskT* d_sawExt, MaskT* d_invert)
+    {
+        const int nodeID = blockIdx.x, t = threadIdx.x;
+        const auto& node = d_grid->tree().template getFirstNode<LEVEL>()[nodeID];
+
+        __shared__ uint64_t sWall[WORDS];  // refined slots (childMask)
+        __shared__ uint64_t sInv [WORDS];  // result bits (seeded, then flooded)
+        __shared__ int      sChanged;
+
+        for (int w = t; w < WORDS; w += blockDim.x) {
+            const uint64_t wall = node.childMask().words()[w];
+            sWall[w] = wall;
+            sInv[w]  = d_sawInt[nodeID].words()[w] & ~d_sawExt[nodeID].words()[w] & ~wall;
+        }
+        __syncthreads();
+
+        auto isOn = [&](const uint64_t* m, int s) { return (m[s >> 6] >> (s & 63)) & 1ull; };
+
+        // Monotone ON-flood: racy same-sweep reads only accelerate legitimate propagation (a set bit
+        // is final truth), so in-place atomicOr is safe. Cap = Manhattan diameter + slack.
+        for (int it = 0; it < 3 * DIM + 16; ++it) {
+            if (t == 0) sChanged = 0;
+            __syncthreads();
+            bool any = false;
+            for (int s = t; s < SLOTS; s += blockDim.x) {
+                if (isOn(sWall, s) || isOn(sInv, s)) continue;
+                const int x = s >> (2 * LOG2DIM), y = (s >> LOG2DIM) & (DIM - 1), z = s & (DIM - 1);
+                constexpr int dx = 1 << (2 * LOG2DIM), dy = 1 << LOG2DIM;
+                // inv bits exist only on childless slots, so a set neighbor bit is a valid feeder
+                if ((x > 0       && isOn(sInv, s - dx)) || (x < DIM - 1 && isOn(sInv, s + dx)) ||
+                    (y > 0       && isOn(sInv, s - dy)) || (y < DIM - 1 && isOn(sInv, s + dy)) ||
+                    (z > 0       && isOn(sInv, s -  1)) || (z < DIM - 1 && isOn(sInv, s +  1))) {
+                    ::atomicOr(reinterpret_cast<unsigned long long*>(&sInv[s >> 6]), 1ull << (s & 63));
+                    any = true;
+                }
+            }
+            if (any) sChanged = 1;
+            __syncthreads();
+            const bool done = (sChanged == 0);  // latch, then barrier: next-iter reset can't race the read
+            __syncthreads();
+            if (done) break;
+        }
+
+        for (int w = t; w < WORDS; w += blockDim.x)
+            d_invert[nodeID].words()[w] = sInv[w];
+    }
+};
+
 } // namespace sdf_detail
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -314,6 +595,23 @@ public:
                      const nanovdb::Vec3f* d_points, const nanovdb::Vec3i* d_triangles,
                      const nanovdb::Map& map);
 
+    /// @brief Step 6 (chunk A, leaf level): build the per-leaf invert masks that sign the INACTIVE
+    ///        voxels inside materialized leaves — bit ON => interior (-background), bit OFF =>
+    ///        exterior (+background, the default). Floods interior signs from the interior active
+    ///        band through each leaf's inactive voxels (active voxels are walls). Requires
+    ///        signBarrier() first (reads the completed sign sidecar). Coarser levels (lower/upper/
+    ///        root) are later pipeline chunks.
+    /// @param d_grid the original (fully signed) device grid.
+    void fillLeafInvertMask(const GridT* d_grid);
+
+    /// @brief Step 6 (chunk B, lower + upper levels): fill the coarse invert masks that sign the
+    ///        CHILDLESS child slots of lower and upper internal nodes (bit ON => that tile is
+    ///        interior / -background). Bottom-up per plan §7a: leaf faces seed lower/upper tiles ->
+    ///        flood lower -> lower faces seed upper tiles -> flood upper. Root-level tiles and the
+    ///        topology rebuild are chunk C. Requires fillLeafInvertMask() first.
+    /// @param d_grid the original (fully signed) device grid.
+    void fillCoarseInvertMasks(const GridT* d_grid);
+
     /// @brief Device pointer to the per-active-voxel sign array (+1 exterior / -1 interior),
     ///        valid after signNonBarrier(). Length activeVoxelCount+1, indexed by leaf.getValue(n);
     ///        slot 0 is the background (+1).
@@ -333,6 +631,22 @@ public:
     ///        remains. Length origActiveVoxelCount+1, indexed by leaf.getValue(n); slot 0 = +1.
     int8_t* deviceSignedVoxelSign() { return static_cast<int8_t*>(mSignedVoxelSign.deviceData()); }
 
+    /// @brief Device pointer to the per-leaf invert masks (nodeCount[0] × Mask<3>), valid after
+    ///        fillLeafInvertMask(). For each materialized leaf, bit n ON means the INACTIVE voxel n
+    ///        is interior (-background); OFF means exterior (+background). Bits of active voxels are
+    ///        always OFF (their sign lives in the sign sidecar).
+    nanovdb::Mask<3>* deviceLeafInvertMask() { return static_cast<nanovdb::Mask<3>*>(mLeafInvertMask.deviceData()); }
+
+    /// @brief Device pointer to the lower-level invert masks (nodeCount[1] × Mask<4>), valid after
+    ///        fillCoarseInvertMasks(). Bit n ON means the CHILDLESS lower slot n (an 8^3-voxel tile)
+    ///        is interior; OFF means exterior. Refined slots (childMask ON) carry no invert bit.
+    nanovdb::Mask<4>* deviceLowerInvertMask() { return static_cast<nanovdb::Mask<4>*>(mLowerInvertMask.deviceData()); }
+
+    /// @brief Device pointer to the upper-level invert masks (nodeCount[2] × Mask<5>), valid after
+    ///        fillCoarseInvertMasks(). Bit n ON means the CHILDLESS upper slot n (a 128^3-voxel tile)
+    ///        is interior; OFF means exterior. Refined slots carry no invert bit.
+    nanovdb::Mask<5>* deviceUpperInvertMask() { return static_cast<nanovdb::Mask<5>*>(mUpperInvertMask.deviceData()); }
+
 private:
 
     cudaStream_t                 mStream{0};
@@ -343,6 +657,9 @@ private:
     nanovdb::cuda::DeviceBuffer  mVoxelSign;       // (derived activeVoxelCount+1) × int8_t: +1 ext / -1 int
     nanovdb::cuda::DeviceBuffer  mOriginalVoxelSign; // (orig activeVoxelCount+1) × int8_t: +1/-1 non-barrier, 0 barrier
     nanovdb::cuda::DeviceBuffer  mSignedVoxelSign;   // (orig activeVoxelCount+1) × int8_t: +1/-1 everywhere (barriers signed)
+    nanovdb::cuda::DeviceBuffer  mLeafInvertMask;    // nodeCount[0] × Mask<3>: inactive-voxel interior bits
+    nanovdb::cuda::DeviceBuffer  mLowerInvertMask;   // nodeCount[1] × Mask<4>: childless-lower-tile interior bits
+    nanovdb::cuda::DeviceBuffer  mUpperInvertMask;   // nodeCount[2] × Mask<5>: childless-upper-tile interior bits
 
 }; // tools::cuda::MeshToSDF<BuildT>
 
@@ -476,6 +793,101 @@ void MeshToSDF<BuildT>::signBarrier(const GridT* d_grid, const uint32_t* d_index
     cudaCheckError();
     if (mVerbose==1) mTimer.stop();
 }// MeshToSDF<BuildT>::signBarrier
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+template <typename BuildT>
+void MeshToSDF<BuildT>::fillLeafInvertMask(const GridT* d_grid)
+{
+    const uint32_t leafCount =
+        util::cuda::DeviceGridTraits<BuildT>::getTreeData(d_grid).mNodeCount[0];
+    if (leafCount == 0) { mLeafInvertMask = nanovdb::cuda::DeviceBuffer(); return; }
+
+    mLeafInvertMask = nanovdb::cuda::DeviceBuffer::create(
+        std::size_t(leafCount) * sizeof(nanovdb::Mask<3>), nullptr, false);
+    cudaCheck(cudaMemsetAsync(mLeafInvertMask.deviceData(), 0,
+                              std::size_t(leafCount) * sizeof(nanovdb::Mask<3>), mStream));
+
+    using Op = sdf_detail::FillLeafInvertMaskFunctor<BuildT>;
+    if (mVerbose==1) mTimer.start("Fill leaf invert mask (inactive-voxel interior flood)");
+    util::cuda::operatorKernel<Op><<<leafCount, Op::MaxThreadsPerBlock, 0, mStream>>>(
+        d_grid, deviceSignedVoxelSign(), deviceLeafInvertMask());
+    cudaCheckError();
+    if (mVerbose==1) mTimer.stop();
+}// MeshToSDF<BuildT>::fillLeafInvertMask
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+template <typename BuildT>
+void MeshToSDF<BuildT>::fillCoarseInvertMasks(const GridT* d_grid)
+{
+    const auto     treeData   = util::cuda::DeviceGridTraits<BuildT>::getTreeData(d_grid);
+    const uint32_t leafCount  = treeData.mNodeCount[0];
+    const uint32_t lowerCount = treeData.mNodeCount[1];
+    const uint32_t upperCount = treeData.mNodeCount[2];
+
+    const std::size_t lowerBytes = std::size_t(lowerCount) * sizeof(nanovdb::Mask<4>);
+    const std::size_t upperBytes = std::size_t(upperCount) * sizeof(nanovdb::Mask<5>);
+    mLowerInvertMask = lowerCount ? nanovdb::cuda::DeviceBuffer::create(lowerBytes, nullptr, false)
+                                  : nanovdb::cuda::DeviceBuffer();
+    mUpperInvertMask = upperCount ? nanovdb::cuda::DeviceBuffer::create(upperBytes, nullptr, false)
+                                  : nanovdb::cuda::DeviceBuffer();
+    if (lowerCount) cudaCheck(cudaMemsetAsync(mLowerInvertMask.deviceData(), 0, lowerBytes, mStream));
+    if (upperCount) cudaCheck(cudaMemsetAsync(mUpperInvertMask.deviceData(), 0, upperBytes, mStream));
+    if (leafCount == 0 || lowerCount == 0) return;  // nothing to seed from
+
+    // Temporary per-tile evidence accumulators (freed at scope exit).
+    auto lowSawIntBuf = nanovdb::cuda::DeviceBuffer::create(lowerBytes, nullptr, false);
+    auto lowSawExtBuf = nanovdb::cuda::DeviceBuffer::create(lowerBytes, nullptr, false);
+    auto upSawIntBuf  = nanovdb::cuda::DeviceBuffer::create(upperBytes, nullptr, false);
+    auto upSawExtBuf  = nanovdb::cuda::DeviceBuffer::create(upperBytes, nullptr, false);
+    auto* d_lowSawInt = static_cast<nanovdb::Mask<4>*>(lowSawIntBuf.deviceData());
+    auto* d_lowSawExt = static_cast<nanovdb::Mask<4>*>(lowSawExtBuf.deviceData());
+    auto* d_upSawInt  = static_cast<nanovdb::Mask<5>*>(upSawIntBuf.deviceData());
+    auto* d_upSawExt  = static_cast<nanovdb::Mask<5>*>(upSawExtBuf.deviceData());
+    cudaCheck(cudaMemsetAsync(d_lowSawInt, 0, lowerBytes, mStream));
+    cudaCheck(cudaMemsetAsync(d_lowSawExt, 0, lowerBytes, mStream));
+    cudaCheck(cudaMemsetAsync(d_upSawInt,  0, upperBytes, mStream));
+    cudaCheck(cudaMemsetAsync(d_upSawExt,  0, upperBytes, mStream));
+
+    // (1) Leaf faces seed the childless lower/upper tiles across them.
+    using LeafSeedOp = sdf_detail::LeafFaceSeedFunctor<BuildT>;
+    if (mVerbose==1) mTimer.start("Coarse invert: seed from leaf faces");
+    util::cuda::operatorKernel<LeafSeedOp><<<leafCount, LeafSeedOp::MaxThreadsPerBlock, 0, mStream>>>(
+        d_grid, deviceSignedVoxelSign(), deviceLeafInvertMask(),
+        d_lowSawInt, d_lowSawExt, d_upSawInt, d_upSawExt);
+    cudaCheckError();
+    if (mVerbose==1) mTimer.stop();
+
+    // (2) Finalize (sawInt && !sawExt gate) + flood the lower level.
+    using LowerFloodOp = sdf_detail::CoarseInvertFloodFunctor<BuildT, 1>;
+    if (mVerbose==1) mTimer.start("Coarse invert: flood lower nodes");
+    util::cuda::operatorKernel<LowerFloodOp><<<lowerCount, LowerFloodOp::MaxThreadsPerBlock, 0, mStream>>>(
+        d_grid, d_lowSawInt, d_lowSawExt, deviceLowerInvertMask());
+    cudaCheckError();
+    if (mVerbose==1) mTimer.stop();
+
+    // (3) Lower faces seed the childless upper tiles across them.
+    using LowerSeedOp = sdf_detail::LowerFaceSeedFunctor<BuildT>;
+    if (mVerbose==1) mTimer.start("Coarse invert: seed from lower faces");
+    util::cuda::operatorKernel<LowerSeedOp><<<lowerCount, LowerSeedOp::MaxThreadsPerBlock, 0, mStream>>>(
+        d_grid, deviceLowerInvertMask(), d_upSawInt, d_upSawExt);
+    cudaCheckError();
+    if (mVerbose==1) mTimer.stop();
+
+    // (4) Finalize + flood the upper level.
+    if (upperCount) {
+        using UpperFloodOp = sdf_detail::CoarseInvertFloodFunctor<BuildT, 2>;
+        if (mVerbose==1) mTimer.start("Coarse invert: flood upper nodes");
+        util::cuda::operatorKernel<UpperFloodOp><<<upperCount, UpperFloodOp::MaxThreadsPerBlock, 0, mStream>>>(
+            d_grid, d_upSawInt, d_upSawExt, deviceUpperInvertMask());
+        cudaCheckError();
+        if (mVerbose==1) mTimer.stop();
+    }
+
+    // The evidence accumulators go out of scope here; sync so their frees can't outrun the kernels.
+    cudaCheck(cudaStreamSynchronize(mStream));
+}// MeshToSDF<BuildT>::fillCoarseInvertMasks
 
 } // namespace tools::cuda
 

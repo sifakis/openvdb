@@ -50,6 +50,13 @@ struct CCResult {
     bool     analyticChecked             = false;  // sphere ground-truth check ran
     uint64_t analyticConfidentMismatches = 0;      // sphere ground-truth, beyond-shell (must be 0)
     uint64_t analyticInShellTies         = 0;      // sphere ground-truth, within √3/2-voxel shell
+    bool     invertChecked               = false;  // leaf invert-mask analytic check ran (step 6 chunk A)
+    uint64_t invertMismatches            = 0;      // inactive voxels whose invert bit disagrees w/ analytic
+    uint64_t invertOnBits                = 0;      // inactive voxels marked interior (always reported)
+    bool     coarseInvertChecked         = false;  // lower/upper invert-mask analytic check ran (chunk B)
+    uint64_t coarseInvertMismatches      = 0;      // childless tiles whose invert bit disagrees w/ analytic
+    uint64_t lowerOnTiles                = 0;      // childless lower tiles marked interior
+    uint64_t upperOnTiles                = 0;      // childless upper tiles marked interior
 };
 
 std::pair<GridHandleT, UDFSidecarT> computeUDF(
@@ -494,7 +501,9 @@ CCResult computeCC(const GridHandleT& origHandle, const GridHandleT& derivedHand
                const nanovdb::Map&                map,
                [[maybe_unused]] float             bandWidth,    // used only by the OpenVDB cross-check
                const double*                      analyticSpheres,   // numSpheres × {Cx,Cy,Cz,R} world, or nullptr
-               int                                numAnalyticSpheres)
+               int                                numAnalyticSpheres,
+               const double*                      analyticBoxes,     // numBoxes × {Cx,Cy,Cz,halfExtent} world, or nullptr
+               int                                numAnalyticBoxes)
 {
     CCResult result;
     using BuildT = nanovdb::ValueOnIndex;
@@ -532,6 +541,16 @@ CCResult computeCC(const GridHandleT& origHandle, const GridHandleT& derivedHand
     sdf.signBarrier(origHandle.deviceGrid<BuildT>(),
                     static_cast<const uint32_t*>(indexSidecar.deviceData()),
                     dPoints.data().get(), dTriangles.data().get(), map);
+    cudaCheck(cudaDeviceSynchronize());
+
+    // Step 6, chunk A (SDF domain): per-leaf invert masks signing the INACTIVE voxels inside
+    // materialized leaves (bit ON = interior).
+    sdf.fillLeafInvertMask(origHandle.deviceGrid<BuildT>());
+    cudaCheck(cudaDeviceSynchronize());
+
+    // Step 6, chunk B: lower/upper invert masks signing the CHILDLESS coarse tiles (bit ON =
+    // interior). Root level + topology rebuild are chunk C.
+    sdf.fillCoarseInvertMasks(origHandle.deviceGrid<BuildT>());
     cudaCheck(cudaDeviceSynchronize());
 
     const uint32_t leafCount = Traits::getTreeData(d_grid).mNodeCount[0];
@@ -862,13 +881,36 @@ CCResult computeCC(const GridHandleT& origHandle, const GridHandleT& derivedHand
     }
 #endif
 
-    // ---- Optional independent ground truth: analytic signed distance to a UNION of spheres ----
-    // A second, OpenVDB-free check (used by the in-code sphere self-tests): a point is inside the union
-    // iff it is inside ANY ball, so the true signed distance is min_i(|p - Ci| - Ri) world units
-    // (+ outside / - inside). Compare our sign in the confident region (|d| >= √3/2 voxel); the shell is
-    // method-dependent and only reported.
-    if (analyticSpheres && numAnalyticSpheres > 0) {
-        const double vs         = map.getVoxelSize()[0];
+    // ---- Optional independent ground truth: analytic signed distance to a UNION of spheres/boxes ----
+    // A second, OpenVDB-free check (used by the in-code self-tests): a point is inside the union iff it
+    // is inside ANY primitive, so the true signed distance is the min over primitives (+ outside /
+    // - inside). Spheres use |p-C|-R; boxes use the Chebyshev distance max_i|p_i-C_i| - h, whose SIGN is
+    // exact for a box (it underestimates the Euclidean distance outside near corners, which only widens
+    // the tie band — the safe direction). Signs are compared in the confident region (|d| >= √3/2
+    // voxel); the shell is method-dependent and only reported.
+    const bool haveAnalytic = (analyticSpheres && numAnalyticSpheres > 0) ||
+                              (analyticBoxes   && numAnalyticBoxes   > 0);
+    const double vsWorld = map.getVoxelSize()[0];
+    auto analyticDist = [&](double px, double py, double pz) -> double {
+        double dist = HUGE_VAL;  // union = min over primitives
+        for (int s = 0; s < numAnalyticSpheres; ++s) {
+            const double Cx = analyticSpheres[4*s+0], Cy = analyticSpheres[4*s+1],
+                         Cz = analyticSpheres[4*s+2], R  = analyticSpheres[4*s+3];
+            const double di = std::sqrt((px-Cx)*(px-Cx) + (py-Cy)*(py-Cy) + (pz-Cz)*(pz-Cz)) - R;
+            if (di < dist) dist = di;
+        }
+        for (int b = 0; b < numAnalyticBoxes; ++b) {
+            const double ax = std::fabs(px - analyticBoxes[4*b+0]),
+                         ay = std::fabs(py - analyticBoxes[4*b+1]),
+                         az = std::fabs(pz - analyticBoxes[4*b+2]);
+            const double di = std::max(ax, std::max(ay, az)) - analyticBoxes[4*b+3];
+            if (di < dist) dist = di;
+        }
+        return dist;
+    };
+
+    if (haveAnalytic) {
+        const double vs         = vsWorld;
         const double shellWorld = std::sqrt(0.75) * vs;
         std::size_t aMis = 0, aTie = 0, shownA = 0; double maxAVox = 0.0;
         for (uint32_t li = 0; li < origLeafCount; ++li) {
@@ -877,14 +919,7 @@ CCResult computeCC(const GridHandleT& origHandle, const GridHandleT& derivedHand
             for (uint32_t n = 0; n < 512; ++n) {
                 if (!oleaf.isActive(n)) continue;
                 const nanovdb::Coord ijk = o + nanovdb::NanoLeaf<BuildT>::OffsetToLocalCoord(n);
-                const double px = double(ijk[0]) * vs, py = double(ijk[1]) * vs, pz = double(ijk[2]) * vs;
-                double dist = HUGE_VAL;                              // union of balls = min over balls
-                for (int s = 0; s < numAnalyticSpheres; ++s) {
-                    const double Cx = analyticSpheres[4*s+0], Cy = analyticSpheres[4*s+1],
-                                 Cz = analyticSpheres[4*s+2], R  = analyticSpheres[4*s+3];
-                    const double di = std::sqrt((px-Cx)*(px-Cx) + (py-Cy)*(py-Cy) + (pz-Cz)*(pz-Cz)) - R;
-                    if (di < dist) dist = di;
-                }
+                const double dist = analyticDist(double(ijk[0]) * vs, double(ijk[1]) * vs, double(ijk[2]) * vs);
                 const int8_t truth   = (dist < 0.0) ? int8_t(-1) : int8_t(1);
                 const int8_t ourSign = gpuSigned[oleaf.getValue(n)];
                 if (truth == ourSign) continue;
@@ -903,6 +938,126 @@ CCResult computeCC(const GridHandleT& origHandle, const GridHandleT& derivedHand
                   << " (" << origActive << " orig voxels, " << aMis << " mismatches beyond shell";
         if (aMis) std::cout << " (max " << maxAVox << " vox)";
         std::cout << ", " << aTie << " in-shell ties)\n";
+    }
+
+    // ---- Validate the leaf invert mask (pipeline step 6, chunk A) ----
+    // The invert mask signs INACTIVE voxels inside materialized leaves (bit ON = interior). Inactive
+    // voxels sit beyond the narrow band (> bandWidth voxels from the surface), so the analytic union
+    // ground truth is unambiguous — no shell tie band needed: assert bit == (union dist < 0) for every
+    // inactive voxel of every materialized leaf. Deep interior beyond materialized leaves is a later
+    // chunk and is NOT checked here. Without analytic geometry, only the ON-bit count is reported.
+    {
+        std::vector<nanovdb::Mask<3>> invMasks(origLeafCount);
+        cudaCheck(cudaMemcpy(invMasks.data(), sdf.deviceLeafInvertMask(),
+                             std::size_t(origLeafCount) * sizeof(nanovdb::Mask<3>), cudaMemcpyDeviceToHost));
+
+        const double vs = vsWorld;
+        uint64_t nInactive = 0, nOn = 0, activeOnBits = 0;
+        std::size_t invMis = 0, shownI = 0;
+        for (uint32_t li = 0; li < origLeafCount; ++li) {
+            const auto&          oleaf = origLeaves[li];
+            const nanovdb::Coord o     = oleaf.origin();
+            for (uint32_t n = 0; n < 512; ++n) {
+                const bool on = invMasks[li].isOn(n);
+                if (oleaf.isActive(n)) { if (on) ++activeOnBits; continue; }  // active bits must stay OFF
+                ++nInactive;
+                if (on) ++nOn;
+                if (!haveAnalytic) continue;
+                const nanovdb::Coord ijk = o + nanovdb::NanoLeaf<BuildT>::OffsetToLocalCoord(n);
+                const double dist = analyticDist(double(ijk[0]) * vs, double(ijk[1]) * vs, double(ijk[2]) * vs);
+                const bool truth = dist < 0.0;  // analytic interior
+                if (on != truth) {
+                    ++invMis;
+                    if (shownI++ < 10)
+                        std::cerr << "  invert-mask mismatch @ (" << ijk[0] << "," << ijk[1] << "," << ijk[2]
+                                  << ") bit=" << int(on) << " truth=" << int(truth)
+                                  << " d=" << dist << " (" << dist / vs << " vox)\n";
+                }
+            }
+        }
+
+        result.invertOnBits = nOn;
+        if (haveAnalytic) {
+            result.invertChecked    = true;
+            result.invertMismatches = invMis + activeOnBits;  // stray active bits are also defects
+            std::cout << "Leaf invert-mask validation:            "
+                      << ((invMis == 0 && activeOnBits == 0) ? "PASS" : "FAIL") << " ("
+                      << nInactive << " inactive voxels in " << origLeafCount << " leaves, "
+                      << nOn << " marked interior, " << invMis << " mismatches, "
+                      << activeOnBits << " stray active bits)\n";
+        } else {
+            std::cout << "Leaf invert-mask report:                " << nOn << " / " << nInactive
+                      << " inactive voxels marked interior (" << origLeafCount << " leaves"
+                      << (activeOnBits ? ", " + std::to_string(activeOnBits) + " STRAY ACTIVE BITS" : "")
+                      << ")\n";
+        }
+    }
+
+    // ---- Validate the coarse (lower/upper) invert masks (pipeline step 6, chunk B) ----
+    // A childless tile is uniform-sign (a surface crossing it would force refinement), so its bit must
+    // equal the analytic sign at the TILE CENTER: bit == (analyticDist(center) < 0). Checked for every
+    // childless child slot of every materialized lower (8^3-voxel tiles) and upper (128^3-voxel tiles)
+    // node; refined slots carry no bit. Stray bits on refined slots are also defects. Root-level tiles
+    // are chunk C. Without analytic geometry, only ON-tile counts are reported.
+    {
+        const uint32_t lowerCount = h_orig->tree().nodeCount(1);
+        const uint32_t upperCount = h_orig->tree().nodeCount(2);
+        std::vector<nanovdb::Mask<4>> lowInv(lowerCount);
+        std::vector<nanovdb::Mask<5>> upInv(upperCount);
+        if (lowerCount) cudaCheck(cudaMemcpy(lowInv.data(), sdf.deviceLowerInvertMask(),
+                                  std::size_t(lowerCount) * sizeof(nanovdb::Mask<4>), cudaMemcpyDeviceToHost));
+        if (upperCount) cudaCheck(cudaMemcpy(upInv.data(), sdf.deviceUpperInvertMask(),
+                                  std::size_t(upperCount) * sizeof(nanovdb::Mask<5>), cudaMemcpyDeviceToHost));
+
+        uint64_t lChildless = 0, lOn = 0, uChildless = 0, uOn = 0, strayRefined = 0;
+        std::size_t coarseMis = 0, shownC = 0;
+        // One pass per level; the two levels differ only in node type / slot count / tile dim.
+        auto checkLevel = [&](const auto* nodes, uint32_t count, const auto* inv, int slots,
+                              int tileDim, uint64_t& childless, uint64_t& onCount, const char* lvl) {
+            for (uint32_t ni = 0; ni < count; ++ni) {
+                const auto& node = nodes[ni];
+                for (int n = 0; n < slots; ++n) {
+                    const bool on = inv[ni].isOn(uint32_t(n));
+                    if (node.childMask().isOn(uint32_t(n))) { if (on) ++strayRefined; continue; }
+                    ++childless;
+                    if (on) ++onCount;
+                    if (!haveAnalytic) continue;
+                    const nanovdb::Coord g = node.offsetToGlobalCoord(uint32_t(n));  // tile origin (voxels)
+                    const double half = 0.5 * double(tileDim - 1);
+                    const double dist = analyticDist((double(g[0]) + half) * vsWorld,
+                                                     (double(g[1]) + half) * vsWorld,
+                                                     (double(g[2]) + half) * vsWorld);
+                    const bool truth = dist < 0.0;
+                    if (on != truth) {
+                        ++coarseMis;
+                        if (shownC++ < 10)
+                            std::cerr << "  coarse invert mismatch @ " << lvl << " tile (" << g[0] << ","
+                                      << g[1] << "," << g[2] << ")+" << tileDim << ": bit=" << int(on)
+                                      << " truth=" << int(truth) << " d=" << dist / vsWorld << " vox\n";
+                    }
+                }
+            }
+        };
+        checkLevel(h_orig->tree().template getFirstNode<1>(), lowerCount, lowInv.data(), 4096,   8, lChildless, lOn, "lower");
+        checkLevel(h_orig->tree().template getFirstNode<2>(), upperCount, upInv.data(), 32768, 128, uChildless, uOn, "upper");
+
+        result.lowerOnTiles = lOn;
+        result.upperOnTiles = uOn;
+        if (haveAnalytic) {
+            result.coarseInvertChecked    = true;
+            result.coarseInvertMismatches = coarseMis + strayRefined;
+            std::cout << "Coarse invert-mask validation:          "
+                      << ((coarseMis == 0 && strayRefined == 0) ? "PASS" : "FAIL") << " ("
+                      << lChildless << " lower + " << uChildless << " upper childless tiles, "
+                      << lOn << "+" << uOn << " marked interior, " << coarseMis << " mismatches, "
+                      << strayRefined << " stray refined bits)\n";
+        } else {
+            std::cout << "Coarse invert-mask report:              lower " << lOn << " / " << lChildless
+                      << ", upper " << uOn << " / " << uChildless << " childless tiles marked interior ("
+                      << lowerCount << "+" << upperCount << " nodes"
+                      << (strayRefined ? ", " + std::to_string(strayRefined) + " STRAY REFINED BITS" : "")
+                      << ")\n";
+        }
     }
 
     cudaCheck(cudaFreeHost(origBlob));

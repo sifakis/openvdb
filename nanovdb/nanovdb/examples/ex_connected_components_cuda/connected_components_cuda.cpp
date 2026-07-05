@@ -39,6 +39,13 @@ struct CCResult {
     bool     analyticChecked             = false;
     uint64_t analyticConfidentMismatches = 0;
     uint64_t analyticInShellTies         = 0;
+    bool     invertChecked               = false;
+    uint64_t invertMismatches            = 0;
+    uint64_t invertOnBits                = 0;
+    bool     coarseInvertChecked         = false;
+    uint64_t coarseInvertMismatches      = 0;
+    uint64_t lowerOnTiles                = 0;
+    uint64_t upperOnTiles                = 0;
 };
 
 /// @brief Implemented on the CUDA side (connected_components_cuda_kernels.cu):
@@ -81,7 +88,9 @@ GridHandleT computeDerivedTopology(const GridHandleT& srcHandle, const UDFSideca
 /// @param points,triangles,map  the source mesh + transform (re-uploaded for barrier signing).
 /// @param bandWidth     narrow-band width (voxels); also the half-width for the OpenVDB sign cross-check.
 /// @param analyticSpheres optional numSpheres × {Cx,Cy,Cz,R} (world) enabling the analytic union sign
-///                        check (inside iff inside any ball: min_i(|p-Ci|-Ri)); else nullptr.
+///                        check (inside iff inside any primitive); else nullptr.
+/// @param analyticBoxes   optional numBoxes × {Cx,Cy,Cz,halfExtent} (world) axis-aligned cubes added
+///                        to the analytic union (Chebyshev distance — exact sign); else nullptr.
 CCResult computeCC(const GridHandleT& origHandle, const GridHandleT& derivedHandle,
                const IndexSidecarT&               indexSidecar,
                const std::vector<nanovdb::Vec3f>& points,
@@ -89,7 +98,9 @@ CCResult computeCC(const GridHandleT& origHandle, const GridHandleT& derivedHand
                const nanovdb::Map&                map,
                float                              bandWidth,
                const double*                      analyticSpheres = nullptr,
-               int                                numAnalyticSpheres = 0);
+               int                                numAnalyticSpheres = 0,
+               const double*                      analyticBoxes = nullptr,
+               int                                numAnalyticBoxes = 0);
 
 /// @brief Minimal Wavefront .obj reader (vertices + faces) using NanoVDB types.
 ///
@@ -198,7 +209,8 @@ static CCResult runPipeline(const std::string& name,
                             const std::vector<nanovdb::Vec3f>& points,
                             const std::vector<nanovdb::Vec3i>& triangles,
                             float voxelSize, float bandWidth,
-                            const double* analyticSpheres, int numAnalyticSpheres)
+                            const double* analyticSpheres, int numAnalyticSpheres,
+                            const double* analyticBoxes = nullptr, int numAnalyticBoxes = 0)
 {
     std::cout << "\n================ " << name << " : " << points.size() << " verts, "
               << triangles.size() << " tris (voxelSize=" << voxelSize
@@ -209,7 +221,7 @@ static CCResult runPipeline(const std::string& name,
     printGridDiagnostics(handle, name + " UDF grid");
     auto derivedHandle = computeDerivedTopology(handle, sidecar, voxelSize);
     return computeCC(handle, derivedHandle, indexSidecar, points, triangles, map, bandWidth,
-                     analyticSpheres, numAnalyticSpheres);
+                     analyticSpheres, numAnalyticSpheres, analyticBoxes, numAnalyticBoxes);
 }
 
 /// @brief Run the in-code analytic self-tests (cube + sphere). Returns the number of failed checks.
@@ -224,10 +236,17 @@ static int runSelfTests(const std::string& which, float voxelSize, float bandWid
     if (which == "--cube" || which == "--selftest") {
         std::vector<nanovdb::Vec3f> P; std::vector<nanovdb::Vec3i> T;
         makeCube(voxelSize, 15.0f * voxelSize, P, T);          // half-size ~15 voxels
-        const CCResult r = runPipeline("CUBE", P, T, voxelSize, bandWidth, nullptr, 0);
+        // Analytic ground truth: axis-aligned box, center = the +0.5-voxel shift, half = snapped h.
+        const double s = 0.5 * voxelSize;
+        const double h = std::round(15.0) * voxelSize;         // same snap as makeCube
+        const double box[4] = { s, s, s, h };
+        const CCResult r = runPipeline("CUBE", P, T, voxelSize, bandWidth, nullptr, 0, box, 1);
         std::cout << "  cube assertions:\n";
         check("exactly 2 CC global components", r.globalComponents == 2);
         if (r.openvdbChecked) check("0 confident-region OpenVDB sign mismatches", r.confidentSignMismatches == 0);
+        if (r.analyticChecked) check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
+        check("0 leaf invert-mask mismatches (inactive voxels)", r.invertChecked && r.invertMismatches == 0);
+        check("0 coarse invert-mask mismatches (childless tiles)", r.coarseInvertChecked && r.coarseInvertMismatches == 0);
     }
 
     if (which == "--sphere" || which == "--selftest") {
@@ -242,6 +261,27 @@ static int runSelfTests(const std::string& which, float voxelSize, float bandWid
         check("exactly 2 CC global components", r.globalComponents == 2);
         if (r.openvdbChecked) check("0 confident-region OpenVDB sign mismatches", r.confidentSignMismatches == 0);
         if (r.analyticChecked) check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
+        check("0 leaf invert-mask mismatches (inactive voxels)", r.invertChecked && r.invertMismatches == 0);
+        check("0 coarse invert-mask mismatches (childless tiles)", r.coarseInvertChecked && r.coarseInvertMismatches == 0);
+    }
+
+    // R = 230 voxels: big enough that fully-interior 128^3-aligned regions exist, so childless UPPER
+    // tiles get marked interior (the R=20 sphere only exercises the exterior/OFF path at upper level).
+    if (which == "--big-sphere" || which == "--selftest") {
+        std::vector<nanovdb::Vec3f> P; std::vector<nanovdb::Vec3i> T;
+        const float s = 0.5f * voxelSize;
+        const nanovdb::Vec3f C(s, s, s);
+        const float R = 230.0f * voxelSize;
+        makeUVSphere(C, R, 256, 512, P, T);                    // facet error ~0.02 voxels
+        const double sphere[4] = { double(C[0]), double(C[1]), double(C[2]), double(R) };
+        const CCResult r = runPipeline("BIG-SPHERE", P, T, voxelSize, bandWidth, sphere, 1);
+        std::cout << "  big-sphere assertions:\n";
+        check("exactly 2 CC global components", r.globalComponents == 2);
+        if (r.openvdbChecked) check("0 confident-region OpenVDB sign mismatches", r.confidentSignMismatches == 0);
+        if (r.analyticChecked) check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
+        check("0 leaf invert-mask mismatches (inactive voxels)", r.invertChecked && r.invertMismatches == 0);
+        check("0 coarse invert-mask mismatches (childless tiles)", r.coarseInvertChecked && r.coarseInvertMismatches == 0);
+        check("some interior upper tiles exist (test is exercising the upper ON path)", r.upperOnTiles > 0);
     }
 
     // Probe of the single-seed exterior rule (global min-x component = exterior, all others = interior):
@@ -287,13 +327,14 @@ int main(int argc, char* argv[])
     try {
         if (argc < 2)
             throw std::runtime_error("usage: " + std::string(argv[0]) +
-                                     " <input.obj | --cube | --sphere | --selftest | --two-spheres>"
-                                     " [voxelSize] [bandWidth]");
+                                     " <input.obj | --cube | --sphere | --big-sphere | --selftest |"
+                                     " --two-spheres> [voxelSize] [bandWidth]");
 
         const std::string arg1 = argv[1];
 
         // In-code analytic self-tests / probes (no .obj). Default voxelSize 0.02.
-        if (arg1 == "--cube" || arg1 == "--sphere" || arg1 == "--selftest" || arg1 == "--two-spheres") {
+        if (arg1 == "--cube" || arg1 == "--sphere" || arg1 == "--big-sphere" ||
+            arg1 == "--selftest" || arg1 == "--two-spheres") {
             const float vs = (argc > 2) ? std::stof(argv[2]) : 0.02f;
             const float bw = (argc > 3) ? std::stof(argv[3]) : 3.0f;
             return runSelfTests(arg1, vs, bw) == 0 ? 0 : 1;

@@ -320,8 +320,9 @@ struct FillLeafInvertMaskFunctor
 
 /// @brief Descend root -> upper -> lower for the 8^3 leaf-region at coord @a c and report where the
 ///        finest CHILDLESS tile containing it lives (the face->coarser seeding target, plan §7a).
-/// @return 0 = skip: root-level tile / unmapped space (chunk C) or refined all the way to a leaf
-///         (handled at the finer level); 1 = childless LOWER slot; 2 = childless UPPER slot.
+/// @return 0 = skip: root-level value tile or refined all the way to a leaf (handled at the finer
+///         level); 1 = childless LOWER slot; 2 = childless UPPER slot; 3 = ABSENT root region (no
+///         root tile at all — the chunk-C root-cell target, cell = floorDiv(c,4096) per axis).
 ///         On 1/2, @a nodeIdx = linear node index at that level and @a slot = child-slot offset.
 template <typename BuildT>
 __hostdev__ inline int
@@ -332,7 +333,8 @@ probeChildlessSlot(const NanoGrid<BuildT>& grid, const nanovdb::Coord& c,
     using LowerT = NanoLower<BuildT>;
     const auto& tree = grid.tree();
     const auto* tile = tree.root().probeTile(c);
-    if (!tile || !tile->isChild()) return 0;                    // root-level: deferred to chunk C
+    if (!tile) return 3;                                        // absent root region (chunk C)
+    if (!tile->isChild()) return 0;                             // root-level value tile: skip
     const UpperT* upper = tree.root().getChild(tile);
     const LowerT* lower = upper->probeChild(c);
     if (!lower) {                                               // childless upper slot
@@ -532,6 +534,214 @@ struct CoarseInvertFloodFunctor
     }
 };
 
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Step 6, chunk C (root level): the deep interior beyond any upper node is represented in a small
+// provisional P×Q×R cell array over the grid's root-tile bounding range (one cell per 4096^3 root
+// region) — a SIDECAR consulted by signedSignAt(); the grid itself is never mutated.
+
+/// @brief Mark the WALL cells of the root-cell array: cells whose 4096^3 region has a pre-existing
+///        root entry (an upper child — the band passes through). One thread per cell via lambdaKernel.
+template <typename BuildT>
+struct RootWallMarkFunctor
+{
+    const NanoGrid<BuildT>* dGrid;
+    uint8_t*                dWall;
+    nanovdb::Coord          tileMin;  // root-cell range origin, in 4096-tile units
+    nanovdb::Coord          dims;     // P×Q×R
+
+    __device__ void operator()(size_t idx) const
+    {
+        const int k = int(idx) % dims[2], j = (int(idx) / dims[2]) % dims[1], i = int(idx) / (dims[1] * dims[2]);
+        const nanovdb::Coord c((tileMin[0] + i) << 12, (tileMin[1] + j) << 12, (tileMin[2] + k) << 12);
+        const auto* tile = dGrid->tree().root().probeTile(c);
+        dWall[idx] = (tile && tile->isChild()) ? 1 : 0;
+    }
+};
+
+/// @brief Chunk-C seeding: accumulate interior/exterior evidence from node faces that abut an ABSENT
+///        root region, from ALL THREE levels (a deep-interior root cell can be abutted by a childless
+///        upper tile, a childless lower tile, OR a leaf's inactive-interior voxels — seeding from the
+///        upper level alone would miss the finer abutments). One block per node; face cells classified
+///        exactly as in the chunk-B seed functors (leaf: sign / leaf-invert; lower/upper: childless
+///        slot invert bit, refined slots skipped); each whole face abuts exactly ONE root cell, probed
+///        once. Out-of-range cells (beyond the array) are skipped — they stay exterior by default.
+///        // classification duplicated from Leaf/LowerFaceSeedFunctor — keep in sync
+template <typename BuildT, int LEVEL>  // 0 = leaf, 1 = lower, 2 = upper
+struct RootFaceSeedFunctor
+{
+    static constexpr int MaxThreadsPerBlock         = (LEVEL == 0) ? 384 : 512;
+    static constexpr int MinBlocksPerMultiprocessor = 1;
+    static constexpr int NODE_DIM = (LEVEL == 0) ? 8 : (LEVEL == 1) ? 128 : 4096;
+
+    __device__ void operator()(const NanoGrid<BuildT>*  d_grid,
+                               const int8_t*            d_sign,
+                               const nanovdb::Mask<3>*  d_leafInvert,
+                               const nanovdb::Mask<4>*  d_lowerInvert,
+                               const nanovdb::Mask<5>*  d_upperInvert,
+                               uint8_t* d_sawInt, uint8_t* d_sawExt,
+                               nanovdb::Coord tileMin, nanovdb::Coord dims)
+    {
+        const int nodeID = blockIdx.x, t = threadIdx.x;
+        const auto& node = d_grid->tree().template getFirstNode<LEVEL>()[nodeID];
+
+        __shared__ int sInt[6], sExt[6];
+        if (t < 6) { sInt[t] = 0; sExt[t] = 0; }
+        __syncthreads();
+
+        if constexpr (LEVEL == 0) {
+            const int face = t >> 6, a = (t >> 3) & 7, b = t & 7;
+            int n;
+            switch (face) {
+                case 0:  n = (0 << 6) | (a << 3) | b; break;
+                case 1:  n = (7 << 6) | (a << 3) | b; break;
+                case 2:  n = (a << 6) | (0 << 3) | b; break;
+                case 3:  n = (a << 6) | (7 << 3) | b; break;
+                case 4:  n = (a << 6) | (b << 3) | 0; break;
+                default: n = (a << 6) | (b << 3) | 7; break;
+            }
+            const bool act      = node.isActive(uint32_t(n));
+            const bool interior = act ? (d_sign[node.getValue(uint32_t(n))] == int8_t(-1))
+                                      : d_leafInvert[nodeID].isOn(uint32_t(n));
+            if (interior) sInt[face] = 1; else sExt[face] = 1;
+        } else if constexpr (LEVEL == 1) {
+            for (int u = t; u < 6 * 256; u += blockDim.x) {
+                const int face = u >> 8, a = (u >> 4) & 15, b = u & 15;
+                int n;
+                switch (face) {
+                    case 0:  n = ( 0 << 8) | (a << 4) | b; break;
+                    case 1:  n = (15 << 8) | (a << 4) | b; break;
+                    case 2:  n = (a << 8) | ( 0 << 4) | b; break;
+                    case 3:  n = (a << 8) | (15 << 4) | b; break;
+                    case 4:  n = (a << 8) | (b << 4) |  0; break;
+                    default: n = (a << 8) | (b << 4) | 15; break;
+                }
+                if (node.childMask().isOn(uint32_t(n))) continue;  // refined: finer level contributes
+                if (d_lowerInvert[nodeID].isOn(uint32_t(n))) sInt[face] = 1; else sExt[face] = 1;
+            }
+        } else {
+            for (int u = t; u < 6 * 1024; u += blockDim.x) {
+                const int face = u >> 10, a = (u >> 5) & 31, b = u & 31;
+                int n;
+                switch (face) {
+                    case 0:  n = ( 0 << 10) | (a << 5) | b; break;
+                    case 1:  n = (31 << 10) | (a << 5) | b; break;
+                    case 2:  n = (a << 10) | ( 0 << 5) | b; break;
+                    case 3:  n = (a << 10) | (31 << 5) | b; break;
+                    case 4:  n = (a << 10) | (b << 5) |  0; break;
+                    default: n = (a << 10) | (b << 5) | 31; break;
+                }
+                if (node.childMask().isOn(uint32_t(n))) continue;
+                if (d_upperInvert[nodeID].isOn(uint32_t(n))) sInt[face] = 1; else sExt[face] = 1;
+            }
+        }
+        __syncthreads();
+
+        if (t < 6) {  // one probe per face: the whole face abuts exactly one root cell
+            const int off[6][3] = {{-NODE_DIM,0,0},{NODE_DIM,0,0},{0,-NODE_DIM,0},{0,NODE_DIM,0},{0,0,-NODE_DIM},{0,0,NODE_DIM}};
+            const nanovdb::Coord c = node.origin().offsetBy(off[t][0], off[t][1], off[t][2]);
+            uint64_t nodeIdx; uint32_t slot;
+            if (probeChildlessSlot(*d_grid, c, nodeIdx, slot) == 3) {  // absent root region
+                const int i = (c[0] >> 12) - tileMin[0], j = (c[1] >> 12) - tileMin[1], k = (c[2] >> 12) - tileMin[2];
+                if (i >= 0 && i < dims[0] && j >= 0 && j < dims[1] && k >= 0 && k < dims[2]) {
+                    const int idx = (i * dims[1] + j) * dims[2] + k;
+                    if (sInt[t]) d_sawInt[idx] = 1;  // benign race: all writers store 1
+                    if (sExt[t]) d_sawExt[idx] = 1;
+                }
+            }
+        }
+    }
+};
+
+/// @brief Chunk-C multi-seed flood on the P×Q×R root-cell array (single block; the array is a handful
+///        of cells). Seed = sawInterior && !sawExterior && !wall (mixed evidence => exterior, the safe
+///        side); then flood ON among non-wall cells over 6-adjacency — WALL cells (pre-existing root
+///        entries) block. Every interior-abutting cell seeds (multi-seed), so disconnected interiors
+///        all fill. The surface at 4096 granularity always lies inside a wall cell, so the flood
+///        cannot leak interior -> exterior. Grid-independent (plain arrays) so it is unit-testable.
+struct RootInteriorFloodFunctor
+{
+    static constexpr int MaxThreadsPerBlock         = 256;
+    static constexpr int MinBlocksPerMultiprocessor = 1;
+
+    __device__ void operator()(const uint8_t* d_wall, const uint8_t* d_sawInt, const uint8_t* d_sawExt,
+                               uint8_t* d_on, nanovdb::Coord dims)
+    {
+        const int t = threadIdx.x;
+        const int P = dims[0], Q = dims[1], R = dims[2], total = P * Q * R;
+        __shared__ int sChanged;
+
+        for (int c = t; c < total; c += blockDim.x)
+            d_on[c] = (!d_wall[c] && d_sawInt[c] && !d_sawExt[c]) ? 1 : 0;
+        __syncthreads();
+
+        for (int it = 0; it < total + 2; ++it) {  // cap: any path length < total cells
+            if (t == 0) sChanged = 0;
+            __syncthreads();
+            bool any = false;
+            for (int c = t; c < total; c += blockDim.x) {
+                if (d_wall[c] || d_on[c]) continue;
+                const int k = c % R, j = (c / R) % Q, i = c / (Q * R);
+                const bool on =
+                    (i > 0     && d_on[c - Q * R]) || (i < P - 1 && d_on[c + Q * R]) ||
+                    (j > 0     && d_on[c - R])     || (j < Q - 1 && d_on[c + R])     ||
+                    (k > 0     && d_on[c - 1])     || (k < R - 1 && d_on[c + 1]);
+                if (on) { d_on[c] = 1; any = true; }  // monotone: racy same-sweep reads only accelerate
+            }
+            if (any) sChanged = 1;
+            __syncthreads();
+            const bool done = (sChanged == 0);  // latch, then barrier: next-iter reset can't race the read
+            __syncthreads();
+            if (done) break;
+        }
+    }
+};
+
+/// @brief Full-domain sign query (host + device): the completed level-set sign at ANY index coord,
+///        composed from the grid plus the step-6 sidecars — no grid mutation anywhere. Descends:
+///          active voxel            -> sign sidecar (±1)
+///          inactive leaf voxel     -> leaf invert bit
+///          childless lower slot    -> lower invert bit
+///          childless upper slot    -> upper invert bit
+///          ABSENT root region      -> root-interior sidecar (in-range && ON => interior, else exterior)
+/// @return +1 outside / -1 inside.
+template <typename BuildT>
+__hostdev__ inline int8_t
+signedSignAt(const NanoGrid<BuildT>& grid, const nanovdb::Coord& ijk,
+             const int8_t* sign, const nanovdb::Mask<3>* leafInvert,
+             const nanovdb::Mask<4>* lowerInvert, const nanovdb::Mask<5>* upperInvert,
+             const uint8_t* rootInterior, const nanovdb::Coord& rootTileMin, const nanovdb::Coord& rootDims)
+{
+    using UpperT = NanoUpper<BuildT>;
+    using LowerT = NanoLower<BuildT>;
+    using LeafT  = NanoLeaf<BuildT>;
+    const auto& tree = grid.tree();
+    const auto* tile = tree.root().probeTile(ijk);
+    if (!tile || !tile->isChild()) {  // absent root region (or root value tile): consult the sidecar
+        const int i = (ijk[0] >> 12) - rootTileMin[0],
+                  j = (ijk[1] >> 12) - rootTileMin[1],
+                  k = (ijk[2] >> 12) - rootTileMin[2];
+        const bool interior = rootInterior &&
+            i >= 0 && i < rootDims[0] && j >= 0 && j < rootDims[1] && k >= 0 && k < rootDims[2] &&
+            rootInterior[(i * rootDims[1] + j) * rootDims[2] + k];
+        return interior ? int8_t(-1) : int8_t(1);
+    }
+    const UpperT* upper = tree.root().getChild(tile);
+    const LowerT* lower = upper->probeChild(ijk);
+    if (!lower) {
+        const uint64_t u = util::PtrDiff(upper, tree.template getFirstNode<2>()) / sizeof(UpperT);
+        return upperInvert[u].isOn(UpperT::CoordToOffset(ijk)) ? int8_t(-1) : int8_t(1);
+    }
+    const LeafT* leaf = lower->probeChild(ijk);
+    if (!leaf) {
+        const uint64_t l = util::PtrDiff(lower, tree.template getFirstNode<1>()) / sizeof(LowerT);
+        return lowerInvert[l].isOn(LowerT::CoordToOffset(ijk)) ? int8_t(-1) : int8_t(1);
+    }
+    const uint32_t n = LeafT::CoordToOffset(ijk);
+    if (leaf->isActive(n)) return sign[leaf->getValue(n)];
+    const uint64_t lf = util::PtrDiff(leaf, tree.template getFirstNode<0>()) / sizeof(LeafT);
+    return leafInvert[lf].isOn(n) ? int8_t(-1) : int8_t(1);
+}
+
 } // namespace sdf_detail
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -612,6 +822,15 @@ public:
     /// @param d_grid the original (fully signed) device grid.
     void fillCoarseInvertMasks(const GridT* d_grid);
 
+    /// @brief Step 6 (chunk C, root level): build the root-interior SIDECAR that signs the deep
+    ///        interior beyond any upper node. A small P×Q×R cell array over the grid's root-tile
+    ///        bounding range (one uint8 per 4096^3 root region): pre-existing root entries are walls,
+    ///        faces from ALL THREE levels seed interior evidence into abutting ABSENT cells, and a
+    ///        multi-seed flood fills enclosed interiors. The GRID IS NOT MUTATED — queries consult the
+    ///        sidecar via sdf_detail::signedSignAt(). Requires fillCoarseInvertMasks() first.
+    /// @param d_grid the original (fully signed) device grid.
+    void fillRootInteriorMask(const GridT* d_grid);
+
     /// @brief Device pointer to the per-active-voxel sign array (+1 exterior / -1 interior),
     ///        valid after signNonBarrier(). Length activeVoxelCount+1, indexed by leaf.getValue(n);
     ///        slot 0 is the background (+1).
@@ -647,6 +866,17 @@ public:
     ///        is interior; OFF means exterior. Refined slots carry no invert bit.
     nanovdb::Mask<5>* deviceUpperInvertMask() { return static_cast<nanovdb::Mask<5>*>(mUpperInvertMask.deviceData()); }
 
+    /// @brief Device pointer to the root-interior sidecar (rootTileDims() cells, one uint8 per 4096^3
+    ///        root region; 1 = deep interior), valid after fillRootInteriorMask(). Cell (i,j,k) covers
+    ///        the root region at (rootTileMin()+(i,j,k))*4096. Cells outside the array are exterior.
+    uint8_t* deviceRootInterior() { return static_cast<uint8_t*>(mRootInterior.deviceData()); }
+
+    /// @brief Origin of the root-cell array, in 4096-tile units (valid after fillRootInteriorMask()).
+    nanovdb::Coord rootTileMin() const { return mRootTileMin; }
+
+    /// @brief Dimensions P×Q×R of the root-cell array (valid after fillRootInteriorMask()).
+    nanovdb::Coord rootTileDims() const { return mRootDims; }
+
 private:
 
     cudaStream_t                 mStream{0};
@@ -660,6 +890,9 @@ private:
     nanovdb::cuda::DeviceBuffer  mLeafInvertMask;    // nodeCount[0] × Mask<3>: inactive-voxel interior bits
     nanovdb::cuda::DeviceBuffer  mLowerInvertMask;   // nodeCount[1] × Mask<4>: childless-lower-tile interior bits
     nanovdb::cuda::DeviceBuffer  mUpperInvertMask;   // nodeCount[2] × Mask<5>: childless-upper-tile interior bits
+    nanovdb::cuda::DeviceBuffer  mRootInterior;      // P×Q×R × uint8: deep-interior bits of absent root regions
+    nanovdb::Coord               mRootTileMin{0, 0, 0};  // root-cell array origin (4096-tile units)
+    nanovdb::Coord               mRootDims{0, 0, 0};     // root-cell array dims P×Q×R
 
 }; // tools::cuda::MeshToSDF<BuildT>
 
@@ -888,6 +1121,79 @@ void MeshToSDF<BuildT>::fillCoarseInvertMasks(const GridT* d_grid)
     // The evidence accumulators go out of scope here; sync so their frees can't outrun the kernels.
     cudaCheck(cudaStreamSynchronize(mStream));
 }// MeshToSDF<BuildT>::fillCoarseInvertMasks
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+template <typename BuildT>
+void MeshToSDF<BuildT>::fillRootInteriorMask(const GridT* d_grid)
+{
+    const auto     treeData   = util::cuda::DeviceGridTraits<BuildT>::getTreeData(d_grid);
+    const uint32_t leafCount  = treeData.mNodeCount[0];
+    const uint32_t lowerCount = treeData.mNodeCount[1];
+    const uint32_t upperCount = treeData.mNodeCount[2];
+    if (leafCount == 0) { mRootInterior = nanovdb::cuda::DeviceBuffer(); mRootDims = nanovdb::Coord(0); return; }
+
+    // C1: provisional cell range = the grid bbox at root-tile (4096^3) granularity. >>12 is floor
+    // division by 4096 for negative coords too (arithmetic shift).
+    const auto bbox = util::cuda::DeviceGridTraits<BuildT>::getIndexBBox(d_grid, treeData);
+    mRootTileMin = nanovdb::Coord(bbox.min()[0] >> 12, bbox.min()[1] >> 12, bbox.min()[2] >> 12);
+    const nanovdb::Coord tileMax(bbox.max()[0] >> 12, bbox.max()[1] >> 12, bbox.max()[2] >> 12);
+    mRootDims = nanovdb::Coord(tileMax[0] - mRootTileMin[0] + 1,
+                               tileMax[1] - mRootTileMin[1] + 1,
+                               tileMax[2] - mRootTileMin[2] + 1);
+    const std::size_t total = std::size_t(mRootDims[0]) * mRootDims[1] * mRootDims[2];
+
+    mRootInterior    = nanovdb::cuda::DeviceBuffer::create(total, nullptr, false);
+    auto wallBuf     = nanovdb::cuda::DeviceBuffer::create(total, nullptr, false);
+    auto sawIntBuf   = nanovdb::cuda::DeviceBuffer::create(total, nullptr, false);
+    auto sawExtBuf   = nanovdb::cuda::DeviceBuffer::create(total, nullptr, false);
+    auto* d_wall     = static_cast<uint8_t*>(wallBuf.deviceData());
+    auto* d_sawInt   = static_cast<uint8_t*>(sawIntBuf.deviceData());
+    auto* d_sawExt   = static_cast<uint8_t*>(sawExtBuf.deviceData());
+    cudaCheck(cudaMemsetAsync(mRootInterior.deviceData(), 0, total, mStream));
+    cudaCheck(cudaMemsetAsync(d_wall,   0, total, mStream));
+    cudaCheck(cudaMemsetAsync(d_sawInt, 0, total, mStream));
+    cudaCheck(cudaMemsetAsync(d_sawExt, 0, total, mStream));
+
+    if (mVerbose==1) mTimer.start("Root interior: mark walls + seed + flood");
+
+    // C1: walls = pre-existing root entries.
+    constexpr unsigned int kWallThreads = 128;
+    util::cuda::lambdaKernel<<<unsigned((total + kWallThreads - 1) / kWallThreads), kWallThreads, 0, mStream>>>(
+        total, sdf_detail::RootWallMarkFunctor<BuildT>{ d_grid, d_wall, mRootTileMin, mRootDims });
+    cudaCheckError();
+
+    // C2: interior/exterior evidence from ALL THREE levels into abutting absent root cells.
+    using Seed0 = sdf_detail::RootFaceSeedFunctor<BuildT, 0>;
+    using Seed1 = sdf_detail::RootFaceSeedFunctor<BuildT, 1>;
+    using Seed2 = sdf_detail::RootFaceSeedFunctor<BuildT, 2>;
+    util::cuda::operatorKernel<Seed0><<<leafCount, Seed0::MaxThreadsPerBlock, 0, mStream>>>(
+        d_grid, deviceSignedVoxelSign(), deviceLeafInvertMask(), deviceLowerInvertMask(),
+        deviceUpperInvertMask(), d_sawInt, d_sawExt, mRootTileMin, mRootDims);
+    cudaCheckError();
+    if (lowerCount) {
+        util::cuda::operatorKernel<Seed1><<<lowerCount, Seed1::MaxThreadsPerBlock, 0, mStream>>>(
+            d_grid, deviceSignedVoxelSign(), deviceLeafInvertMask(), deviceLowerInvertMask(),
+            deviceUpperInvertMask(), d_sawInt, d_sawExt, mRootTileMin, mRootDims);
+        cudaCheckError();
+    }
+    if (upperCount) {
+        util::cuda::operatorKernel<Seed2><<<upperCount, Seed2::MaxThreadsPerBlock, 0, mStream>>>(
+            d_grid, deviceSignedVoxelSign(), deviceLeafInvertMask(), deviceLowerInvertMask(),
+            deviceUpperInvertMask(), d_sawInt, d_sawExt, mRootTileMin, mRootDims);
+        cudaCheckError();
+    }
+
+    // C3: gate + multi-seed flood (single block; the array is a handful of cells).
+    using FloodOp = sdf_detail::RootInteriorFloodFunctor;
+    util::cuda::operatorKernel<FloodOp><<<1, FloodOp::MaxThreadsPerBlock, 0, mStream>>>(
+        d_wall, d_sawInt, d_sawExt, deviceRootInterior(), mRootDims);
+    cudaCheckError();
+    if (mVerbose==1) mTimer.stop();
+
+    // Temporaries go out of scope here; sync so their frees can't outrun the kernels.
+    cudaCheck(cudaStreamSynchronize(mStream));
+}// MeshToSDF<BuildT>::fillRootInteriorMask
 
 } // namespace tools::cuda
 

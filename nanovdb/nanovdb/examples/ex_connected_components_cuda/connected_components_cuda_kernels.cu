@@ -57,6 +57,10 @@ struct CCResult {
     uint64_t coarseInvertMismatches      = 0;      // childless tiles whose invert bit disagrees w/ analytic
     uint64_t lowerOnTiles                = 0;      // childless lower tiles marked interior
     uint64_t upperOnTiles                = 0;      // childless upper tiles marked interior
+    uint64_t rootInteriorCells           = 0;      // absent root cells marked deep-interior (chunk C)
+    bool     fullDomainChecked           = false;  // full-domain signedSignAt sweep ran (chunk C)
+    uint64_t fullDomainMismatches        = 0;      // sampled coords whose queried sign disagrees w/ analytic
+    uint64_t fullDomainTies              = 0;      // sampled coords within the on-surface tie band
 };
 
 std::pair<GridHandleT, UDFSidecarT> computeUDF(
@@ -549,8 +553,13 @@ CCResult computeCC(const GridHandleT& origHandle, const GridHandleT& derivedHand
     cudaCheck(cudaDeviceSynchronize());
 
     // Step 6, chunk B: lower/upper invert masks signing the CHILDLESS coarse tiles (bit ON =
-    // interior). Root level + topology rebuild are chunk C.
+    // interior).
     sdf.fillCoarseInvertMasks(origHandle.deviceGrid<BuildT>());
+    cudaCheck(cudaDeviceSynchronize());
+
+    // Step 6, chunk C: root-interior SIDECAR for the deep interior beyond any upper node (the grid
+    // itself is never mutated; sdf_detail::signedSignAt composes the full-domain sign).
+    sdf.fillRootInteriorMask(origHandle.deviceGrid<BuildT>());
     cudaCheck(cudaDeviceSynchronize());
 
     const uint32_t leafCount = Traits::getTreeData(d_grid).mNodeCount[0];
@@ -1060,8 +1069,130 @@ CCResult computeCC(const GridHandleT& origHandle, const GridHandleT& derivedHand
         }
     }
 
+    // ---- Chunk C: root-interior sidecar + FULL-DOMAIN sign query validation ----
+    // signedSignAt composes the whole level set: active signs + leaf/lower/upper invert bits + the
+    // root-interior sidecar. With analytic geometry, sample a coarse 3D lattice spanning deep interior,
+    // band, far exterior AND beyond the root-cell array (out-of-range => exterior), and compare every
+    // queried sign against the analytic one; points within a thin on-surface band are ties (a sampled
+    // coord there may be a legitimately ±-signed surface voxel).
+    {
+        const nanovdb::Coord rMin  = sdf.rootTileMin();
+        const nanovdb::Coord rDims = sdf.rootTileDims();
+        const uint64_t rTotal = uint64_t(rDims[0]) * uint64_t(rDims[1]) * uint64_t(rDims[2]);
+        std::vector<uint8_t> rootOn(rTotal);
+        if (rTotal) cudaCheck(cudaMemcpy(rootOn.data(), sdf.deviceRootInterior(), rTotal, cudaMemcpyDeviceToHost));
+        uint64_t rootInterior = 0;
+        for (uint64_t c = 0; c < rTotal; ++c) rootInterior += rootOn[c];
+        result.rootInteriorCells = rootInterior;
+        std::cout << "Root-interior sidecar:                  " << rDims[0] << "x" << rDims[1] << "x"
+                  << rDims[2] << " cells @ tileMin (" << rMin[0] << "," << rMin[1] << "," << rMin[2]
+                  << "), " << rootInterior << " deep-interior\n";
+
+        if (haveAnalytic) {
+            // Re-download the invert sidecars (the chunk-A/B validation copies were scoped).
+            const uint32_t lowerCount = h_orig->tree().nodeCount(1);
+            const uint32_t upperCount = h_orig->tree().nodeCount(2);
+            std::vector<nanovdb::Mask<3>> leafInv(origLeafCount);
+            std::vector<nanovdb::Mask<4>> lowInv(lowerCount);
+            std::vector<nanovdb::Mask<5>> upInv(upperCount);
+            cudaCheck(cudaMemcpy(leafInv.data(), sdf.deviceLeafInvertMask(),
+                                 std::size_t(origLeafCount) * sizeof(nanovdb::Mask<3>), cudaMemcpyDeviceToHost));
+            if (lowerCount) cudaCheck(cudaMemcpy(lowInv.data(), sdf.deviceLowerInvertMask(),
+                                 std::size_t(lowerCount) * sizeof(nanovdb::Mask<4>), cudaMemcpyDeviceToHost));
+            if (upperCount) cudaCheck(cudaMemcpy(upInv.data(), sdf.deviceUpperInvertMask(),
+                                 std::size_t(upperCount) * sizeof(nanovdb::Mask<5>), cudaMemcpyDeviceToHost));
+
+            // Sample lattice: grid bbox expanded by 4200 voxels (crosses into absent root regions and
+            // beyond the root-cell array on every side), ~41 samples per axis.
+            const auto& hbbox = h_orig->indexBBox();
+            const int margin = 4200, steps = 41;
+            uint64_t nSampled = 0, ties = 0; std::size_t fdMis = 0, shownF = 0;
+            for (int si = 0; si < steps; ++si)
+                for (int sj = 0; sj < steps; ++sj)
+                    for (int sk = 0; sk < steps; ++sk) {
+                        const int lo[3] = { hbbox.min()[0] - margin, hbbox.min()[1] - margin, hbbox.min()[2] - margin };
+                        const int hi[3] = { hbbox.max()[0] + margin, hbbox.max()[1] + margin, hbbox.max()[2] + margin };
+                        const nanovdb::Coord ijk(lo[0] + int(int64_t(hi[0] - lo[0]) * si / (steps - 1)),
+                                                 lo[1] + int(int64_t(hi[1] - lo[1]) * sj / (steps - 1)),
+                                                 lo[2] + int(int64_t(hi[2] - lo[2]) * sk / (steps - 1)));
+                        ++nSampled;
+                        const double dist = analyticDist(double(ijk[0]) * vsWorld, double(ijk[1]) * vsWorld,
+                                                         double(ijk[2]) * vsWorld);
+                        if (std::fabs(dist) < std::sqrt(0.75) * vsWorld) { ++ties; continue; }
+                        const int8_t truth = (dist < 0.0) ? int8_t(-1) : int8_t(1);
+                        const int8_t ours  = nanovdb::tools::cuda::sdf_detail::signedSignAt(
+                            *h_orig, ijk, gpuSigned.data(), leafInv.data(), lowInv.data(), upInv.data(),
+                            rootOn.data(), rMin, rDims);
+                        if (ours != truth) {
+                            ++fdMis;
+                            if (shownF++ < 10)
+                                std::cerr << "  full-domain mismatch @ (" << ijk[0] << "," << ijk[1] << ","
+                                          << ijk[2] << ") ours=" << int(ours) << " truth=" << int(truth)
+                                          << " d=" << dist / vsWorld << " vox\n";
+                        }
+                    }
+            result.fullDomainChecked    = true;
+            result.fullDomainMismatches = fdMis;
+            result.fullDomainTies       = ties;
+            std::cout << "Full-domain sign query validation:      " << (fdMis == 0 ? "PASS" : "FAIL")
+                      << " (" << nSampled << " sampled coords, " << fdMis << " mismatches, "
+                      << ties << " on-surface ties)\n";
+        }
+    }
+
     cudaCheck(cudaFreeHost(origBlob));
 
     cudaCheck(cudaFreeHost(hostBlob));
     return result;
+}
+
+/// @brief Synthetic unit test of the chunk-C root-interior flood (RootInteriorFloodFunctor). An
+///        interior ABSENT root cell needs an object >4096 voxels thick — no practically-rasterizable
+///        mesh reaches that — so the seed gate / multi-seed / wall-blocking logic is exercised here
+///        with fabricated inputs instead. Layout: 7×5×5 cells, full wall planes at i=2 and i=4 carve
+///        three disconnected non-wall regions A={i:0,1}, B={i:3}, C={i:5,6}:
+///          - A is seeded interior at one cell           -> the flood must fill ALL of A;
+///          - B is seeded interior at one cell           -> fills all of B (multi-seed: disconnected);
+///          - C gets MIXED evidence (sawInt+sawExt)      -> gate rejects; C stays exterior;
+///          - walls must stay OFF and block A/B from C.
+/// @return number of cells whose final state differs from the expectation (0 = PASS).
+int testRootInteriorFlood()
+{
+    const nanovdb::Coord dims(7, 5, 5);
+    const int P = dims[0], Q = dims[1], R = dims[2], total = P * Q * R;
+    auto idx = [&](int i, int j, int k) { return (i * Q + j) * R + k; };
+
+    std::vector<uint8_t> wall(total, 0), sawInt(total, 0), sawExt(total, 0);
+    for (int j = 0; j < Q; ++j)
+        for (int k = 0; k < R; ++k) { wall[idx(2, j, k)] = 1; wall[idx(4, j, k)] = 1; }
+    sawInt[idx(0, 2, 2)] = 1;                             // region A: one interior seed
+    sawInt[idx(3, 2, 2)] = 1;                             // region B: one interior seed (disconnected)
+    sawInt[idx(5, 2, 2)] = 1; sawExt[idx(5, 2, 2)] = 1;   // region C: mixed evidence -> must stay OFF
+
+    thrust::universal_vector<uint8_t> dWall(wall.begin(), wall.end());
+    thrust::universal_vector<uint8_t> dSawInt(sawInt.begin(), sawInt.end());
+    thrust::universal_vector<uint8_t> dSawExt(sawExt.begin(), sawExt.end());
+    thrust::universal_vector<uint8_t> dOn(std::size_t(total), uint8_t(0));
+
+    using FloodOp = nanovdb::tools::cuda::sdf_detail::RootInteriorFloodFunctor;
+    nanovdb::util::cuda::operatorKernel<FloodOp><<<1, FloodOp::MaxThreadsPerBlock>>>(
+        dWall.data().get(), dSawInt.data().get(), dSawExt.data().get(), dOn.data().get(), dims);
+    cudaCheckError();
+    cudaCheck(cudaDeviceSynchronize());
+
+    int mism = 0;
+    for (int i = 0; i < P; ++i)
+        for (int j = 0; j < Q; ++j)
+            for (int k = 0; k < R; ++k) {
+                const bool expect = (i == 0 || i == 1 || i == 3);  // A and B fill; walls and C stay OFF
+                if (bool(dOn[idx(i, j, k)]) != expect) {
+                    if (mism < 10)
+                        std::cerr << "  root-flood unit mismatch @ (" << i << "," << j << "," << k
+                                  << "): on=" << int(dOn[idx(i, j, k)]) << " expect=" << int(expect) << "\n";
+                    ++mism;
+                }
+            }
+    std::cout << "Root-interior flood unit test:          " << (mism == 0 ? "PASS" : "FAIL")
+              << " (7x5x5 cells, 2 wall planes, 3 regions, " << mism << " mismatches)\n";
+    return mism;
 }

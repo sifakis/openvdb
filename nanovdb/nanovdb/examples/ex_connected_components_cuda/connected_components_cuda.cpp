@@ -46,6 +46,10 @@ struct CCResult {
     uint64_t coarseInvertMismatches      = 0;
     uint64_t lowerOnTiles                = 0;
     uint64_t upperOnTiles                = 0;
+    uint64_t rootInteriorCells           = 0;
+    bool     fullDomainChecked           = false;
+    uint64_t fullDomainMismatches        = 0;
+    uint64_t fullDomainTies              = 0;
 };
 
 /// @brief Implemented on the CUDA side (connected_components_cuda_kernels.cu):
@@ -71,6 +75,10 @@ std::tuple<GridHandleT, UDFSidecarT, IndexSidecarT> computeUDFAndIndex(
 /// @brief Implemented on the CUDA side: prints topology diagnostics for the device-
 ///        resident index grid (active voxels, node counts, bbox, occupancy, memory).
 void printGridDiagnostics(const GridHandleT& handle, const std::string& title);
+
+/// @brief Implemented on the CUDA side: synthetic unit test of the chunk-C root-interior flood
+///        (seed gate, multi-seed fill of disconnected regions, wall blocking). Returns 0 on PASS.
+int testRootInteriorFlood();
 
 /// @brief Implemented on the CUDA side: derive the connected-components input topology by
 ///        pruning the surface/barrier shell (voxels within √3/2 voxels of the surface) from
@@ -233,6 +241,12 @@ static int runSelfTests(const std::string& which, float voxelSize, float bandWid
         if (!ok) ++failures;
     };
 
+    if (which == "--selftest") {
+        // The interior-ON path of the root flood needs an object >4096 voxels thick — unreachable by
+        // rasterization — so it is exercised synthetically.
+        check("root-interior flood unit test (synthetic)", testRootInteriorFlood() == 0);
+    }
+
     if (which == "--cube" || which == "--selftest") {
         std::vector<nanovdb::Vec3f> P; std::vector<nanovdb::Vec3i> T;
         makeCube(voxelSize, 15.0f * voxelSize, P, T);          // half-size ~15 voxels
@@ -247,6 +261,7 @@ static int runSelfTests(const std::string& which, float voxelSize, float bandWid
         if (r.analyticChecked) check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
         check("0 leaf invert-mask mismatches (inactive voxels)", r.invertChecked && r.invertMismatches == 0);
         check("0 coarse invert-mask mismatches (childless tiles)", r.coarseInvertChecked && r.coarseInvertMismatches == 0);
+        check("0 full-domain sign query mismatches", r.fullDomainChecked && r.fullDomainMismatches == 0);
     }
 
     if (which == "--sphere" || which == "--selftest") {
@@ -263,6 +278,7 @@ static int runSelfTests(const std::string& which, float voxelSize, float bandWid
         if (r.analyticChecked) check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
         check("0 leaf invert-mask mismatches (inactive voxels)", r.invertChecked && r.invertMismatches == 0);
         check("0 coarse invert-mask mismatches (childless tiles)", r.coarseInvertChecked && r.coarseInvertMismatches == 0);
+        check("0 full-domain sign query mismatches", r.fullDomainChecked && r.fullDomainMismatches == 0);
     }
 
     // R = 230 voxels: big enough that fully-interior 128^3-aligned regions exist, so childless UPPER
@@ -281,6 +297,7 @@ static int runSelfTests(const std::string& which, float voxelSize, float bandWid
         if (r.analyticChecked) check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
         check("0 leaf invert-mask mismatches (inactive voxels)", r.invertChecked && r.invertMismatches == 0);
         check("0 coarse invert-mask mismatches (childless tiles)", r.coarseInvertChecked && r.coarseInvertMismatches == 0);
+        check("0 full-domain sign query mismatches", r.fullDomainChecked && r.fullDomainMismatches == 0);
         check("some interior upper tiles exist (test is exercising the upper ON path)", r.upperOnTiles > 0);
     }
 

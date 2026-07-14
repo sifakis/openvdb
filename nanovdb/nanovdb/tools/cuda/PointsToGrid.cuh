@@ -1013,9 +1013,6 @@ inline void PointsToGrid<BuildT, ResourceT>::processUpperNodes()
 
     mResource->deallocate_async(mData.d_tile_keys, mData.nodeCount[2]*sizeof(uint64_t), ResourceT::DEFAULT_ALIGNMENT, mStream);
 
-    // Upper background values are zero and the grid buffer is zero-initialized
-    // in getBuffer, so the former dense SetUpperBackgroundValuesFunctor pass
-    // (nodeCount[2]<<15 threads) is unnecessary.
 }// PointsToGrid<BuildT, ResourceT>::processUpperNodes
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -1057,9 +1054,6 @@ inline void PointsToGrid<BuildT, ResourceT>::processLowerNodes()
     util::cuda::lambdaKernel<<<numBlocks(mData.nodeCount[1]), mNumThreads, 0, mStream>>>(mData.nodeCount[1], BuildLowerNodesFunctor<BuildT>(), mDeviceData);
     cudaCheckError();
 
-    // Lower background values are zero and the grid buffer is zero-initialized
-    // in getBuffer, so the former dense SetLowerBackgroundValuesFunctor pass
-    // (nodeCount[1]<<12 threads) is unnecessary.
 }// PointsToGrid<BuildT, ResourceT>::processLowerNodes
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------

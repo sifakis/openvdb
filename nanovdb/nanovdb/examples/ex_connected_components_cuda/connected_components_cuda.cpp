@@ -17,6 +17,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>   // std::getenv
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -30,8 +31,8 @@ using GridHandleT   = nanovdb::GridHandle<nanovdb::cuda::DeviceBuffer>;
 using UDFSidecarT   = nanovdb::cuda::DeviceBuffer;
 using IndexSidecarT = nanovdb::cuda::DeviceBuffer;
 
-// Summary of computeCC's validators (definition must match connected_components_cuda_kernels.cu).
-struct CCResult {
+// Summary of validateMeshToSdf's checks (definition must match connected_components_cuda_kernels.cu).
+struct SDFResult {
     uint64_t globalComponents            = 0;
     bool     openvdbChecked              = false;
     uint64_t confidentSignMismatches     = 0;
@@ -52,25 +53,43 @@ struct CCResult {
     uint64_t fullDomainTies              = 0;
 };
 
-/// @brief Implemented on the CUDA side (connected_components_cuda_kernels.cu):
-///        uploads the mesh and voxelizes it into a ValueOnIndex grid plus a per-active-
-///        voxel unsigned-distance-field sidecar.
-/// @return { index-grid handle, UDF sidecar } (device buffers)
-std::pair<GridHandleT, UDFSidecarT> computeUDF(
-    const std::vector<nanovdb::Vec3f>& points,
-    const std::vector<nanovdb::Vec3i>& triangles,
-    const nanovdb::Map&                map,
-    float                              bandWidth);
+// ---- Host/device seam (all implemented in connected_components_cuda_kernels.cu) --------------------
+//
+// The mesh->SDF example runs as three passes over an opaque pipeline object (SdfPipeline; defined on
+// the CUDA side because it embeds CUDA-only types — the host driver only ever holds a pointer):
+//   buildMeshToSdf     run steps 1-6 (rasterize -> prune -> CC -> sign -> fill) -> live device state
+//   validateMeshToSdf  independent CPU oracles + OpenVDB / analytic cross-checks -> SDFResult metrics
+//   exportMeshToSdf    dump the Polyscope visualization files (.ccvis + .fill)
+// freeSdfPipeline releases the pipeline. Build once, then validate and/or export over it.
 
-/// @brief Implemented on the CUDA side: like computeUDF, but also returns a per-active-voxel
-///        nearest-triangle-index sidecar (uint32; 0xFFFFFFFF for background / no-hit) needed by the
-///        later barrier-signing step. A built-in CPU oracle validates the index against the UDF.
-/// @return { index-grid handle, UDF sidecar, nearest-triangle-index sidecar } (device buffers)
-std::tuple<GridHandleT, UDFSidecarT, IndexSidecarT> computeUDFAndIndex(
-    const std::vector<nanovdb::Vec3f>& points,
-    const std::vector<nanovdb::Vec3i>& triangles,
-    const nanovdb::Map&                map,
-    float                              bandWidth);
+struct SdfPipeline;   // opaque; defined in the .cu
+
+/// @brief Run the full pipeline (steps 1-6) and return the live device state.
+/// @param points,triangles,map  the source mesh + index<->world transform.
+/// @param bandWidth             narrow-band width (voxels).
+SdfPipeline* buildMeshToSdf(const std::vector<nanovdb::Vec3f>& points,
+                            const std::vector<nanovdb::Vec3i>& triangles,
+                            const nanovdb::Map&                map,
+                            float                              bandWidth);
+
+/// @brief Independent validation of a built pipeline (CPU oracles + optional OpenVDB / analytic
+///        ground-truth cross-checks). Read-only; returns the metrics summary.
+/// @param analyticSpheres optional numSpheres × {Cx,Cy,Cz,R} (world) enabling the analytic union sign
+///                        check (inside iff inside any primitive); else nullptr.
+/// @param analyticBoxes   optional numBoxes × {Cx,Cy,Cz,halfExtent} (world) axis-aligned cubes.
+SDFResult validateMeshToSdf(const SdfPipeline*                 pipeline,
+                            const std::vector<nanovdb::Vec3f>& points,
+                            const std::vector<nanovdb::Vec3i>& triangles,
+                            const double*                      analyticSpheres = nullptr,
+                            int                                numAnalyticSpheres = 0,
+                            const double*                      analyticBoxes = nullptr,
+                            int                                numAnalyticBoxes = 0);
+
+/// @brief Dump the Polyscope visualization of a built pipeline to `<path>` (+ `<path>.fill`).
+void exportMeshToSdf(const SdfPipeline* pipeline, const std::string& path);
+
+/// @brief Release a pipeline returned by buildMeshToSdf.
+void freeSdfPipeline(SdfPipeline* pipeline);
 
 /// @brief Implemented on the CUDA side: prints topology diagnostics for the device-
 ///        resident index grid (active voxels, node counts, bbox, occupancy, memory).
@@ -79,36 +98,6 @@ void printGridDiagnostics(const GridHandleT& handle, const std::string& title);
 /// @brief Implemented on the CUDA side: synthetic unit test of the chunk-C root-interior flood
 ///        (seed gate, multi-seed fill of disconnected regions, wall blocking). Returns 0 on PASS.
 int testRootInteriorFlood();
-
-/// @brief Implemented on the CUDA side: derive the connected-components input topology by
-///        pruning the surface/barrier shell (voxels within √3/2 voxels of the surface) from
-///        the rasterized index grid via PruneGrid. Returns a clean, topology-only index grid.
-///        voxelSize converts the √3/2-voxel barrier into the sidecar's world-space units.
-GridHandleT computeDerivedTopology(const GridHandleT& srcHandle, const UDFSidecarT& udfSidecar,
-                                   float voxelSize);
-
-/// @brief Implemented on the CUDA side: run connected-components labeling + signing on the derived
-///        (barrier-pruned) grid, inject the per-voxel signs back onto the original grid, then sign the
-///        remaining barrier voxels (step 5) so the original grid's sign field is complete.
-/// @param origHandle    the original (pre-prune) UDF index grid — injection + barrier-signing target.
-/// @param derivedHandle the barrier-pruned grid CC + signing run on.
-/// @param indexSidecar  the original grid's nearest-triangle-index sidecar (for barrier signing).
-/// @param points,triangles,map  the source mesh + transform (re-uploaded for barrier signing).
-/// @param bandWidth     narrow-band width (voxels); also the half-width for the OpenVDB sign cross-check.
-/// @param analyticSpheres optional numSpheres × {Cx,Cy,Cz,R} (world) enabling the analytic union sign
-///                        check (inside iff inside any primitive); else nullptr.
-/// @param analyticBoxes   optional numBoxes × {Cx,Cy,Cz,halfExtent} (world) axis-aligned cubes added
-///                        to the analytic union (Chebyshev distance — exact sign); else nullptr.
-CCResult computeCC(const GridHandleT& origHandle, const GridHandleT& derivedHandle,
-               const IndexSidecarT&               indexSidecar,
-               const std::vector<nanovdb::Vec3f>& points,
-               const std::vector<nanovdb::Vec3i>& triangles,
-               const nanovdb::Map&                map,
-               float                              bandWidth,
-               const double*                      analyticSpheres = nullptr,
-               int                                numAnalyticSpheres = 0,
-               const double*                      analyticBoxes = nullptr,
-               int                                numAnalyticBoxes = 0);
 
 /// @brief Minimal Wavefront .obj reader (vertices + faces) using NanoVDB types.
 ///
@@ -211,9 +200,9 @@ static void makeUVSphere(nanovdb::Vec3f C, float R, int nLat, int nLon,
         T.emplace_back(south, ring(nLat - 2, j + 1), ring(nLat - 2, j));
 }
 
-/// @brief Run the full mesh->SDF pipeline (rasterize -> prune -> CC + sign + cross-check) on an
-///        in-memory mesh and return computeCC's validator summary.
-static CCResult runPipeline(const std::string& name,
+/// @brief Run the full mesh->SDF pipeline (build), optionally export it, and validate it against the
+///        analytic ground truth on an in-memory mesh. Returns the validator summary.
+static SDFResult runPipeline(const std::string& name,
                             const std::vector<nanovdb::Vec3f>& points,
                             const std::vector<nanovdb::Vec3i>& triangles,
                             float voxelSize, float bandWidth,
@@ -225,11 +214,13 @@ static CCResult runPipeline(const std::string& name,
               << ", bandWidth=" << bandWidth << ") ================\n";
     nanovdb::Map map;
     map.set(double(voxelSize), nanovdb::Vec3d(0.0), 1.0);
-    auto [handle, sidecar, indexSidecar] = computeUDFAndIndex(points, triangles, map, bandWidth);
-    printGridDiagnostics(handle, name + " UDF grid");
-    auto derivedHandle = computeDerivedTopology(handle, sidecar, voxelSize);
-    return computeCC(handle, derivedHandle, indexSidecar, points, triangles, map, bandWidth,
-                     analyticSpheres, numAnalyticSpheres, analyticBoxes, numAnalyticBoxes);
+
+    SdfPipeline* pipeline = buildMeshToSdf(points, triangles, map, bandWidth);
+    if (const char* visPath = std::getenv("CC_EXPORT_VIS")) exportMeshToSdf(pipeline, visPath);
+    SDFResult result = validateMeshToSdf(pipeline, points, triangles,
+                                         analyticSpheres, numAnalyticSpheres, analyticBoxes, numAnalyticBoxes);
+    freeSdfPipeline(pipeline);
+    return result;
 }
 
 /// @brief Run the in-code analytic self-tests (cube + sphere). Returns the number of failed checks.
@@ -254,7 +245,7 @@ static int runSelfTests(const std::string& which, float voxelSize, float bandWid
         const double s = 0.5 * voxelSize;
         const double h = std::round(15.0) * voxelSize;         // same snap as makeCube
         const double box[4] = { s, s, s, h };
-        const CCResult r = runPipeline("CUBE", P, T, voxelSize, bandWidth, nullptr, 0, box, 1);
+        const SDFResult r = runPipeline("CUBE", P, T, voxelSize, bandWidth, nullptr, 0, box, 1);
         std::cout << "  cube assertions:\n";
         check("exactly 2 CC global components", r.globalComponents == 2);
         if (r.openvdbChecked) check("0 confident-region OpenVDB sign mismatches", r.confidentSignMismatches == 0);
@@ -271,7 +262,7 @@ static int runSelfTests(const std::string& which, float voxelSize, float bandWid
         const float R = 20.0f * voxelSize;                     // radius ~20 voxels
         makeUVSphere(C, R, 128, 256, P, T);
         const double sphere[4] = { double(C[0]), double(C[1]), double(C[2]), double(R) };
-        const CCResult r = runPipeline("SPHERE", P, T, voxelSize, bandWidth, sphere, 1);
+        const SDFResult r = runPipeline("SPHERE", P, T, voxelSize, bandWidth, sphere, 1);
         std::cout << "  sphere assertions:\n";
         check("exactly 2 CC global components", r.globalComponents == 2);
         if (r.openvdbChecked) check("0 confident-region OpenVDB sign mismatches", r.confidentSignMismatches == 0);
@@ -290,7 +281,7 @@ static int runSelfTests(const std::string& which, float voxelSize, float bandWid
         const float R = 230.0f * voxelSize;
         makeUVSphere(C, R, 256, 512, P, T);                    // facet error ~0.02 voxels
         const double sphere[4] = { double(C[0]), double(C[1]), double(C[2]), double(R) };
-        const CCResult r = runPipeline("BIG-SPHERE", P, T, voxelSize, bandWidth, sphere, 1);
+        const SDFResult r = runPipeline("BIG-SPHERE", P, T, voxelSize, bandWidth, sphere, 1);
         std::cout << "  big-sphere assertions:\n";
         check("exactly 2 CC global components", r.globalComponents == 2);
         if (r.openvdbChecked) check("0 confident-region OpenVDB sign mismatches", r.confidentSignMismatches == 0);
@@ -316,7 +307,7 @@ static int runSelfTests(const std::string& which, float voxelSize, float bandWid
         makeUVSphere(C2, R2, 128, 256, P, T);                  // appended (composable indices)
         const double spheres[8] = { double(C1[0]), double(C1[1]), double(C1[2]), double(R1),
                                     double(C2[0]), double(C2[1]), double(C2[2]), double(R2) };
-        const CCResult r = runPipeline("TWO-SPHERES", P, T, voxelSize, bandWidth, spheres, 2);
+        const SDFResult r = runPipeline("TWO-SPHERES", P, T, voxelSize, bandWidth, spheres, 2);
 
         std::cout << "  two-sphere probe (single-seed exterior rule), REPORT ONLY:\n";
         std::cout << "    CC global components            : " << r.globalComponents << " (expected 4)\n";
@@ -374,23 +365,13 @@ int main(int argc, char* argv[])
         nanovdb::Map map;
         map.set(double(voxelSize), nanovdb::Vec3d(0.0), 1.0);
 
-        // Step 1: rasterize the mesh into an index grid + UDF sidecar + nearest-triangle-index sidecar.
-        // (The index sidecar is just carried for now; step 5 / barrier signing will consume it.)
-        auto [handle, sidecar, indexSidecar] = computeUDFAndIndex(points, triangles, map, bandWidth);
-
-        printGridDiagnostics(handle, "Rasterized UDF grid");
-        std::cout << "UDF sidecar                           : "
-                  << (sidecar.size() / sizeof(float)) << " floats\n";
-        std::cout << "Nearest-triangle-index sidecar        : "
-                  << (indexSidecar.size() / sizeof(uint32_t)) << " uint32\n";
-
-        // Step 2: derive the CC-input topology by pruning the surface/barrier shell.
-        auto derivedHandle = computeDerivedTopology(handle, sidecar, voxelSize);
-        printGridDiagnostics(derivedHandle, "Derived CC-input grid");
-
-        // Steps 3–5: connected-components labeling + signing on the derived grid, inject the signs
-        // back onto the original grid, then sign the remaining barrier voxels on the original.
-        computeCC(handle, derivedHandle, indexSidecar, points, triangles, map, bandWidth);
+        // Build the full mesh->SDF pipeline (steps 1-6; buildMeshToSdf prints the grid diagnostics),
+        // optionally dump the visualization, then validate. No analytic ground truth for an arbitrary
+        // mesh, so validation runs the CPU oracles (+ the OpenVDB cross-check when built with OpenVDB).
+        SdfPipeline* pipeline = buildMeshToSdf(points, triangles, map, bandWidth);
+        if (const char* visPath = std::getenv("CC_EXPORT_VIS")) exportMeshToSdf(pipeline, visPath);
+        validateMeshToSdf(pipeline, points, triangles);
+        freeSdfPipeline(pipeline);
 
         return 0;
     }

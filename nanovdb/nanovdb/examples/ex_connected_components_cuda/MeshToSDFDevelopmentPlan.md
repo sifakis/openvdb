@@ -8,33 +8,36 @@ on NanoVDB index grids. This document is the running design notes for that work.
 > OpenVDB's `ComputeIntersectingVoxelSign`), and the per-level `invertMask` level-set
 > representation extension — lives in [`MeshToSDF_PipelinePlan.md`](./MeshToSDF_PipelinePlan.md).
 
-> **No OpenVDB.** Unlike `ex_mesh_to_grid_cuda`, this example is pure NanoVDB + CUDA.
-> The index↔world transform uses `nanovdb::Map::set(scale, translation, taper)`
-> directly, the OBJ reader uses NanoVDB types, and the target is registered without
-> the `OPENVDB` flag. (NanoVDB itself may still link `libopenvdb` transitively in a
-> build configured with `NANOVDB_USE_OPENVDB=ON`, but no example code uses it.)
+> **OpenVDB usage.** The core pipeline (steps 1–6) is pure NanoVDB + CUDA — the index↔world
+> transform uses `nanovdb::Map` directly and the OBJ reader uses NanoVDB types. `validateMeshToSdf`
+> *optionally* cross-checks the signs against OpenVDB's `meshToLevelSet` when the example is built
+> with `NANOVDB_USE_OPENVDB=ON` (guarded by `#ifdef NANOVDB_USE_OPENVDB`); without it, the
+> CPU-oracle and analytic checks still run.
 
 ## Files
 
 | File | Role |
 | :--- | :--- |
-| `connected_components_cuda.cpp`         | Host driver: arg parsing, OBJ reader, builds the mesh + `nanovdb::Map`, calls the device entry points. No CUDA *code* (only header-only handle/buffer types). |
-| `connected_components_cuda_kernels.cu`  | CUDA / NanoVDB side: `computeUDF()`, `printGridDiagnostics()`, `computeDerivedTopology()`, and `computeCC()` (drives the full `ConnectedComponents` pipeline — `processLeafConnectedComponents()` → `processCrossLeafEdges()` → `processComponentLabels()` — and validates each stage against a host oracle). |
-| `MeshToSDFDevelopmentPlan.md`           | This document. |
+| `connected_components_cuda.cpp`         | Host driver: arg parsing, OBJ reader, synthetic test meshes, `nanovdb::Map`, calls the seam. No CUDA *code* (only header-only handle/buffer types). |
+| `connected_components_cuda_kernels.cu`  | CUDA / NanoVDB side. Three passes over an opaque `SdfPipeline`: **`buildMeshToSdf`** (steps 1–6: rasterize → prune → CC → sign → fill), **`validateMeshToSdf`** (CPU oracles + OpenVDB / analytic cross-checks), **`exportMeshToSdf`** (Polyscope dump). Plus `printGridDiagnostics()` and the synthetic `testRootInteriorFlood()` unit test. |
+| `mesh_to_sdf_viewer.py`                  | Polyscope viewer for the `exportMeshToSdf` dump (`.ccvis` + `.fill`). Not part of the build. |
+| `MeshToSDF_PipelinePlan.md`             | Umbrella pipeline plan (steps 1–6). |
+| `MeshToSDFDevelopmentPlan.md`           | This document (CC / step-3 running notes). |
 | `standalone/cc_vis.cpp`                 | Standalone 2D CPU visualizer of the SV hook/compress primitives (see `standalone/README.md`). **Not** part of the example build — it lives one directory down so the `nanovdb_example` source glob (non-recursive) skips it; otherwise its `main()` would collide with the driver's. |
 
 The actual per-leaf CC kernel lives in the library, not the example:
-`nanovdb/tools/cuda/ConnectedComponents.cuh`.
+`nanovdb/tools/cuda/ConnectedComponents.cuh`; the SDF domain logic lives in
+`nanovdb/tools/cuda/MeshToSDF.cuh`.
 
-The host/device seam is a small set of forward-declared functions (à la
-`ex_mesh_to_grid_cuda`'s `mainMeshToGrid`), passing host `std::vector`s + `nanovdb::Map`
-in and returning device buffers (`GridHandle<DeviceBuffer>`, `DeviceBuffer`) out.
+The host/device seam is a small set of forward-declared functions. `SdfPipeline` is opaque to the
+`.cpp` (it embeds CUDA-only types): the driver only holds an `SdfPipeline*` returned by
+`buildMeshToSdf`, passes it to `validateMeshToSdf` / `exportMeshToSdf`, then `freeSdfPipeline`.
 
 ## Pipeline (incremental)
 
-1. **`computeUDF(points, triangles, map, bandWidth)` → `{ handle, sidecar }`** *(done)*
+1. **`computeUDFAndIndex(points, triangles, map, bandWidth)` → `{ handle, udf sidecar, index sidecar }`** *(done)*
    Rasterize the mesh into a narrow-band `ValueOnIndex` grid (every active voxel gets a
-   dense index in `[1, N]`) plus a UDF sidecar of `N+1` floats:
+   dense index in `[1, N]`) plus a UDF sidecar of `N+1` floats (and a nearest-triangle-index sidecar):
    `sidecar[0]` = background, `sidecar[leaf.getValue(vi)]` = that voxel's unsigned distance
    to the closest triangle. This is `nanovdb::tools::cuda::MeshToGrid`, shared conceptually
    with `ex_mesh_to_grid_cuda` (which is really *mesh → UDF*).
@@ -55,7 +58,7 @@ in and returning device buffers (`GridHandle<DeviceBuffer>`, `DeviceBuffer`) out
    `uint16_t` per leaf (`deviceLeafComponentCounts()`). Cross-leaf connectivity is
    ignored at this stage. See "Per-leaf CC kernel" below.
 
-   **Validation (in the example, `computeCC()`):** after the kernel runs, the example
+   **Validation (in the example, `validateMeshToSdf()`):** after the kernel runs, the example
    copies the device grid blob into a scratch host buffer (NanoVDB grids are
    position-independent, so a raw byte copy is a valid host grid; the input handle is left
    untouched — no `deviceDownload` residue), runs a host union-find oracle harvested from
@@ -94,13 +97,13 @@ in and returning device buffers (`GridHandle<DeviceBuffer>`, `DeviceBuffer`) out
    **Fix.** A single `__syncthreads()` at the end of the loop body, after the `break` test, so
    no thread resets `changed` until every thread has read it. The break is then uniform across
    the block and the loop's barriers can no longer diverge. The device-vs-oracle harness in
-   `computeCC()` is the standing regression guard.
+   `validateMeshToSdf()` is the standing regression guard.
 
 4. **Global connected-components labeling (CUDA)** *(IMPLEMENTED + VALIDATED — `processCrossLeafEdges`
    + `processComponentLabels`)*
    Merge the leaf-local components across leaf boundaries so two components share a global label iff
    connected through adjacent active voxels — *including across leaves*. Two stages, both validated
-   against host oracles in `computeCC()` (0 mismatches up to the dragon @ 0.0005): **step 5** ANDs the
+   against host oracles in `validateMeshToSdf()` (0 mismatches up to the dragon @ 0.0005): **step 5** ANDs the
    touching per-component face masks over each leaf's +X/+Y/+Z neighbors to emit a cross-leaf edge
    list, and **step 6** runs a lock-free union-find over those edges to assign each component a
    representative (its class's minimum slot). The number of distinct representatives is the true
@@ -172,7 +175,7 @@ For a 2D, CPU, single-step-at-a-time intuition for exactly these primitives and 
 
 Steps 1–6 below are **✅ implemented and validated** (steps 1–4: 2026-06-09/11; steps 5–6: 2026-06-12).
 
-> **✅ Validated against a CPU oracle (2026-06-11).** `computeCC()` in the example now runs a host
+> **✅ Validated against a CPU oracle (2026-06-11).** `validateMeshToSdf()` in the example now runs a host
 > oracle (`cpuMasksFaces`) that independently rebuilds each component's `Mask<3>` and its six face
 > bitmasks **directly from voxel coordinates** (deliberately *not* mirroring the kernel's
 > shift/`0x0101…` extraction), then compares them elementwise against the device buffers.
@@ -269,7 +272,7 @@ whose vertices are leaf-local components rather than voxels.
 closed-form component counts — no mesh, fully deterministic: one sphere → 2 (inner + outer shell),
 N well-separated spheres → 2N, and two heavily-overlapping spheres → 2 (merged into one solid). It
 exercises both disjoint components and cross-leaf merging. (The live mesh path is validated in the
-example's `computeCC()`; e.g. `sphere.obj` reports 2 global labels at voxelSize 0.02/0.01/0.005.)
+example's `validateMeshToSdf()`; e.g. `sphere.obj` reports 2 global labels at voxelSize 0.02/0.01/0.005.)
 
 **Open design questions**
 

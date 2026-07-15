@@ -3,15 +3,15 @@
 
 /// @file  connected_components_cuda_kernels.cu
 ///
-/// @brief CUDA / NanoVDB side of the connected-components example (no OpenVDB).
+/// @brief CUDA / NanoVDB side of the mesh->SDF example.
 ///
-///        computeUDF(): uploads the triangle mesh and voxelizes it into a narrow-band
-///        ValueOnIndex grid plus a per-active-voxel unsigned-distance-field (UDF)
-///        sidecar, via nanovdb::tools::cuda::MeshToGrid.
-///
-///        The connected-components labeling (a union-find with hierarchical insights)
-///        and the derivative-grid step it operates on will be added here as follow-ups.
-///        See MeshToSDFDevelopmentPlan.md in this directory for the design notes and roadmap.
+///        Three passes over an opaque SdfPipeline (the host driver holds only a pointer):
+///          buildMeshToSdf()     rasterize -> prune -> CC -> sign -> fill (steps 1-6)
+///          validateMeshToSdf()  independent CPU oracles + OpenVDB / analytic cross-checks
+///          exportMeshToSdf()    dump the Polyscope visualization (.ccvis + .fill)
+///        The connected-components labeling and the mesh->SDF library live in
+///        nanovdb/tools/cuda/{ConnectedComponents,MeshToSDF}.cuh. See MeshToSDF_PipelinePlan.md
+///        and MeshToSDFDevelopmentPlan.md in this directory for the design notes.
 
 #include <nanovdb/NanoVDB.h>
 #include <nanovdb/tools/cuda/MeshToGrid.cuh>
@@ -29,7 +29,11 @@
 
 #include <algorithm>  // std::sort
 #include <cmath>      // std::sqrt, std::fabs
+#include <cstdint>
+#include <cstdlib>    // std::getenv
+#include <fstream>    // std::ofstream (visualization export)
 #include <iostream>
+#include <memory>     // std::unique_ptr (SdfPipeline)
 #include <string>
 #include <tuple>
 #include <utility>
@@ -40,9 +44,9 @@ using GridHandleT   = nanovdb::GridHandle<nanovdb::cuda::DeviceBuffer>;
 using UDFSidecarT   = nanovdb::cuda::DeviceBuffer;
 using IndexSidecarT = nanovdb::cuda::DeviceBuffer;
 
-// Summary of computeCC's validators, returned so the in-code analytic self-tests can assert on it.
+// Summary of validateMeshToSdf's checks, returned so the in-code analytic self-tests can assert on it.
 // (Definition must match in connected_components_cuda.cpp.)
-struct CCResult {
+struct SDFResult {
     uint64_t globalComponents            = 0;      // distinct global CC labels
     bool     openvdbChecked              = false;  // OpenVDB cross-check ran (needs NANOVDB_USE_OPENVDB)
     uint64_t confidentSignMismatches     = 0;      // OpenVDB cross-check, beyond-shell (must be 0)
@@ -63,31 +67,22 @@ struct CCResult {
     uint64_t fullDomainTies              = 0;      // sampled coords within the on-surface tie band
 };
 
-std::pair<GridHandleT, UDFSidecarT> computeUDF(
-    const std::vector<nanovdb::Vec3f>& points,
-    const std::vector<nanovdb::Vec3i>& triangles,
-    const nanovdb::Map&                map,
-    float                              bandWidth)
-{
-    using BuildT = nanovdb::ValueOnIndex;
+// All live device state produced by buildMeshToSdf and consumed (read-only) by validateMeshToSdf /
+// exportMeshToSdf. Opaque to the host driver (which only holds an SdfPipeline*), since it embeds the
+// CUDA-only pipeline objects. The two objects own device buffers and are built once the derived grid
+// exists, hence unique_ptr. (Phase 2 will move this struct to a .cu-only header.)
+struct SdfPipeline {
+    GridHandleT   orig, derived;   // original (pre-prune) + derived (barrier-pruned) index grids
+    UDFSidecarT   udf;             // per-active-voxel unsigned distance (world units)
+    IndexSidecarT index;          // per-active-voxel nearest-triangle index
+    nanovdb::Map  map;            // index<->world transform
+    float         bandWidth = 0.f;
+    std::unique_ptr<nanovdb::tools::cuda::ConnectedComponents<nanovdb::ValueOnIndex>> cc;   // step 3 labels
+    std::unique_ptr<nanovdb::tools::cuda::MeshToSDF<nanovdb::ValueOnIndex>>           sdf;  // steps 4-6 signs+fill
+};
 
-    // Upload mesh to the device (managed memory keeps the example simple).
-    thrust::universal_vector<nanovdb::Vec3f> dPoints(points.begin(), points.end());
-    thrust::universal_vector<nanovdb::Vec3i> dTriangles(triangles.begin(), triangles.end());
-
-    nanovdb::tools::cuda::MeshToGrid<BuildT> converter(
-        dPoints.data().get(),    uint32_t(dPoints.size()),
-        dTriangles.data().get(), uint32_t(dTriangles.size()),
-        map);
-    converter.setVerbose(1);
-    converter.setNarrowBandWidth(bandWidth);
-
-    // { index-grid handle, UDF sidecar }, both backed by DeviceBuffer.
-    return converter.getHandleAndUDF();
-}
-
-/// @brief Step 1 (additive sibling of computeUDF): rasterize the mesh into the index grid + UDF
-///        sidecar AND a per-active-voxel NEAREST-TRIANGLE-INDEX sidecar (uint32), needed by step 5
+/// @brief Step 1: rasterize the mesh into the index grid + UDF sidecar AND a per-active-voxel
+///        NEAREST-TRIANGLE-INDEX sidecar (uint32), needed by step 5
 ///        (barrier signing). See MeshToGrid::getHandleAndUDFAndIndex. After building, a CPU oracle
 ///        re-derives each active voxel's distance from its stored triangle and checks it against the
 ///        UDF, and confirms background / no-hit voxels carry the INVALID (0xFFFFFFFF) index.
@@ -498,69 +493,280 @@ std::size_t cpuSignBarrier(const GridT* g,
 
 } // anonymous namespace
 
-CCResult computeCC(const GridHandleT& origHandle, const GridHandleT& derivedHandle,
-               const IndexSidecarT&               indexSidecar,
+// ---------------------------------------------------------------------------------------------------
+// Visualization export (Polyscope Sparse Volume Grid).
+//
+// Dumps one record per ORIGINAL-grid active voxel — [i,j,k, cc, sign, udf] — to a compact binary the
+// companion python viewer (mesh_to_sdf_viewer.py) reads via np.fromfile. cc is the derived-grid
+// connected-component label (barrier voxels, absent from the derived grid, get cc = -1 so they show as
+// their own category); sign is the final signed-level-set sign (step 5); udf is the world-space
+// unsigned distance. Gated by the CC_EXPORT_VIS env var so normal runs / self-tests are unaffected.
+//
+// File layout (little-endian):
+//   char   magic[8] = "CCVIS001"
+//   uint64 N                       (number of records)
+//   double voxelSize               (uniform; world units per voxel)
+//   double tx, ty, tz              (world position of index origin (0,0,0))
+//   N × { int32 i,j,k,cc,sign;  float udf }   (24 bytes each)
+// ---------------------------------------------------------------------------------------------------
+void exportMeshToSdf(const SdfPipeline* p, const std::string& path)
+{
+    using BuildT = nanovdb::ValueOnIndex;
+    using Traits = nanovdb::util::cuda::DeviceGridTraits<BuildT>;
+    const auto& origHandle    = p->orig;
+    const auto& derivedHandle = p->derived;
+    auto&       cc            = *p->cc;
+    auto&       sdf           = *p->sdf;
+    const auto& udfSidecar    = p->udf;
+    const auto& map           = p->map;
+
+    const auto* d_grid = derivedHandle.deviceGrid<BuildT>();
+    const auto* o_grid = origHandle.deviceGrid<BuildT>();
+
+    // --- derived grid (host copy) + CC arrays: gives every non-barrier voxel its component label ---
+    const uint32_t derLeafCount = Traits::getTreeData(d_grid).mNodeCount[0];
+    const uint64_t derBytes     = derivedHandle.bufferSize();
+    void* derBlob = nullptr;
+    cudaCheck(cudaMallocHost(&derBlob, derBytes));
+    cudaCheck(cudaMemcpy(derBlob, derivedHandle.deviceData(), derBytes, cudaMemcpyDeviceToHost));
+    const auto* h_der = reinterpret_cast<const nanovdb::NanoGrid<BuildT>*>(derBlob);
+
+    std::vector<uint64_t> offsets(std::size_t(derLeafCount) + 1);
+    cudaCheck(cudaMemcpy(offsets.data(), cc.deviceLeafComponentOffsets(),
+                         (std::size_t(derLeafCount) + 1) * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+    const uint64_t K = derLeafCount ? offsets[derLeafCount] : 0;
+    std::vector<nanovdb::Mask<3>> masks(K);
+    if (K) cudaCheck(cudaMemcpy(masks.data(), cc.deviceLeafComponentMasks(),
+                                std::size_t(K) * sizeof(nanovdb::Mask<3>), cudaMemcpyDeviceToHost));
+    std::vector<uint64_t> parent(K);
+    if (K) cudaCheck(cudaMemcpy(parent.data(), cc.deviceComponentParent(),
+                                std::size_t(K) * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+
+    const auto* dFirst = derLeafCount ? h_der->tree().getFirstLeaf() : nullptr;
+    auto voxelSlot = [&](uint32_t li, uint32_t n) -> uint64_t {       // voxel -> its global component slot
+        for (uint64_t s = offsets[li]; s < offsets[li + 1]; ++s)
+            if (masks[s].isOn(n)) return s;
+        return offsets[li];
+    };
+
+    // --- original grid (host copy) + final signs + UDF: the voxel set we actually export ---
+    const uint64_t origActive = Traits::getActiveVoxelCount(o_grid);
+    const uint64_t origBytes  = origHandle.bufferSize();
+    void* origBlob = nullptr;
+    cudaCheck(cudaMallocHost(&origBlob, origBytes));
+    cudaCheck(cudaMemcpy(origBlob, origHandle.deviceData(), origBytes, cudaMemcpyDeviceToHost));
+    const auto* h_orig = reinterpret_cast<const nanovdb::NanoGrid<BuildT>*>(origBlob);
+
+    std::vector<int8_t> signs(origActive + 1);
+    cudaCheck(cudaMemcpy(signs.data(), sdf.deviceSignedVoxelSign(),
+                         std::size_t(origActive + 1) * sizeof(int8_t), cudaMemcpyDeviceToHost));
+    std::vector<float> udf(origActive + 1);
+    cudaCheck(cudaMemcpy(udf.data(), static_cast<const float*>(udfSidecar.deviceData()),
+                         std::size_t(origActive + 1) * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // World transform (this example uses a uniform scale, zero translation, but read it generically).
+    const nanovdb::Vec3d w0 = map.applyMap(nanovdb::Vec3d(0.0, 0.0, 0.0));
+    const nanovdb::Vec3d wx = map.applyMap(nanovdb::Vec3d(1.0, 0.0, 0.0));
+    const double voxelSize  = wx[0] - w0[0];
+
+    std::ofstream out(path, std::ios::binary);
+    if (!out) { std::cerr << "CC_EXPORT_VIS: cannot open " << path << " for writing\n"; }
+    else {
+        const uint32_t origLeafCount = Traits::getTreeData(o_grid).mNodeCount[0];
+        const auto*    oFirst        = origLeafCount ? h_orig->tree().getFirstLeaf() : nullptr;
+
+        out.write("CCVIS001", 8);
+        const uint64_t N = origActive;
+        out.write(reinterpret_cast<const char*>(&N), sizeof(N));
+        out.write(reinterpret_cast<const char*>(&voxelSize), sizeof(double));
+        for (int a = 0; a < 3; ++a) { const double t = w0[a]; out.write(reinterpret_cast<const char*>(&t), sizeof(double)); }
+
+        uint64_t written = 0, barrier = 0;
+        for (uint32_t li = 0; li < origLeafCount; ++li) {
+            const auto& oleaf = oFirst[li];
+            const nanovdb::Coord o = oleaf.origin();
+            // matching derived leaf (same origin); pointer arithmetic gives its CC-array index
+            const auto* dleaf = dFirst ? h_der->tree().root().probeLeaf(o) : nullptr;
+            const uint32_t dli = dleaf ? uint32_t(dleaf - dFirst) : 0u;
+            for (uint32_t n = 0; n < 512; ++n) {
+                if (!oleaf.isActive(n)) continue;
+                const nanovdb::Coord ijk = o + nanovdb::NanoLeaf<BuildT>::OffsetToLocalCoord(n);
+                int32_t cclabel = -1;                                 // -1 = barrier (not in derived grid)
+                if (dleaf && dleaf->isActive(n)) cclabel = int32_t(parent[voxelSlot(dli, n)]);
+                else ++barrier;
+                const uint64_t vi = oleaf.getValue(n);
+                const int32_t  ii[5] = { ijk[0], ijk[1], ijk[2], cclabel, int32_t(signs[vi]) };
+                const float    d     = udf[vi];
+                out.write(reinterpret_cast<const char*>(ii), sizeof(ii));
+                out.write(reinterpret_cast<const char*>(&d), sizeof(float));
+                ++written;
+            }
+        }
+        std::cout << "CC_EXPORT_VIS: wrote " << written << " voxels (" << barrier
+                  << " barrier, cc=-1) to " << path << "  [voxelSize=" << voxelSize << "]\n";
+    }
+
+    // --- Step-6 interior fill (deep interior) -> companion "<path>.fill" ---
+    // One box per interior region, at its tree level: inactive interior leaf voxels (1^3), childless
+    // interior lower (8^3) / upper (128^3) tiles, and absent-root interior tiles (4096^3). Each record
+    // is the box's base VOXEL coord + level {0,1,2,3}; the viewer renders each as a cube sized to its
+    // level. This is what makes the deep interior — which lives in coarse childless tiles, not active
+    // voxels — visible for debugging step 6.
+    {
+        const uint32_t origLeafCount = Traits::getTreeData(o_grid).mNodeCount[0];
+        const uint32_t lowerCount = h_orig->tree().nodeCount(1);
+        const uint32_t upperCount = h_orig->tree().nodeCount(2);
+        std::vector<nanovdb::Mask<3>> leafInv(origLeafCount);
+        std::vector<nanovdb::Mask<4>> lowInv(lowerCount);
+        std::vector<nanovdb::Mask<5>> upInv(upperCount);
+        if (origLeafCount) cudaCheck(cudaMemcpy(leafInv.data(), sdf.deviceLeafInvertMask(),
+                             std::size_t(origLeafCount) * sizeof(nanovdb::Mask<3>), cudaMemcpyDeviceToHost));
+        if (lowerCount) cudaCheck(cudaMemcpy(lowInv.data(), sdf.deviceLowerInvertMask(),
+                             std::size_t(lowerCount) * sizeof(nanovdb::Mask<4>), cudaMemcpyDeviceToHost));
+        if (upperCount) cudaCheck(cudaMemcpy(upInv.data(), sdf.deviceUpperInvertMask(),
+                             std::size_t(upperCount) * sizeof(nanovdb::Mask<5>), cudaMemcpyDeviceToHost));
+        const nanovdb::Coord rMin = sdf.rootTileMin(), rDims = sdf.rootTileDims();
+        const uint64_t rTotal = uint64_t(rDims[0]) * uint64_t(rDims[1]) * uint64_t(rDims[2]);
+        std::vector<uint8_t> rootOn(rTotal);
+        if (rTotal) cudaCheck(cudaMemcpy(rootOn.data(), sdf.deviceRootInterior(), rTotal, cudaMemcpyDeviceToHost));
+
+        std::vector<int32_t> recs;   // 4 ints per box: baseVoxel x,y,z, level
+        const auto* oFirst = origLeafCount ? h_orig->tree().getFirstLeaf() : nullptr;
+        for (uint32_t li = 0; li < origLeafCount; ++li) {                        // level 0: 1^3
+            const auto& lf = oFirst[li]; const nanovdb::Coord o = lf.origin();
+            for (uint32_t n = 0; n < 512; ++n) {
+                if (lf.isActive(n) || !leafInv[li].isOn(n)) continue;
+                const nanovdb::Coord ijk = o + nanovdb::NanoLeaf<BuildT>::OffsetToLocalCoord(n);
+                recs.insert(recs.end(), { ijk[0], ijk[1], ijk[2], 0 });
+            }
+        }
+        const auto* loN = lowerCount ? h_orig->tree().template getFirstNode<1>() : nullptr;
+        for (uint32_t ni = 0; ni < lowerCount; ++ni) {                          // level 1: 8^3
+            const auto& nd = loN[ni];
+            for (uint32_t n = 0; n < 4096; ++n) {
+                if (nd.childMask().isOn(n) || !lowInv[ni].isOn(n)) continue;
+                const nanovdb::Coord g = nd.offsetToGlobalCoord(n);
+                recs.insert(recs.end(), { g[0], g[1], g[2], 1 });
+            }
+        }
+        const auto* upN = upperCount ? h_orig->tree().template getFirstNode<2>() : nullptr;
+        for (uint32_t ni = 0; ni < upperCount; ++ni) {                          // level 2: 128^3
+            const auto& nd = upN[ni];
+            for (uint32_t n = 0; n < 32768; ++n) {
+                if (nd.childMask().isOn(n) || !upInv[ni].isOn(n)) continue;
+                const nanovdb::Coord g = nd.offsetToGlobalCoord(n);
+                recs.insert(recs.end(), { g[0], g[1], g[2], 2 });
+            }
+        }
+        for (int i = 0; i < rDims[0]; ++i)                                        // level 3: 4096^3
+            for (int j = 0; j < rDims[1]; ++j)
+                for (int k = 0; k < rDims[2]; ++k)
+                    if (rootOn[(uint64_t(i) * rDims[1] + j) * rDims[2] + k]) {
+                        const nanovdb::Coord t = rMin + nanovdb::Coord(i, j, k);
+                        recs.insert(recs.end(), { t[0] * 4096, t[1] * 4096, t[2] * 4096, 3 });
+                    }
+
+        const std::string fillPath = std::string(path) + ".fill";
+        std::ofstream fout(fillPath, std::ios::binary);
+        if (!fout) { std::cerr << "CC_EXPORT_VIS: cannot open " << fillPath << "\n"; }
+        else {
+            const uint64_t M = recs.size() / 4;
+            fout.write("CCFILL01", 8);
+            fout.write(reinterpret_cast<const char*>(&M), sizeof(M));
+            fout.write(reinterpret_cast<const char*>(&voxelSize), sizeof(double));
+            for (int a = 0; a < 3; ++a) { const double t = w0[a]; fout.write(reinterpret_cast<const char*>(&t), sizeof(double)); }
+            fout.write(reinterpret_cast<const char*>(recs.data()), recs.size() * sizeof(int32_t));
+            std::cout << "CC_EXPORT_VIS: wrote " << M << " interior-fill boxes to " << fillPath << "\n";
+        }
+    }
+
+    cudaCheck(cudaFreeHost(derBlob));
+    cudaCheck(cudaFreeHost(origBlob));
+}
+
+// ---------------------------------------------------------------------------------------------------
+// BUILD : run the full mesh->SDF pipeline (steps 1-6) in order and return the live device state. No
+// validation, no visualization — those are separate passes over the returned SdfPipeline.
+// ---------------------------------------------------------------------------------------------------
+SdfPipeline* buildMeshToSdf(const std::vector<nanovdb::Vec3f>& points,
+                            const std::vector<nanovdb::Vec3i>& triangles,
+                            const nanovdb::Map& map, float bandWidth)
+{
+    using BuildT = nanovdb::ValueOnIndex;
+    auto* p = new SdfPipeline;
+    p->map = map;
+    p->bandWidth = bandWidth;
+    const float voxelSize = float(map.getVoxelSize()[0]);
+
+    // STEP 1: rasterize the mesh -> UDF + nearest-triangle-index sidecars (index oracle runs inside).
+    std::tie(p->orig, p->udf, p->index) = computeUDFAndIndex(points, triangles, map, bandWidth);
+    printGridDiagnostics(p->orig, "Rasterized UDF grid");
+
+    // STEP 2: prune the surface/barrier shell -> derived (CC-input) topology.
+    p->derived = computeDerivedTopology(p->orig, p->udf, voxelSize);
+    printGridDiagnostics(p->derived, "Derived CC-input grid");
+    auto* d_grid = p->derived.deviceGrid<BuildT>();
+
+    // STEP 3: connected components on the derived grid (per-leaf -> cross-leaf edges -> global labels).
+    p->cc = std::make_unique<nanovdb::tools::cuda::ConnectedComponents<BuildT>>(d_grid);
+    auto& cc = *p->cc;
+    cc.setVerbose(1);
+    cc.processLeafConnectedComponents(); cudaCheck(cudaDeviceSynchronize());
+    cc.processCrossLeafEdges();          cudaCheck(cudaDeviceSynchronize());
+    cc.processComponentLabels();         cudaCheck(cudaDeviceSynchronize());
+
+    p->sdf = std::make_unique<nanovdb::tools::cuda::MeshToSDF<BuildT>>();
+    auto& sdf = *p->sdf;
+    sdf.setVerbose(1);
+
+    // STEP 4: sign the non-barrier voxels from the labeling, then inject the signs onto the original.
+    sdf.signNonBarrier(d_grid, cc);                                 cudaCheck(cudaDeviceSynchronize());
+    sdf.injectSignsToOriginal(p->orig.deviceGrid<BuildT>(), d_grid); cudaCheck(cudaDeviceSynchronize());
+
+    // STEP 5: sign the barrier voxels in place on the original grid (mirror of OpenVDB's
+    // ComputeIntersectingVoxelSign); needs the mesh on the device + the nearest-triangle-index sidecar.
+    thrust::universal_vector<nanovdb::Vec3f> dPoints(points.begin(), points.end());
+    thrust::universal_vector<nanovdb::Vec3i> dTriangles(triangles.begin(), triangles.end());
+    sdf.signBarrier(p->orig.deviceGrid<BuildT>(),
+                    static_cast<const uint32_t*>(p->index.deviceData()),
+                    dPoints.data().get(), dTriangles.data().get(), map);
+    cudaCheck(cudaDeviceSynchronize());
+
+    // STEP 6: complete the level set via per-level invert-mask sidecars (leaf -> lower/upper -> root).
+    sdf.fillLeafInvertMask(p->orig.deviceGrid<BuildT>());    cudaCheck(cudaDeviceSynchronize());
+    sdf.fillCoarseInvertMasks(p->orig.deviceGrid<BuildT>());  cudaCheck(cudaDeviceSynchronize());
+    sdf.fillRootInteriorMask(p->orig.deviceGrid<BuildT>());   cudaCheck(cudaDeviceSynchronize());
+
+    return p;
+}
+
+void freeSdfPipeline(SdfPipeline* p) { delete p; }
+
+// ---------------------------------------------------------------------------------------------------
+// VALIDATE : independent CPU oracles + OpenVDB / analytic cross-checks over a built pipeline. Reads the
+// live device arrays through the pipeline (read-only) and returns the metrics summary.
+// ---------------------------------------------------------------------------------------------------
+SDFResult validateMeshToSdf(const SdfPipeline* p,
                const std::vector<nanovdb::Vec3f>& points,
                const std::vector<nanovdb::Vec3i>& triangles,
-               const nanovdb::Map&                map,
-               [[maybe_unused]] float             bandWidth,    // used only by the OpenVDB cross-check
                const double*                      analyticSpheres,   // numSpheres × {Cx,Cy,Cz,R} world, or nullptr
                int                                numAnalyticSpheres,
                const double*                      analyticBoxes,     // numBoxes × {Cx,Cy,Cz,halfExtent} world, or nullptr
                int                                numAnalyticBoxes)
 {
-    CCResult result;
+    SDFResult result;
     using BuildT = nanovdb::ValueOnIndex;
     using Traits = nanovdb::util::cuda::DeviceGridTraits<BuildT>;
 
+    const auto&                  origHandle    = p->orig;
+    const auto&                  derivedHandle = p->derived;
+    const auto&                  indexSidecar  = p->index;
+    const auto&                  map           = p->map;
+    [[maybe_unused]] const float bandWidth     = p->bandWidth;   // used only by the OpenVDB cross-check
+    auto&                        cc            = *p->cc;
+    auto&                        sdf           = *p->sdf;
+
     const auto* d_grid = derivedHandle.deviceGrid<BuildT>();
-
-    // Pure connected-components labeling (domain-agnostic): per-leaf CC -> cross-leaf edges ->
-    // global union-find. Steps 3/5/6 of the pipeline.
-    nanovdb::tools::cuda::ConnectedComponents<BuildT> cc(d_grid);
-    cc.setVerbose(1);
-    cc.processLeafConnectedComponents();
-    cudaCheck(cudaDeviceSynchronize());
-    cc.processCrossLeafEdges();
-    cudaCheck(cudaDeviceSynchronize());
-    cc.processComponentLabels();
-    cudaCheck(cudaDeviceSynchronize());
-
-    // Step 4 (SDF domain): sign the non-barrier voxels (+ exterior / - interior) from the labeling.
-    nanovdb::tools::cuda::MeshToSDF<BuildT> sdf;
-    sdf.setVerbose(1);
-    sdf.signNonBarrier(d_grid, cc);
-    cudaCheck(cudaDeviceSynchronize());
-
-    // Injection: carry the derived (non-barrier) signs back onto the original grid; barrier voxels
-    // (present only in the original) stay sentinel 0 for the future step-5 barrier signing.
-    sdf.injectSignsToOriginal(origHandle.deviceGrid<BuildT>(), d_grid);
-    cudaCheck(cudaDeviceSynchronize());
-
-    // Step 5 (SDF domain): sign the barrier voxels in place on the original grid (faithful mirror of
-    // OpenVDB ComputeIntersectingVoxelSign). Needs the mesh on the device (the per-UDF transformed-
-    // triangle buffer was freed) and the nearest-triangle-index sidecar.
-    thrust::universal_vector<nanovdb::Vec3f> dPoints(points.begin(), points.end());
-    thrust::universal_vector<nanovdb::Vec3i> dTriangles(triangles.begin(), triangles.end());
-    sdf.signBarrier(origHandle.deviceGrid<BuildT>(),
-                    static_cast<const uint32_t*>(indexSidecar.deviceData()),
-                    dPoints.data().get(), dTriangles.data().get(), map);
-    cudaCheck(cudaDeviceSynchronize());
-
-    // Step 6, chunk A (SDF domain): per-leaf invert masks signing the INACTIVE voxels inside
-    // materialized leaves (bit ON = interior).
-    sdf.fillLeafInvertMask(origHandle.deviceGrid<BuildT>());
-    cudaCheck(cudaDeviceSynchronize());
-
-    // Step 6, chunk B: lower/upper invert masks signing the CHILDLESS coarse tiles (bit ON =
-    // interior).
-    sdf.fillCoarseInvertMasks(origHandle.deviceGrid<BuildT>());
-    cudaCheck(cudaDeviceSynchronize());
-
-    // Step 6, chunk C: root-interior SIDECAR for the deep interior beyond any upper node (the grid
-    // itself is never mutated; sdf_detail::signedSignAt composes the full-domain sign).
-    sdf.fillRootInteriorMask(origHandle.deviceGrid<BuildT>());
-    cudaCheck(cudaDeviceSynchronize());
 
     const uint32_t leafCount = Traits::getTreeData(d_grid).mNodeCount[0];
     if (leafCount == 0) { std::cout << "CC validation: empty grid, nothing to check\n"; return result; }
@@ -856,6 +1062,18 @@ CCResult computeCC(const GridHandleT& origHandle, const GridHandleT& derivedHand
         // a real error (e.g. a flipped component) and fails the check.
         const float vs       = float(voxelSize);
         const float shellVox = std::sqrt(0.75f);  // √3/2 ≈ 0.866 voxels
+
+        // Optional Polyscope companion "<CC_EXPORT_VIS>.ovdb": one record per ORIGINAL-grid active
+        // voxel, in the SAME leaf/voxel iteration order as the .ccvis dump written by exportMeshToSdf
+        // (both walk getFirstLeaf() in leaf order over active voxels 0..511 of byte-identical grid
+        // copies), so the viewer associates them positionally. Each record carries OpenVDB's raw
+        // level-set value + sign at that voxel plus a precomputed mismatch class, so the viewer can
+        // highlight exactly the disagreements this validator reports. Additive: no OpenVDB, no file.
+        struct OvdbRec { float value; int32_t sign; int32_t mismatch; };  // mismatch: 0 agree, 1 beyond-shell, 2 in-shell
+        const char*          ovdbVisPath = std::getenv("CC_EXPORT_VIS");
+        std::vector<OvdbRec> ovdbRecs;
+        if (ovdbVisPath) ovdbRecs.reserve(origActive);
+
         std::size_t realMismatch = 0, shellTie = 0, shownO = 0;
         uint64_t nOutside = 0, nInside = 0; float maxRealVox = 0.0f;
         for (uint32_t li = 0; li < origLeafCount; ++li) {
@@ -868,15 +1086,23 @@ CCResult computeCC(const GridHandleT& origHandle, const GridHandleT& derivedHand
                 const int8_t ourSign = gpuSigned[oleaf.getValue(n)];
                 const int8_t ovSign  = (val < 0.0f) ? int8_t(-1) : int8_t(1);
                 if (ovSign > 0) ++nOutside; else ++nInside;
-                if (ovSign == ourSign) continue;
                 const float v = std::fabs(val) / vs;       // distance to surface, in voxels
-                if (v < shellVox) { ++shellTie; continue; } // within barrier shell: method-dependent
-                ++realMismatch;
-                if (v > maxRealVox) maxRealVox = v;
-                if (shownO++ < 10)
-                    std::cerr << "  OpenVDB sign mismatch @ (" << ijk[0] << "," << ijk[1] << "," << ijk[2]
-                              << ") ours=" << int(ourSign) << " openvdb=" << int(ovSign)
-                              << " val=" << val << " (" << v << " vox)\n";
+                int32_t mismatch = 0;                       // 0 = agree
+                if (ovSign != ourSign) {
+                    if (v < shellVox) {                     // within barrier shell: method-dependent
+                        mismatch = 2;
+                        ++shellTie;
+                    } else {                                // beyond shell: a real disagreement
+                        mismatch = 1;
+                        ++realMismatch;
+                        if (v > maxRealVox) maxRealVox = v;
+                        if (shownO++ < 10)
+                            std::cerr << "  OpenVDB sign mismatch @ (" << ijk[0] << "," << ijk[1] << ","
+                                      << ijk[2] << ") ours=" << int(ourSign) << " openvdb=" << int(ovSign)
+                                      << " val=" << val << " (" << v << " vox)\n";
+                    }
+                }
+                if (ovdbVisPath) ovdbRecs.push_back({ val, int32_t(ovSign), mismatch });
             }
         }
         std::cout << "OpenVDB sign cross-check:               " << (realMismatch == 0 ? "PASS" : "FAIL")
@@ -887,6 +1113,24 @@ CCResult computeCC(const GridHandleT& origHandle, const GridHandleT& derivedHand
         result.openvdbChecked          = true;
         result.confidentSignMismatches = realMismatch;
         result.inShellTies             = shellTie;
+
+        // Write the .ovdb companion (same directory/basename as the .ccvis dump).
+        if (ovdbVisPath) {
+            const std::string ovdbPath = std::string(ovdbVisPath) + ".ovdb";
+            std::ofstream oout(ovdbPath, std::ios::binary);
+            if (!oout) { std::cerr << "CC_EXPORT_VIS: cannot open " << ovdbPath << " for writing\n"; }
+            else {
+                // Layout: char magic[8]="CCOVDB01"; uint64 N; double voxelSize; N×{float value,int32 sign,int32 mismatch}.
+                const uint64_t M = ovdbRecs.size();
+                oout.write("CCOVDB01", 8);
+                oout.write(reinterpret_cast<const char*>(&M), sizeof(M));
+                oout.write(reinterpret_cast<const char*>(&voxelSize), sizeof(double));
+                oout.write(reinterpret_cast<const char*>(ovdbRecs.data()), ovdbRecs.size() * sizeof(OvdbRec));
+                std::cout << "CC_EXPORT_VIS: wrote " << M << " OpenVDB-comparison records to " << ovdbPath
+                          << " (" << realMismatch << " beyond-shell mismatches, " << shellTie
+                          << " in-shell ties)\n";
+            }
+        }
     }
 #endif
 

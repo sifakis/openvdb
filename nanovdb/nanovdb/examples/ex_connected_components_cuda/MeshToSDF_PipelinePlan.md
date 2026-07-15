@@ -4,10 +4,18 @@ High-level design notes for the GPU mesh-to-**SDF** pipeline on NanoVDB index gr
 This is the umbrella plan; the connected-components stage (step 3 below) has its own
 detailed notes in [`MeshToSDFDevelopmentPlan.md`](./MeshToSDFDevelopmentPlan.md).
 
-> **Where we are (2026-06-12).** Steps 2 and 3 are implemented and validated. Everything
-> else on this page is *planned / under design* — captured here from a design discussion so
-> the reasoning isn't lost. The cross-level "flood fill" (how the invert masks actually get
-> populated across the tree) is explicitly **still to be designed**; see the open items at the end.
+> **Where we are (2026-07-14).** Steps 1–6 are **all implemented** and validated. The narrow band
+> is signed (steps 4–5) and the sign is extended to all of space via per-level invert-mask sidecars,
+> filled bottom-up leaf → lower → upper → root (step 6); a single `signedSignAt(x)` query composes
+> the full level set, sidecar-only (grid topology is never rebuilt). The example driver is organized
+> into three passes over an opaque `SdfPipeline`: **`buildMeshToSdf`** (run steps 1–6),
+> **`validateMeshToSdf`** (independent CPU oracles + OpenVDB / analytic cross-checks), and
+> **`exportMeshToSdf`** (Polyscope visualization dump, viewed with `mesh_to_sdf_viewer.py`).
+> The design notes on this page match what shipped.
+>
+> **Known limitation.** Step 4's exterior rule is *single-seed* (the min-axis component is the only
+> region called exterior), so it mislabels **separated objects** and **nested / hollow** shapes
+> (reproduced by the `--two-spheres` probe). A more robust replacement is under design.
 
 ---
 
@@ -15,15 +23,15 @@ detailed notes in [`MeshToSDFDevelopmentPlan.md`](./MeshToSDFDevelopmentPlan.md)
 
 | # | Step | Status | Where | Notes |
 |---|------|--------|-------|-------|
-| 1 | **Compute UDF + triangle-index sidecar** | TODO | `MeshToGrid.cuh` (extend) | Rasterize mesh → narrow-band `ValueOnIndex` grid + **two** sidecars: the UDF (float per active voxel) and the **nearest-triangle index** (uint32 per active voxel). |
-| 2 | **Prune barrier voxels → derived topology** | ✅ done | `computeDerivedTopology` (example) | Drop voxels with `udf² < 0.75·voxelSize²` (the surface shell), rebuild a clean `ValueOnIndex` grid via `PruneGrid`. |
+| 1 | **Compute UDF + triangle-index sidecar** | ✅ done | `MeshToGrid.cuh` (`getHandleAndUDFAndIndex`) | Rasterize mesh → narrow-band `ValueOnIndex` grid + **two** sidecars: the UDF (float per active voxel) and the **nearest-triangle index** (uint32 per active voxel), written together via a packed-64 `atomicMin`. |
+| 2 | **Prune barrier voxels → derived topology** | ✅ done | `computeDerivedTopology` (`MeshToSDF.cuh`) | Drop voxels with `udf² < 0.75·voxelSize²` (the surface shell), rebuild a clean `ValueOnIndex` grid via `PruneGrid`. |
 | 3 | **Connected components on the pruned topology** | ✅ done | `ConnectedComponents.cuh` | Per-leaf CC → cross-leaf edges → global union-find. Output: `deviceComponentParent[]`. Detailed in the companion doc. |
-| 4 | **Sign the non-barrier voxels** | TODO | new | Identify the exterior CC (it contains the global min-x — or min-y/-z — active voxel) → `+`. All other CCs → `−`. |
-| 5 | **Sign the barrier voxels** | TODO | new | Replicate OpenVDB's `ComputeIntersectingVoxelSign`: use the triangle-index sidecar + already-signed neighbors to decide each barrier voxel's side. |
-| 6 | **Narrow band → "proper" (gap-free) SDF** | TODO (design) | new | Extend the level-set *representation* so inactive voxels/tiles at every tree level carry a sign. See "Level-set representation extension" below. Then a cross-level fill populates it. |
+| 4 | **Sign the non-barrier voxels** | ✅ done | `MeshToSDF::signNonBarrier` | Exterior CC = the one holding the global min-x active voxel → `+`; all other CCs → `−`. **Single-seed** — see the limitation note above. |
+| 5 | **Sign the barrier voxels** | ✅ done | `MeshToSDF::signBarrier` | Mirrors OpenVDB's `ComputeIntersectingVoxelSign` (double precision): each barrier voxel takes the side it shares with an already-signed neighbor via that neighbor's nearest triangle. Reads a sign snapshot → order-independent. |
+| 6 | **Complete the level set (gap-free fill)** | ✅ done | `MeshToSDF::fill{Leaf,Coarse}InvertMask`, `fillRootInteriorMask` | Per-level invert-mask sidecars carry the sign into inactive voxels/tiles; filled bottom-up leaf → lower → upper → root. Sidecar-only — grid topology never rebuilt. `signedSignAt` composes the query. |
 
-The **current task at hand** remains narrow: compute the discrete connected components of a
-`ValueOnIndex` grid (step 3). Steps 4–6 are the planned trajectory beyond that.
+**Status:** the full steps-1→6 pipeline is implemented and validated; current work is code cleanup
+and a more robust step-4 rule (the single-seed limitation above).
 
 ---
 

@@ -1,13 +1,13 @@
 # Visualizing the mesh → SDF pipeline
 
 Two steps: **(1)** run the CUDA example to dump the result to a file, **(2)** open that file in
-Polyscope with `mesh_to_sdf_viewer.py`. The dump is written only when the `CC_EXPORT_VIS` env var is
+Polyscope with `scripts/mesh_to_sdf_viewer.py`. The dump is written only when the `CC_EXPORT_VIS` env var is
 set, so normal runs / self-tests are unaffected.
 
 ```
 buildMeshToSdf ──(CC_EXPORT_VIS=path)──▶ exportMeshToSdf ──▶ path.ccvis (+ .fill, + .ovdb)
                                                                     │
-                                                      mesh_to_sdf_viewer.py ──▶ Polyscope window
+                                                      scripts/mesh_to_sdf_viewer.py ──▶ Polyscope window
 ```
 
 ---
@@ -55,11 +55,11 @@ low hundred-thousands — start around `0.008`–`0.01` and go finer only if nee
 
 ```bash
 ~/Desktop/work/.venv/bin/python \
-  ~/Desktop/Code/NVIDIA/openvdb/nanovdb/nanovdb/examples/ex_connected_components_cuda/mesh_to_sdf_viewer.py \
+  ~/Desktop/Code/NVIDIA/openvdb/nanovdb/nanovdb/examples/ex_connected_components_cuda/scripts/mesh_to_sdf_viewer.py \
   /tmp/bunny.ccvis
 ```
 
-(Or `source ~/Desktop/work/.venv/bin/activate` once, then `python mesh_to_sdf_viewer.py <dump>`.)
+(Or `source ~/Desktop/work/.venv/bin/activate` once, then `python scripts/mesh_to_sdf_viewer.py <dump>`.)
 
 ### Structures (each is an on/off toggle in the left panel)
 
@@ -145,4 +145,4 @@ Transparency is always available: each structure has a **Transparency** slider u
 
 `.ovdb` records are positionally aligned 1:1 with the `.ccvis` records. World position of voxel `ijk`
 = `(tx,ty,tz) + ijk · voxelSize`. See `exportMeshToSdf()` in `connected_components_cuda_kernels.cu`
-and the header docstring of `mesh_to_sdf_viewer.py`.
+and the header docstring of `scripts/mesh_to_sdf_viewer.py`.

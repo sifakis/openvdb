@@ -20,7 +20,7 @@ on NanoVDB index grids. This document is the running design notes for that work.
 | :--- | :--- |
 | `connected_components_cuda.cpp`         | Host driver: arg parsing, OBJ reader, synthetic test meshes, `nanovdb::Map`, calls the seam. No CUDA *code* (only header-only handle/buffer types). |
 | `connected_components_cuda_kernels.cu`  | CUDA / NanoVDB side. Three passes over an opaque `SdfPipeline`: **`buildMeshToSdf`** (steps 1–6: rasterize → prune → CC → sign → fill), **`validateMeshToSdf`** (CPU oracles + OpenVDB / analytic cross-checks), **`exportMeshToSdf`** (Polyscope dump). Plus `printGridDiagnostics()` and the synthetic `testRootInteriorFlood()` unit test. |
-| `mesh_to_sdf_viewer.py`                  | Polyscope viewer for the `exportMeshToSdf` dump (`.ccvis` + `.fill`). Not part of the build. |
+| `scripts/mesh_to_sdf_viewer.py`                  | Polyscope viewer for the `exportMeshToSdf` dump (`.ccvis` + `.fill`). Not part of the build. |
 | `MeshToSDF_PipelinePlan.md`             | Umbrella pipeline plan (steps 1–6). |
 | `MeshToSDFDevelopmentPlan.md`           | This document (CC / step-3 running notes). |
 | `standalone/cc_vis.cpp`                 | Standalone 2D CPU visualizer of the SV hook/compress primitives (see `standalone/README.md`). **Not** part of the example build — it lives one directory down so the `nanovdb_example` source glob (non-recursive) skips it; otherwise its `main()` would collide with the driver's. |

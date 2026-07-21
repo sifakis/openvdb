@@ -497,7 +497,7 @@ std::size_t cpuSignBarrier(const GridT* g,
 // Visualization export (Polyscope Sparse Volume Grid).
 //
 // Dumps one record per ORIGINAL-grid active voxel — [i,j,k, cc, sign, udf] — to a compact binary the
-// companion python viewer (mesh_to_sdf_viewer.py) reads via np.fromfile. cc is the derived-grid
+// companion python viewer (scripts/mesh_to_sdf_viewer.py) reads via np.fromfile. cc is the derived-grid
 // connected-component label (barrier voxels, absent from the derived grid, get cc = -1 so they show as
 // their own category); sign is the final signed-level-set sign (step 5); udf is the world-space
 // unsigned distance. Gated by the CC_EXPORT_VIS env var so normal runs / self-tests are unaffected.

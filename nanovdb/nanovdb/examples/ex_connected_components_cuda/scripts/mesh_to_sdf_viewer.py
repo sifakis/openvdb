@@ -9,7 +9,7 @@ example with the CC_EXPORT_VIS env var, e.g.:
 then view it:
 
     pip install polyscope numpy
-    python mesh_to_sdf_viewer.py /tmp/dragon.ccvis
+    python scripts/mesh_to_sdf_viewer.py /tmp/dragon.ccvis
 
 Each active voxel becomes one occupied cell of a Polyscope Sparse Volume Grid, with three
 togglable per-cell quantities:

@@ -368,9 +368,11 @@ int main(int argc, char* argv[])
         // Build the full mesh->SDF pipeline (steps 1-6; buildMeshToSdf prints the grid diagnostics),
         // optionally dump the visualization, then validate. No analytic ground truth for an arbitrary
         // mesh, so validation runs the CPU oracles (+ the OpenVDB cross-check when built with OpenVDB).
+        // Validation is CPU-heavy (host oracles + OpenVDB meshToLevelSet); set CC_SKIP_VALIDATE=1 to
+        // skip it and time the GPU pipeline alone (e.g. for benchmarking).
         SdfPipeline* pipeline = buildMeshToSdf(points, triangles, map, bandWidth);
         if (const char* visPath = std::getenv("CC_EXPORT_VIS")) exportMeshToSdf(pipeline, visPath);
-        validateMeshToSdf(pipeline, points, triangles);
+        if (!std::getenv("CC_SKIP_VALIDATE")) validateMeshToSdf(pipeline, points, triangles);
         freeSdfPipeline(pipeline);
 
         return 0;

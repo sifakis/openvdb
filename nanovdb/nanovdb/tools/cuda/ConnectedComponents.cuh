@@ -100,11 +100,23 @@ public:
     /// @param level Verbose level: 0=quiet, 1=timing, 2=benchmarking
     void setVerbose(int level = 1) { mVerbose = level; }
 
-    /// @brief Compute per-leaf connected components.
+    /// @brief Label all connected components: runs the three stages in order (per-leaf CC ->
+    ///        cross-leaf edges -> global labels). After it returns, deviceComponentParent()[s]
+    ///        holds component s's global representative. The individual stages remain publicly
+    ///        callable for granular use (e.g. unit tests that inspect intermediate outputs).
+    void label()
+    {
+        processLeafConnectedComponents();
+        processCrossLeafEdges();
+        processComponentLabels();
+    }
+
+    /// @brief Compute per-leaf connected components (stage 1 of 3).
     ///
-    ///        Initially this only enumerates, for every leaf node, the number of distinct
-    ///        connected components formed by that leaf's active voxels (treating each leaf
-    ///        in isolation), storing the result in the per-leaf array mLeafComponentCounts.
+    ///        For every leaf node, labels the distinct 6-connected components formed by that
+    ///        leaf's active voxels (treating each leaf in isolation) and records, per leaf-local
+    ///        component, its count, prefix-sum offset, active-voxel Mask<3>, and six boundary
+    ///        face masks. Cross-leaf connectivity is resolved by the later stages.
     void processLeafConnectedComponents();
 
     /// @brief Device pointer to the per-leaf component-count array (one uint16_t per leaf),
@@ -133,8 +145,8 @@ public:
         return reinterpret_cast<uint64_t(*)[6]>(mLeafComponentFaceMasks.deviceData());
     }
 
-    /// @brief Compute the cross-leaf connectivity edges of the component graph (step 5): for every
-    ///        pair of leaf-local components on face-adjacent leaves whose touching face masks
+    /// @brief Compute the cross-leaf connectivity edges of the component graph (stage 2 of 3): for
+    ///        every pair of leaf-local components on face-adjacent leaves whose touching face masks
     ///        intersect, emit one edge (global slot a, global slot b) with a < b. Requires
     ///        processLeafConnectedComponents() to have been called first. Edges are produced in an
     ///        unspecified order — compare as a set.
@@ -147,8 +159,8 @@ public:
     /// @brief Number of cross-leaf edges E, valid after processCrossLeafEdges().
     uint64_t crossLeafEdgeCount() const { return mCrossLeafEdgeCount; }
 
-    /// @brief Compute global component labels (step 6): union-find over the cross-leaf edges so two
-    ///        leaf-local components share a representative iff they are connected across leaves.
+    /// @brief Compute global component labels (stage 3 of 3): union-find over the cross-leaf edges so
+    ///        two leaf-local components share a representative iff they are connected across leaves.
     ///        Requires processCrossLeafEdges() first. After flatten, deviceComponentParent()[s] is
     ///        the global representative of component s (the minimum global slot in its class).
     void processComponentLabels();
@@ -432,7 +444,7 @@ struct LeafComponentMaskFunctor
 }; // LeafComponentMaskFunctor
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-// Step 5: cross-leaf connectivity edges.
+// Stage 2: cross-leaf connectivity edges.
 //
 // One block per leaf. For each of the leaf's +X/+Y/+Z neighbor leaves (so each undirected leaf-leaf
 // boundary is visited exactly once, from its -side), pair every local component of this leaf with
@@ -535,7 +547,7 @@ struct CrossLeafEdgeScatterFunctor
 };
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-// Step 6: global union-find over the cross-leaf edge list (representative = min slot in the class).
+// Stage 3: global union-find over the cross-leaf edge list (representative = min slot in the class).
 
 /// @brief Walk parent pointers to the root of x. Links always point larger->smaller slot, so the
 ///        forest is acyclic and this terminates; the root is the minimum slot in x's class.

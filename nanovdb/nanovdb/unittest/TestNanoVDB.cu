@@ -4216,9 +4216,7 @@ TEST(TestNanoVDBCUDA, ConnectedComponentsMultiSphere)
         const auto* d_grid = handle.template deviceGrid<BuildT>();
 
         nanovdb::tools::cuda::ConnectedComponents<BuildT> cc(d_grid);
-        cc.processLeafConnectedComponents();
-        cc.processCrossLeafEdges();
-        cc.processComponentLabels();
+        cc.label();
         cudaCheck(cudaDeviceSynchronize());
 
         const uint32_t leafCount = Traits::getTreeData(d_grid).mNodeCount[0];

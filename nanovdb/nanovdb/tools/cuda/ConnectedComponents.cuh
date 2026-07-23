@@ -87,11 +87,10 @@ public:
     /// @param level Verbose level: 0=quiet, 1=timing, 2=benchmarking
     void setVerbose(int level = 1) { mVerbose = level; }
 
-    /// @brief Run the connected-components pipeline (per-leaf CC -> cross-leaf edges -> global labels
-    ///        -> per-voxel labels) and return { d_labels, componentCount }:
+    /// @brief Run the connected-components pipeline and return { d_labels, componentCount }:
     ///          - d_labels: a device array of activeVoxelCount+1 uint32_t, indexed by leaf.getValue(n)
     ///            (slot 0 = background, sentinel 0xFFFFFFFF). Each active voxel holds its component's
-    ///            representative slot, so two active voxels share a value iff they are in the same
+    ///            dense id in [0, N), so two active voxels share a value iff they are in the same
     ///            connected component. This is a non-owning view valid for this object's lifetime.
     ///          - componentCount: the number of connected components N.
     std::pair<uint32_t*, uint64_t> getVoxelLabelsAndCount()
@@ -105,69 +104,30 @@ public:
 
 private:
 
-    // --- Internal pipeline stages + intermediate device arrays (not part of the public API). ---
+    // --- Pipeline stages (run in order by getVoxelLabelsAndCount). ---
 
-    /// @brief Compute per-leaf connected components (stage 1 of 3).
-    ///
-    ///        For every leaf node, labels the distinct 6-connected components formed by that
-    ///        leaf's active voxels (treating each leaf in isolation) and records, per leaf-local
-    ///        component, its count, prefix-sum offset, active-voxel Mask<3>, and six boundary
-    ///        face masks. Cross-leaf connectivity is resolved by the later stages.
+    // Stage 1: per-leaf 6-connected components (each leaf in isolation) -> per-component count,
+    // prefix-sum offset, active-voxel Mask<3>, and 6 face masks.
     void processLeafConnectedComponents();
 
-    /// @brief Device pointer to the per-leaf component-count array (one uint16_t per leaf),
-    ///        valid after processLeafConnectedComponents(). A leaf has at most 256 components
-    ///        (8^3 voxels, 6-connected worst case = 3D checkerboard), so uint16_t suffices.
-    uint16_t* deviceLeafComponentCounts() { return static_cast<uint16_t*>(mLeafComponentCounts.deviceData()); }
-
-    /// @brief Device pointer to the per-leaf component-offset array (one uint64_t per leaf plus
-    ///        one sentinel), valid after processLeafConnectedComponents().
-    ///        offsets[i]   = exclusive prefix = start of leaf i's component block.
-    ///        offsets[i+1] = inclusive prefix = end   of leaf i's component block.
-    ///        offsets[leafCount] = K, the total number of leaf-local components.
-    uint64_t* deviceLeafComponentOffsets() { return static_cast<uint64_t*>(mLeafComponentOffsets.deviceData()); }
-
-    /// @brief Device pointer to the flat array of per-component active-voxel masks,
-    ///        valid after processLeafConnectedComponents(). Leaf i's components occupy
-    ///        slots [offsets[i], offsets[i+1]), so mLeafComponentMasks[offsets[i] + k]
-    ///        is the Mask<3> for leaf i's k-th local component.
-    nanovdb::Mask<3>* deviceLeafComponentMasks() { return static_cast<nanovdb::Mask<3>*>(mLeafComponentMasks.deviceData()); }
-
-    /// @brief Device pointer to the per-component face masks, valid after
-    ///        processLeafConnectedComponents(). Indexed as [compIdx][LeafNeighborTap].
-    ///        Cross-leaf connectivity between component I of one leaf and component J of
-    ///        a face-adjacent leaf reduces to a single bitwise AND of the touching faces.
-    uint64_t (*deviceLeafComponentFaceMasks())[6] {
-        return reinterpret_cast<uint64_t(*)[6]>(mLeafComponentFaceMasks.deviceData());
-    }
-
-    /// @brief Compute the cross-leaf connectivity edges of the component graph (stage 2 of 3): for
-    ///        every pair of leaf-local components on face-adjacent leaves whose touching face masks
-    ///        intersect, emit one edge (global slot a, global slot b) with a < b. Requires
-    ///        processLeafConnectedComponents() to have been called first. Edges are produced in an
-    ///        unspecified order — compare as a set.
+    // Stage 2: emit one edge (a<b) per pair of face-adjacent leaf-local components whose touching
+    // face masks intersect. Unordered.
     void processCrossLeafEdges();
 
-    /// @brief Device pointer to the cross-leaf edge array (crossLeafEdgeCount() entries),
-    ///        valid after processCrossLeafEdges().
-    CrossLeafEdge* deviceCrossLeafEdges() { return static_cast<CrossLeafEdge*>(mCrossLeafEdges.deviceData()); }
-
-    /// @brief Number of cross-leaf edges E, valid after processCrossLeafEdges().
-    uint64_t crossLeafEdgeCount() const { return mCrossLeafEdgeCount; }
-
-    /// @brief Compute global component labels (stage 3 of 3): union-find over the cross-leaf edges so
-    ///        two leaf-local components share a representative iff they are connected across leaves.
-    ///        Requires processCrossLeafEdges() first. After flatten, deviceComponentParent()[s] is
-    ///        the global representative of component s (the minimum global slot in its class).
+    // Stage 3: union-find over the edges -> deviceComponentParent()[s] = component s's representative
+    // (its class's minimum global slot).
     void processComponentLabels();
 
-    /// @brief Device pointer to the per-component global representative array (K entries),
-    ///        valid after processComponentLabels().
-    uint64_t* deviceComponentParent() { return static_cast<uint64_t*>(mComponentParent.deviceData()); }
-
-    /// @brief Materialize the per-active-voxel label sidecar (representative slot per voxel) and the
-    ///        component count. Requires processComponentLabels() first; label() calls it.
+    // Build the per-voxel label sidecar + component count N from the parent array.
     void processVoxelLabels();
+
+    // --- Internal device-array accessors (each valid after the stage that fills it). ---
+    auto deviceLeafComponentCounts()    { return static_cast<uint16_t*>(mLeafComponentCounts.deviceData()); }
+    auto deviceLeafComponentOffsets()   { return static_cast<uint64_t*>(mLeafComponentOffsets.deviceData()); }
+    auto deviceLeafComponentMasks()     { return static_cast<nanovdb::Mask<3>*>(mLeafComponentMasks.deviceData()); }
+    auto deviceLeafComponentFaceMasks() { return reinterpret_cast<uint64_t(*)[6]>(mLeafComponentFaceMasks.deviceData()); }
+    auto deviceCrossLeafEdges()         { return static_cast<CrossLeafEdge*>(mCrossLeafEdges.deviceData()); }
+    auto deviceComponentParent()        { return static_cast<uint64_t*>(mComponentParent.deviceData()); }
 
     cudaStream_t                 mStream{0};
     util::cuda::Timer            mTimer;
@@ -188,7 +148,7 @@ private:
 
     nanovdb::cuda::DeviceBuffer  mComponentParent;          // K × uint64_t: per-component global representative
 
-    nanovdb::cuda::DeviceBuffer  mVoxelLabel;               // (activeVoxelCount+1) × uint32_t: per-active-voxel representative slot (index by leaf.getValue(n); slot 0 = background)
+    nanovdb::cuda::DeviceBuffer  mVoxelLabel;               // (activeVoxelCount+1) × uint32_t: per-active-voxel dense component id in [0,N) (index by leaf.getValue(n); slot 0 = background)
     uint64_t                     mGlobalComponentCount{0};  // number of connected components N (distinct representatives)
 
 }; // tools::cuda::ConnectedComponents<BuildT>
@@ -607,19 +567,20 @@ struct LabelFlattenFunctor {
     __device__ void operator()(size_t s, uint64_t* p) const { p[s] = ccFind(p, uint64_t(s)); }
 };
 
-// Count self-roots (parent[s] == s): the number of distinct global components N.
-struct CountSelfRootsFunctor {
-    __device__ void operator()(size_t s, const uint64_t* p, unsigned long long* cnt) const {
-        if (p[s] == uint64_t(s)) atomicAdd(cnt, 1ull);
+// flag[s] = 1 if component s is a self-root (parent[s]==s), else 0. An inclusive scan of these flags
+// gives each root its dense id (scan[root]-1) and, in the last entry, the component count N.
+struct RootFlagFunctor {
+    __device__ void operator()(size_t s, const uint64_t* p, uint32_t* flag) const {
+        flag[s] = (p[s] == uint64_t(s)) ? 1u : 0u;
     }
 };
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-// Voxel-label scatter: write each active voxel's representative slot into the per-voxel sidecar.
+// Voxel-label scatter: write each active voxel's dense component id into the per-voxel sidecar.
 //
 // One block per leaf, one thread per voxel offset n. The leaf's components partition its active
-// voxels, so the (short) scan over the leaf's slots finds the unique component containing n; its
-// representative slot parent[s] is written at leaf.getValue(n). No global search is needed.
+// voxels, so the short scan over the leaf's slots finds the unique component containing n; its dense
+// id (rank[parent[s]] - 1) is written at leaf.getValue(n).
 
 template <typename BuildT>
 struct VoxelLabelScatterFunctor
@@ -629,7 +590,7 @@ struct VoxelLabelScatterFunctor
 
     __device__ void operator()(const NanoGrid<BuildT>* d_grid, const uint64_t* d_offsets,
                                const nanovdb::Mask<3>* d_masks, const uint64_t* d_parent,
-                               uint32_t* d_voxelLabel)
+                               const uint32_t* d_rank, uint32_t* d_voxelLabel)
     {
         const int   leafID = blockIdx.x, n = threadIdx.x;
         const auto& leaf   = d_grid->tree().template getFirstNode<0>()[leafID];
@@ -637,7 +598,7 @@ struct VoxelLabelScatterFunctor
         const uint64_t base = d_offsets[leafID], end = d_offsets[leafID + 1];
         for (uint64_t s = base; s < end; ++s)
             if (d_masks[s].isOn(uint32_t(n))) {
-                d_voxelLabel[leaf.getValue(uint32_t(n))] = uint32_t(d_parent[s]);
+                d_voxelLabel[leaf.getValue(uint32_t(n))] = d_rank[d_parent[s]] - 1u;  // dense id in [0,N)
                 return;
             }
     }
@@ -823,7 +784,7 @@ void ConnectedComponents<BuildT>::processVoxelLabels()
     const uint64_t activeCount =
         util::cuda::DeviceGridTraits<BuildT>::getActiveVoxelCount(mDeviceSrcGrid);
 
-    // Per-active-voxel representative-slot sidecar (indexed by leaf.getValue(n); slot 0 = background).
+    // Per-active-voxel dense-label sidecar (indexed by leaf.getValue(n); slot 0 = background).
     mVoxelLabel = nanovdb::cuda::DeviceBuffer::create((activeCount + 1) * sizeof(uint32_t), nullptr, false);
     cudaCheck(cudaMemsetAsync(mVoxelLabel.deviceData(), 0xFF, (activeCount + 1) * sizeof(uint32_t), mStream)); // background = 0xFFFFFFFF
 
@@ -831,27 +792,30 @@ void ConnectedComponents<BuildT>::processVoxelLabels()
     const uint64_t K = mLeafComponentAggregateCount;
     if (leafCount == 0 || K == 0) return;
 
-    // (a) Scatter: each active voxel's representative slot -> sidecar.
+    // (a) Assign dense component ids: rank[s] = inclusive count of self-roots in [0,s], so a root's
+    //     dense id is rank[root]-1 and rank[K-1] = N.
+    auto rankBuf = nanovdb::cuda::DeviceBuffer::create(K * sizeof(uint32_t), nullptr, false);
+    auto* d_rank = static_cast<uint32_t*>(rankBuf.deviceData());
+    util::cuda::lambdaKernel<<<(unsigned int)((K + 255) / 256), 256, 0, mStream>>>(
+        K, cc_detail::RootFlagFunctor{}, deviceComponentParent(), d_rank);
+    cudaCheckError();
+    CALL_CUBS(DeviceScan::InclusiveSum, d_rank, d_rank, int(K));
+    cudaCheckError();
+
+    uint32_t hN = 0;
+    cudaCheck(cudaMemcpyAsync(&hN, d_rank + (K - 1), sizeof(uint32_t), cudaMemcpyDeviceToHost, mStream));
+    cudaCheck(cudaStreamSynchronize(mStream));
+    mGlobalComponentCount = uint64_t(hN);
+
+    // (b) Scatter: each active voxel's dense component id -> sidecar.
     using ScatterOp = cc_detail::VoxelLabelScatterFunctor<BuildT>;
     if (mVerbose==1) mTimer.start("Voxel-label scatter");
     util::cuda::operatorKernel<ScatterOp>
         <<<leafCount, ScatterOp::MaxThreadsPerBlock, 0, mStream>>>(
             mDeviceSrcGrid, deviceLeafComponentOffsets(), deviceLeafComponentMasks(),
-            deviceComponentParent(), static_cast<uint32_t*>(mVoxelLabel.deviceData()));
+            deviceComponentParent(), d_rank, static_cast<uint32_t*>(mVoxelLabel.deviceData()));
     cudaCheckError();
     if (mVerbose==1) mTimer.stop();
-
-    // (b) Component count N = number of self-roots (parent[s] == s).
-    auto cntBuf = nanovdb::cuda::DeviceBuffer::create(sizeof(unsigned long long), nullptr, false);
-    auto* d_cnt = static_cast<unsigned long long*>(cntBuf.deviceData());
-    cudaCheck(cudaMemsetAsync(d_cnt, 0, sizeof(unsigned long long), mStream));
-    util::cuda::lambdaKernel<<<(unsigned int)((K + 255) / 256), 256, 0, mStream>>>(
-        K, cc_detail::CountSelfRootsFunctor{}, deviceComponentParent(), d_cnt);
-    cudaCheckError();
-    unsigned long long hCnt = 0;
-    cudaCheck(cudaMemcpyAsync(&hCnt, d_cnt, sizeof(hCnt), cudaMemcpyDeviceToHost, mStream));
-    cudaCheck(cudaStreamSynchronize(mStream));
-    mGlobalComponentCount = uint64_t(hCnt);
 }// ConnectedComponents<BuildT>::processVoxelLabels
 
 } // namespace tools::cuda

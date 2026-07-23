@@ -1,4 +1,4 @@
-# ex_connected_components_cuda
+# ex_mesh_to_sdf_cuda
 
 A NanoVDB / CUDA example that builds toward a **connected-components (CC) labeling**
 on NanoVDB index grids. This document is the running design notes for that work.
@@ -18,8 +18,8 @@ on NanoVDB index grids. This document is the running design notes for that work.
 
 | File | Role |
 | :--- | :--- |
-| `connected_components_cuda.cpp`         | Host driver: arg parsing, OBJ reader, synthetic test meshes, `nanovdb::Map`, calls the seam. No CUDA *code* (only header-only handle/buffer types). |
-| `connected_components_cuda_kernels.cu`  | CUDA / NanoVDB side. Three passes over an opaque `SdfPipeline`: **`buildMeshToSdf`** (steps 1–6: rasterize → prune → CC → sign → fill), **`validateMeshToSdf`** (CPU oracles + OpenVDB / analytic cross-checks), **`exportMeshToSdf`** (Polyscope dump). Plus `printGridDiagnostics()` and the synthetic `testRootInteriorFlood()` unit test. |
+| `mesh_to_sdf_cuda.cpp`         | Host driver: arg parsing, OBJ reader, synthetic test meshes, `nanovdb::Map`, calls the seam. No CUDA *code* (only header-only handle/buffer types). |
+| `mesh_to_sdf_cuda_kernels.cu`  | CUDA / NanoVDB side. Three passes over an opaque `SdfPipeline`: **`buildMeshToSdf`** (steps 1–6: rasterize → prune → CC → sign → fill), **`validateMeshToSdf`** (CPU oracles + OpenVDB / analytic cross-checks), **`exportMeshToSdf`** (Polyscope dump). Plus `printGridDiagnostics()` and the synthetic `testRootInteriorFlood()` unit test. |
 | `scripts/mesh_to_sdf_viewer.py`                  | Polyscope viewer for the `exportMeshToSdf` dump (`.ccvis` + `.fill`). Not part of the build. |
 | `MeshToSDF_PipelinePlan.md`             | Umbrella pipeline plan (steps 1–6). |
 | `MeshToSDFDevelopmentPlan.md`           | This document (CC / step-3 running notes). |
@@ -372,7 +372,7 @@ Built as part of the NanoVDB examples when configured with
 `-DNANOVDB_BUILD_EXAMPLES=ON -DNANOVDB_USE_CUDA=ON`:
 
 ```bash
-./examples/ex_connected_components_cuda input.obj [voxelSize] [bandWidth]
+./examples/ex_mesh_to_sdf_cuda input.obj [voxelSize] [bandWidth]
 # defaults: voxelSize=0.01, bandWidth=3.0
 ```
 

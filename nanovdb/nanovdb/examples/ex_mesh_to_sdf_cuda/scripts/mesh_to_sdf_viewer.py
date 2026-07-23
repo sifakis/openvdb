@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """View a mesh->SDF pipeline dump in Polyscope as a Sparse Volume Grid.
 
-Companion to ex_connected_components_cuda. Produce the dump by running the CUDA
+Companion to ex_mesh_to_sdf_cuda. Produce the dump by running the CUDA
 example with the CC_EXPORT_VIS env var, e.g.:
 
-    CC_EXPORT_VIS=/tmp/dragon.ccvis ./nanovdb_example_ex_connected_components_cuda dragon.obj 0.001
+    CC_EXPORT_VIS=/tmp/dragon.ccvis ./ex_mesh_to_sdf_cuda dragon.obj 0.001
 
 then view it:
 

@@ -1,7 +1,7 @@
 # Standalone tools
 
 Self-contained helper programs for the connected-components work. These are **not**
-part of the `ex_connected_components_cuda` build: the `nanovdb_example` CMake helper
+part of the `ex_mesh_to_sdf_cuda` build: the `nanovdb_example` CMake helper
 globs `*.cpp`/`*.cu` directly in the example root (non-recursively), so anything in
 this subdirectory is intentionally excluded — each tool here has its own `main()` and
 is meant to be compiled by hand.

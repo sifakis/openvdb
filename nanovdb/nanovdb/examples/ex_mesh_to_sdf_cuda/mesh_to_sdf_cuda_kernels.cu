@@ -1,7 +1,7 @@
 // Copyright Contributors to the OpenVDB Project
 // SPDX-License-Identifier: Apache-2.0
 
-/// @file  connected_components_cuda_kernels.cu
+/// @file  mesh_to_sdf_cuda_kernels.cu
 ///
 /// @brief CUDA / NanoVDB side of the mesh->SDF example.
 ///
@@ -39,13 +39,13 @@
 #include <utility>
 #include <vector>
 
-// Must match the aliases in connected_components_cuda.cpp.
+// Must match the aliases in mesh_to_sdf_cuda.cpp.
 using GridHandleT   = nanovdb::GridHandle<nanovdb::cuda::DeviceBuffer>;
 using UDFSidecarT   = nanovdb::cuda::DeviceBuffer;
 using IndexSidecarT = nanovdb::cuda::DeviceBuffer;
 
 // Summary of validateMeshToSdf's checks, returned so the in-code analytic self-tests can assert on it.
-// (Definition must match in connected_components_cuda.cpp.)
+// (Definition must match in mesh_to_sdf_cuda.cpp.)
 struct SDFResult {
     uint64_t globalComponents            = 0;      // distinct global CC labels
     bool     openvdbChecked              = false;  // OpenVDB cross-check ran (needs NANOVDB_USE_OPENVDB)

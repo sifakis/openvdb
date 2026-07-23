@@ -32,7 +32,7 @@ Run the example with `CC_EXPORT_VIS=<path>`:
 ```bash
 cd ~/Desktop/Code/NVIDIA/openvdb/build/release
 CC_EXPORT_VIS=/tmp/bunny.ccvis \
-  nanovdb/nanovdb/examples/ex_connected_components_cuda ~/Desktop/meshes/bunny.obj 0.008
+  nanovdb/nanovdb/examples/ex_mesh_to_sdf_cuda ~/Desktop/meshes/bunny.obj 0.008
 ```
 
 Arguments: `<input.obj> [voxelSize] [bandWidth]` (also works with the synthetic `--sphere` /
@@ -55,7 +55,7 @@ low hundred-thousands — start around `0.008`–`0.01` and go finer only if nee
 
 ```bash
 ~/Desktop/work/.venv/bin/python \
-  ~/Desktop/Code/NVIDIA/openvdb/nanovdb/nanovdb/examples/ex_connected_components_cuda/scripts/mesh_to_sdf_viewer.py \
+  ~/Desktop/Code/NVIDIA/openvdb/nanovdb/nanovdb/examples/ex_mesh_to_sdf_cuda/scripts/mesh_to_sdf_viewer.py \
   /tmp/bunny.ccvis
 ```
 
@@ -144,5 +144,5 @@ Transparency is always available: each structure has a **Transparency** slider u
 ```
 
 `.ovdb` records are positionally aligned 1:1 with the `.ccvis` records. World position of voxel `ijk`
-= `(tx,ty,tz) + ijk · voxelSize`. See `exportMeshToSdf()` in `connected_components_cuda_kernels.cu`
+= `(tx,ty,tz) + ijk · voxelSize`. See `exportMeshToSdf()` in `mesh_to_sdf_cuda_kernels.cu`
 and the header docstring of `scripts/mesh_to_sdf_viewer.py`.

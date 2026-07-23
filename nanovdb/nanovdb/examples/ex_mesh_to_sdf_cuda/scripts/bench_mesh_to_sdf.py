@@ -8,10 +8,10 @@ is printed by the CC label validator)."""
 import subprocess, re, time, os, sys
 
 EXE = os.path.expanduser("~/Desktop/Code/NVIDIA/openvdb/build/release/"
-                         "nanovdb/nanovdb/examples/ex_connected_components_cuda")
+                         "nanovdb/nanovdb/examples/ex_mesh_to_sdf_cuda")
 MESHES = os.path.expanduser("~/Desktop/meshes")
 OUT = os.path.expanduser("~/Desktop/Code/NVIDIA/openvdb/nanovdb/nanovdb/examples/"
-                         "ex_connected_components_cuda/BENCHMARK.md")
+                         "ex_mesh_to_sdf_cuda/BENCHMARK.md")
 
 # Pipeline step boundaries — the first timer label of each step (positional; some labels repeat
 # across MeshToGrid/PruneGrid so we bucket by order, not by name).

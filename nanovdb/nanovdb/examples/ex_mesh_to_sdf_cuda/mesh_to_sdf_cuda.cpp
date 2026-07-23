@@ -1,7 +1,7 @@
 // Copyright Contributors to the OpenVDB Project
 // SPDX-License-Identifier: Apache-2.0
 
-/// @file  connected_components_cuda.cpp
+/// @file  mesh_to_sdf_cuda.cpp
 ///
 /// @brief Host driver for the connected-components example (NanoVDB / CUDA only,
 ///        no OpenVDB). Reads a triangle mesh from a Wavefront .obj file, builds the
@@ -31,7 +31,7 @@ using GridHandleT   = nanovdb::GridHandle<nanovdb::cuda::DeviceBuffer>;
 using UDFSidecarT   = nanovdb::cuda::DeviceBuffer;
 using IndexSidecarT = nanovdb::cuda::DeviceBuffer;
 
-// Summary of validateMeshToSdf's checks (definition must match connected_components_cuda_kernels.cu).
+// Summary of validateMeshToSdf's checks (definition must match mesh_to_sdf_cuda_kernels.cu).
 struct SDFResult {
     uint64_t globalComponents            = 0;
     bool     openvdbChecked              = false;
@@ -53,7 +53,7 @@ struct SDFResult {
     uint64_t fullDomainTies              = 0;
 };
 
-// ---- Host/device seam (all implemented in connected_components_cuda_kernels.cu) --------------------
+// ---- Host/device seam (all implemented in mesh_to_sdf_cuda_kernels.cu) --------------------
 //
 // The mesh->SDF example runs as three passes over an opaque pipeline object (SdfPipeline; defined on
 // the CUDA side because it embeds CUDA-only types — the host driver only ever holds a pointer):

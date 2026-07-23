@@ -30,7 +30,7 @@
 #include <nanovdb/cuda/DeviceBuffer.h>
 #include <nanovdb/math/Proximity.h>                    // closestPointOnTriangleToPoint
 #include <nanovdb/tools/cuda/PruneGrid.cuh>
-#include <nanovdb/tools/cuda/ConnectedComponents.cuh>  // ConnectedComponents<> + ccVoxelComponentSlot()
+#include <nanovdb/tools/cuda/ConnectedComponents.cuh>  // ConnectedComponents<>
 #include <nanovdb/util/cuda/Injection.cuh>             // InjectGridDataFunctor
 #include <nanovdb/util/cuda/DeviceGridTraits.cuh>
 #include <nanovdb/util/cuda/Timer.h>
@@ -90,16 +90,14 @@ struct FindExteriorRepFunctor
     static constexpr int MaxThreadsPerBlock         = LEAF_SIZE;
     static constexpr int MinBlocksPerMultiprocessor = 1;
 
-    __device__ void operator()(const NanoGrid<BuildT>* d_grid, const nanovdb::Mask<3>* d_masks,
-                               const uint64_t* d_offsets, const uint64_t* d_parent,
+    __device__ void operator()(const NanoGrid<BuildT>* d_grid, const uint32_t* d_voxelLabel,
                                unsigned long long* d_minKey)
     {
         const int leafID = blockIdx.x, n = threadIdx.x;
         const auto& leaf = d_grid->tree().template getFirstNode<0>()[leafID];
         if (!leaf.isActive(uint32_t(n))) return;
         const nanovdb::Coord ijk = leaf.origin() + nanovdb::NanoLeaf<BuildT>::OffsetToLocalCoord(uint32_t(n));
-        const uint64_t s   = ccVoxelComponentSlot(d_masks, d_offsets, uint32_t(leafID), uint32_t(n));
-        const uint32_t rep = uint32_t(d_parent[s]);
+        const uint32_t rep = d_voxelLabel[leaf.getValue(uint32_t(n))];  // component representative slot
         const uint32_t ux  = uint32_t(int64_t(ijk[0]) + (int64_t(1) << 31));  // x, shifted to unsigned-comparable
         const unsigned long long key = (static_cast<unsigned long long>(ux) << 32) | rep;
         atomicMin(d_minKey, key);
@@ -114,15 +112,14 @@ struct SignNonBarrierFunctor
     static constexpr int MaxThreadsPerBlock         = LEAF_SIZE;
     static constexpr int MinBlocksPerMultiprocessor = 1;
 
-    __device__ void operator()(const NanoGrid<BuildT>* d_grid, const nanovdb::Mask<3>* d_masks,
-                               const uint64_t* d_offsets, const uint64_t* d_parent,
+    __device__ void operator()(const NanoGrid<BuildT>* d_grid, const uint32_t* d_voxelLabel,
                                uint32_t exteriorRep, int8_t* d_sign)
     {
         const int leafID = blockIdx.x, n = threadIdx.x;
         const auto& leaf = d_grid->tree().template getFirstNode<0>()[leafID];
         if (!leaf.isActive(uint32_t(n))) return;
-        const uint64_t s = ccVoxelComponentSlot(d_masks, d_offsets, uint32_t(leafID), uint32_t(n));
-        d_sign[leaf.getValue(uint32_t(n))] = (uint32_t(d_parent[s]) == exteriorRep) ? int8_t(1) : int8_t(-1);
+        const uint32_t rep = d_voxelLabel[leaf.getValue(uint32_t(n))];  // component representative slot
+        d_sign[leaf.getValue(uint32_t(n))] = (rep == exteriorRep) ? int8_t(1) : int8_t(-1);
     }
 };
 
@@ -776,11 +773,11 @@ public:
 
     /// @brief Sign the non-barrier voxels of a CC-labeled grid: the component containing the global
     ///        minimum-x active voxel is the exterior (+); every other component is interior (-).
-    ///        Convention: +outside / -inside. Requires @c cc to have completed
-    ///        processLeafConnectedComponents() → processCrossLeafEdges() → processComponentLabels().
-    /// @param d_grid the CC-labeled (derived) device grid
-    /// @param cc     a ConnectedComponents instance holding that grid's labeling
-    void signNonBarrier(const GridT* d_grid, ConnectedComponents<BuildT>& cc);
+    ///        Convention: +outside / -inside.
+    /// @param d_grid      the CC-labeled (derived) device grid
+    /// @param d_voxelLabel per-active-voxel component-label sidecar for @a d_grid (from
+    ///                     ConnectedComponents::getVoxelLabelsAndCount()), indexed by leaf.getValue(n).
+    void signNonBarrier(const GridT* d_grid, const uint32_t* d_voxelLabel);
 
     /// @brief Carry the derived-grid signs (from signNonBarrier) back onto the original grid. The
     ///        derived grid is the barrier-pruned subset of the original, so the injection covers all
@@ -932,7 +929,7 @@ MeshToSDF<BuildT>::computeDerivedTopology(const GridT* d_srcGrid, const float* d
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 template <typename BuildT>
-void MeshToSDF<BuildT>::signNonBarrier(const GridT* d_grid, ConnectedComponents<BuildT>& cc)
+void MeshToSDF<BuildT>::signNonBarrier(const GridT* d_grid, const uint32_t* d_voxelLabel)
 {
     const uint32_t leafCount =
         util::cuda::DeviceGridTraits<BuildT>::getTreeData(d_grid).mNodeCount[0];
@@ -950,8 +947,7 @@ void MeshToSDF<BuildT>::signNonBarrier(const GridT* d_grid, ConnectedComponents<
     cudaCheck(cudaMemcpyAsync(d_minKey, &initKey, sizeof(initKey), cudaMemcpyHostToDevice, mStream));
     using FindOp = sdf_detail::FindExteriorRepFunctor<BuildT>;
     util::cuda::operatorKernel<FindOp><<<leafCount, FindOp::MaxThreadsPerBlock, 0, mStream>>>(
-        d_grid, cc.deviceLeafComponentMasks(), cc.deviceLeafComponentOffsets(),
-        cc.deviceComponentParent(), d_minKey);
+        d_grid, d_voxelLabel, d_minKey);
     cudaCheckError();
     unsigned long long minKey = 0;
     cudaCheck(cudaMemcpyAsync(&minKey, d_minKey, sizeof(minKey), cudaMemcpyDeviceToHost, mStream));
@@ -965,8 +961,7 @@ void MeshToSDF<BuildT>::signNonBarrier(const GridT* d_grid, ConnectedComponents<
     using SignOp = sdf_detail::SignNonBarrierFunctor<BuildT>;
     if (mVerbose==1) mTimer.start("Sign: write per-voxel signs");
     util::cuda::operatorKernel<SignOp><<<leafCount, SignOp::MaxThreadsPerBlock, 0, mStream>>>(
-        d_grid, cc.deviceLeafComponentMasks(), cc.deviceLeafComponentOffsets(),
-        cc.deviceComponentParent(), uint32_t(mExteriorRep), deviceVoxelSign());
+        d_grid, d_voxelLabel, uint32_t(mExteriorRep), deviceVoxelSign());
     cudaCheckError();
     if (mVerbose==1) mTimer.stop();
 }// MeshToSDF<BuildT>::signNonBarrier

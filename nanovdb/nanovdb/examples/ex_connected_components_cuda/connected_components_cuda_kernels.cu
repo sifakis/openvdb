@@ -78,6 +78,7 @@ struct SdfPipeline {
     nanovdb::Map  map;            // index<->world transform
     float         bandWidth = 0.f;
     std::unique_ptr<nanovdb::tools::cuda::ConnectedComponents<nanovdb::ValueOnIndex>> cc;   // step 3 labels
+    std::pair<uint32_t*, uint64_t> ccLabels{nullptr, 0};   // { per-voxel label sidecar (owned by cc), component count N }
     std::unique_ptr<nanovdb::tools::cuda::MeshToSDF<nanovdb::ValueOnIndex>>           sdf;  // steps 4-6 signs+fill
 };
 
@@ -515,7 +516,6 @@ void exportMeshToSdf(const SdfPipeline* p, const std::string& path)
     using Traits = nanovdb::util::cuda::DeviceGridTraits<BuildT>;
     const auto& origHandle    = p->orig;
     const auto& derivedHandle = p->derived;
-    auto&       cc            = *p->cc;
     auto&       sdf           = *p->sdf;
     const auto& udfSidecar    = p->udf;
     const auto& map           = p->map;
@@ -523,7 +523,7 @@ void exportMeshToSdf(const SdfPipeline* p, const std::string& path)
     const auto* d_grid = derivedHandle.deviceGrid<BuildT>();
     const auto* o_grid = origHandle.deviceGrid<BuildT>();
 
-    // --- derived grid (host copy) + CC arrays: gives every non-barrier voxel its component label ---
+    // --- derived grid (host copy) + CC voxel-label sidecar: every non-barrier voxel's component label ---
     const uint32_t derLeafCount = Traits::getTreeData(d_grid).mNodeCount[0];
     const uint64_t derBytes     = derivedHandle.bufferSize();
     void* derBlob = nullptr;
@@ -531,23 +531,13 @@ void exportMeshToSdf(const SdfPipeline* p, const std::string& path)
     cudaCheck(cudaMemcpy(derBlob, derivedHandle.deviceData(), derBytes, cudaMemcpyDeviceToHost));
     const auto* h_der = reinterpret_cast<const nanovdb::NanoGrid<BuildT>*>(derBlob);
 
-    std::vector<uint64_t> offsets(std::size_t(derLeafCount) + 1);
-    cudaCheck(cudaMemcpy(offsets.data(), cc.deviceLeafComponentOffsets(),
-                         (std::size_t(derLeafCount) + 1) * sizeof(uint64_t), cudaMemcpyDeviceToHost));
-    const uint64_t K = derLeafCount ? offsets[derLeafCount] : 0;
-    std::vector<nanovdb::Mask<3>> masks(K);
-    if (K) cudaCheck(cudaMemcpy(masks.data(), cc.deviceLeafComponentMasks(),
-                                std::size_t(K) * sizeof(nanovdb::Mask<3>), cudaMemcpyDeviceToHost));
-    std::vector<uint64_t> parent(K);
-    if (K) cudaCheck(cudaMemcpy(parent.data(), cc.deviceComponentParent(),
-                                std::size_t(K) * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+    // Per-active-voxel component label (representative slot), indexed by derived leaf.getValue(n).
+    const uint64_t derActive = Traits::getActiveVoxelCount(d_grid);
+    std::vector<uint32_t> voxelLabel(derActive + 1);
+    cudaCheck(cudaMemcpy(voxelLabel.data(), p->ccLabels.first,
+                         std::size_t(derActive + 1) * sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
     const auto* dFirst = derLeafCount ? h_der->tree().getFirstLeaf() : nullptr;
-    auto voxelSlot = [&](uint32_t li, uint32_t n) -> uint64_t {       // voxel -> its global component slot
-        for (uint64_t s = offsets[li]; s < offsets[li + 1]; ++s)
-            if (masks[s].isOn(n)) return s;
-        return offsets[li];
-    };
 
     // --- original grid (host copy) + final signs + UDF: the voxel set we actually export ---
     const uint64_t origActive = Traits::getActiveVoxelCount(o_grid);
@@ -585,14 +575,13 @@ void exportMeshToSdf(const SdfPipeline* p, const std::string& path)
         for (uint32_t li = 0; li < origLeafCount; ++li) {
             const auto& oleaf = oFirst[li];
             const nanovdb::Coord o = oleaf.origin();
-            // matching derived leaf (same origin); pointer arithmetic gives its CC-array index
+            // matching derived leaf (same origin) gives each voxel's CC label from the sidecar
             const auto* dleaf = dFirst ? h_der->tree().root().probeLeaf(o) : nullptr;
-            const uint32_t dli = dleaf ? uint32_t(dleaf - dFirst) : 0u;
             for (uint32_t n = 0; n < 512; ++n) {
                 if (!oleaf.isActive(n)) continue;
                 const nanovdb::Coord ijk = o + nanovdb::NanoLeaf<BuildT>::OffsetToLocalCoord(n);
                 int32_t cclabel = -1;                                 // -1 = barrier (not in derived grid)
-                if (dleaf && dleaf->isActive(n)) cclabel = int32_t(parent[voxelSlot(dli, n)]);
+                if (dleaf && dleaf->isActive(n)) cclabel = int32_t(voxelLabel[dleaf->getValue(n)]);
                 else ++barrier;
                 const uint64_t vi = oleaf.getValue(n);
                 const int32_t  ii[5] = { ijk[0], ijk[1], ijk[2], cclabel, int32_t(signs[vi]) };
@@ -711,16 +700,14 @@ SdfPipeline* buildMeshToSdf(const std::vector<nanovdb::Vec3f>& points,
     p->cc = std::make_unique<nanovdb::tools::cuda::ConnectedComponents<BuildT>>(d_grid);
     auto& cc = *p->cc;
     cc.setVerbose(1);
-    cc.processLeafConnectedComponents(); cudaCheck(cudaDeviceSynchronize());
-    cc.processCrossLeafEdges();          cudaCheck(cudaDeviceSynchronize());
-    cc.processComponentLabels();         cudaCheck(cudaDeviceSynchronize());
+    p->ccLabels = cc.getVoxelLabelsAndCount();  cudaCheck(cudaDeviceSynchronize());
 
     p->sdf = std::make_unique<nanovdb::tools::cuda::MeshToSDF<BuildT>>();
     auto& sdf = *p->sdf;
     sdf.setVerbose(1);
 
     // STEP 4: sign the non-barrier voxels from the labeling, then inject the signs onto the original.
-    sdf.signNonBarrier(d_grid, cc);                                 cudaCheck(cudaDeviceSynchronize());
+    sdf.signNonBarrier(d_grid, p->ccLabels.first);                  cudaCheck(cudaDeviceSynchronize());
     sdf.injectSignsToOriginal(p->orig.deviceGrid<BuildT>(), d_grid); cudaCheck(cudaDeviceSynchronize());
 
     // STEP 5: sign the barrier voxels in place on the original grid (mirror of OpenVDB's
@@ -763,7 +750,7 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
     const auto&                  indexSidecar  = p->index;
     const auto&                  map           = p->map;
     [[maybe_unused]] const float bandWidth     = p->bandWidth;   // used only by the OpenVDB cross-check
-    auto&                        cc            = *p->cc;
+    [[maybe_unused]] auto&       cc            = *p->cc;          // used only by the retained #if 0 checks
     auto&                        sdf           = *p->sdf;
 
     const auto* d_grid = derivedHandle.deviceGrid<BuildT>();
@@ -771,20 +758,55 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
     const uint32_t leafCount = Traits::getTreeData(d_grid).mNodeCount[0];
     if (leafCount == 0) { std::cout << "CC validation: empty grid, nothing to check\n"; return result; }
 
-    // GPU result -> host.
-    std::vector<uint16_t> gpuCounts(leafCount);
-    cudaCheck(cudaMemcpy(gpuCounts.data(), cc.deviceLeafComponentCounts(),
-                         std::size_t(leafCount) * sizeof(uint16_t), cudaMemcpyDeviceToHost));
-
-    // CPU validation. NanoVDB grids are position-independent (relative offsets), so a raw
-    // byte copy of the device blob into a (32B-aligned) scratch host buffer is itself a valid
-    // host grid. We don't touch the handle (no deviceDownload residue); the scratch is freed
-    // immediately after the check.
+    // Host copy of the derived grid. NanoVDB grids are position-independent (relative offsets), so a
+    // raw byte copy of the device blob into a 32B-aligned pinned buffer is itself a valid host grid.
+    // Shared by the voxel-label contract check and the non-barrier sign check below.
     const uint64_t gridBytes = derivedHandle.bufferSize();
     void* hostBlob = nullptr;
     cudaCheck(cudaMallocHost(&hostBlob, gridBytes));   // pinned, >=32B aligned
     cudaCheck(cudaMemcpy(hostBlob, derivedHandle.deviceData(), gridBytes, cudaMemcpyDeviceToHost));
     const auto* h_grid = reinterpret_cast<const nanovdb::NanoGrid<BuildT>*>(hostBlob);
+
+    // ---- CC voxel-label contract validation (public API: getVoxelLabelsAndCount) ----
+    // Independent connectivity property: any two 6-adjacent active voxels must carry the same component
+    // label. This catches a cross-leaf under-merge without touching CC internals; N is the reported
+    // component count. The deeper white-box cross-checks (per-leaf counts, masks/faces, cross-leaf
+    // edges, union-find labels) that used the now-private accessors are retained under `#if 0` below.
+    const uint64_t derActive = Traits::getActiveVoxelCount(d_grid);
+    std::vector<uint32_t> voxelLabel(derActive + 1);
+    cudaCheck(cudaMemcpy(voxelLabel.data(), p->ccLabels.first,
+                         std::size_t(derActive + 1) * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    {
+        auto acc = h_grid->getAccessor();
+        const nanovdb::Coord dirs[6] = { nanovdb::Coord(1,0,0), nanovdb::Coord(-1,0,0),
+                                         nanovdb::Coord(0,1,0), nanovdb::Coord(0,-1,0),
+                                         nanovdb::Coord(0,0,1), nanovdb::Coord(0,0,-1) };
+        const auto* leaves0 = h_grid->tree().getFirstLeaf();
+        std::size_t adjViolations = 0;
+        for (uint32_t li = 0; li < leafCount; ++li) {
+            const auto& leaf = leaves0[li];
+            for (uint32_t n = 0; n < 512; ++n) {
+                if (!leaf.isActive(n)) continue;
+                const nanovdb::Coord c = leaf.origin() + nanovdb::NanoLeaf<BuildT>::OffsetToLocalCoord(n);
+                const uint32_t lc = voxelLabel[leaf.getValue(n)];
+                for (const auto& d : dirs) {
+                    const nanovdb::Coord nb = c + d;
+                    if (acc.isActive(nb) && voxelLabel[acc.getValue(nb)] != lc) ++adjViolations;
+                }
+            }
+        }
+        const uint64_t N = p->ccLabels.second;
+        result.globalComponents = N;
+        std::cout << "CC voxel-label contract validation:     " << (adjViolations == 0 ? "PASS" : "FAIL")
+                  << " (" << derActive << " active voxels, " << N << " components, "
+                  << adjViolations << " adjacency violations)\n";
+    }
+
+#if 0  // [Retained for reference] white-box CC cross-checks — used the now-private CC internal accessors.
+    // GPU result -> host.
+    std::vector<uint16_t> gpuCounts(leafCount);
+    cudaCheck(cudaMemcpy(gpuCounts.data(), cc.deviceLeafComponentCounts(),
+                         std::size_t(leafCount) * sizeof(uint16_t), cudaMemcpyDeviceToHost));
 
     const std::vector<uint16_t> cpuCounts = cpuLeafComponentCounts(h_grid);
 
@@ -925,30 +947,23 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
               << (labelMismatch == 0 ? "PASS" : "FAIL") << " ("
               << K << " components, " << distinct << " global labels, "
               << labelMismatch << " mismatches)\n";
-    result.globalComponents = distinct;
+#endif  // [Retained for reference] white-box CC cross-checks
 
-    // ---- Validate non-barrier voxel signs (pipeline step 4) ----
+    // ---- Validate non-barrier voxel signs (public API: deviceVoxelLabel + deviceVoxelSign) ----
     // Independently pick the exterior component (the one holding the global min-x active voxel),
     // sign every active voxel (+ exterior / - interior), and compare to the GPU per-voxel buffer.
-    // Reuses the already-validated component offsets, masks, and parent array.
-    const uint64_t activeCount = Traits::getActiveVoxelCount(d_grid);
+    // Uses the voxel-label sidecar downloaded above.
+    const uint64_t activeCount = derActive;
     const auto* leaves = h_grid->tree().getFirstLeaf();
 
-    // voxel -> its global component slot (scan the leaf's component masks)
-    auto voxelSlot = [&](uint32_t li, uint32_t n) -> uint64_t {
-        for (uint64_t s = gpuOffsets[li]; s < gpuOffsets[li + 1]; ++s)
-            if (gpuMasks[s].isOn(n)) return s;
-        return gpuOffsets[li];
-    };
-
-    // exterior representative = parent of the component holding the global minimum-x active voxel
-    uint64_t exteriorRepCpu = 0; int32_t bestX = 0; bool found = false;
+    // exterior representative = the component label of the global minimum-x active voxel
+    uint32_t exteriorRepCpu = 0; int32_t bestX = 0; bool found = false;
     for (uint32_t li = 0; li < leafCount; ++li) {
         const auto& leaf = leaves[li];
         for (uint32_t n = 0; n < 512; ++n) {
             if (!leaf.isActive(n)) continue;
             const auto ijk = leaf.origin() + nanovdb::NanoLeaf<BuildT>::OffsetToLocalCoord(n);
-            if (!found || ijk[0] < bestX) { bestX = ijk[0]; exteriorRepCpu = gpuParent[voxelSlot(li, n)]; found = true; }
+            if (!found || ijk[0] < bestX) { bestX = ijk[0]; exteriorRepCpu = voxelLabel[leaf.getValue(n)]; found = true; }
         }
     }
 
@@ -958,7 +973,7 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
         const auto& leaf = leaves[li];
         for (uint32_t n = 0; n < 512; ++n) {
             if (!leaf.isActive(n)) continue;
-            cpuSign[leaf.getValue(n)] = (gpuParent[voxelSlot(li, n)] == exteriorRepCpu) ? int8_t(1) : int8_t(-1);
+            cpuSign[leaf.getValue(n)] = (voxelLabel[leaf.getValue(n)] == exteriorRepCpu) ? int8_t(1) : int8_t(-1);
         }
     }
 

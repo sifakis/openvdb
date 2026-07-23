@@ -29,6 +29,8 @@
 
 #include <cub/cub.cuh>
 
+#include <utility>  // std::pair
+
 // Define utility macro used to call CUB functions that use dynamic temporary storage.
 // Uses mTempDevicePool (a TempDevicePool member) and mStream from the enclosing class.
 #ifndef CALL_CUBS
@@ -49,23 +51,10 @@ namespace nanovdb {
 
 namespace tools::cuda {
 
-/// @brief Indices into the per-component face-mask array [6] for the six axis-aligned
-///        leaf-neighbor directions. Used to unambiguously identify which face of a leaf's
-///        connected component is being referenced when testing cross-leaf adjacency.
-///
-///        Each face is stored as a uint64_t bitmask over the 8×8 boundary plane.
-///        The bit-ordering conventions differ by axis (they fall out naturally from the
-///        x-major voxel offset layout n = (x<<6)|(y<<3)|z and the extraction algorithm):
-///
-///          ±X faces (free coords y, z):  bit index = y*8 + z   (y major, z minor)
-///          ±Y faces (free coords x, z):  bit index = x*8 + z   (x major, z minor)
-///          ±Z faces (free coords x, y):  bit index = y*8 + x   (y major, x minor)
-///
-///        Cross-leaf connectivity between component I of one leaf and component J of a
-///        face-adjacent leaf is detected by a single bitwise AND of the touching faces,
-///        e.g. faceMasks[I][plusX] & faceMasks[J][minusX] != 0. The AND is meaningful
-///        as long as both sides use the same encoding — which they do, since all masks
-///        are produced by the same extraction code.
+/// @brief Index of each of the 6 leaf faces into a component's face-mask array. Each face is a
+///        uint64_t bitmask over the 8x8 boundary plane; cross-leaf adjacency is one AND of the
+///        touching faces (faceMasks[I][plusX] & faceMasks[J][minusX]). Bit index per axis:
+///          ±X: y*8+z    ±Y: x*8+z    ±Z: y*8+x
 enum LeafNeighborTap : int {
     minusX = 0,
     plusX  = 1,
@@ -75,10 +64,8 @@ enum LeafNeighborTap : int {
     plusZ  = 5
 };
 
-/// @brief An undirected edge of the cross-leaf component graph: two leaf-local components (each a
-///        global slot = leafComponentOffsets[leaf] + localIdx) that touch across a shared leaf face.
-///        Stored canonically with a < b. uint32_t suffices: the total component count
-///        K <= 256 * leafCount stays well below 2^32 for any realistic grid.
+/// @brief Undirected edge between two leaf-local components (global slots) touching across a leaf
+///        face, stored canonically with a < b. uint32_t: K <= 256*leafCount stays well below 2^32.
 struct CrossLeafEdge { uint32_t a, b; };
 
 template <typename BuildT>
@@ -100,16 +87,25 @@ public:
     /// @param level Verbose level: 0=quiet, 1=timing, 2=benchmarking
     void setVerbose(int level = 1) { mVerbose = level; }
 
-    /// @brief Label all connected components: runs the three stages in order (per-leaf CC ->
-    ///        cross-leaf edges -> global labels). After it returns, deviceComponentParent()[s]
-    ///        holds component s's global representative. The individual stages remain publicly
-    ///        callable for granular use (e.g. unit tests that inspect intermediate outputs).
-    void label()
+    /// @brief Run the connected-components pipeline (per-leaf CC -> cross-leaf edges -> global labels
+    ///        -> per-voxel labels) and return { d_labels, componentCount }:
+    ///          - d_labels: a device array of activeVoxelCount+1 uint32_t, indexed by leaf.getValue(n)
+    ///            (slot 0 = background, sentinel 0xFFFFFFFF). Each active voxel holds its component's
+    ///            representative slot, so two active voxels share a value iff they are in the same
+    ///            connected component. This is a non-owning view valid for this object's lifetime.
+    ///          - componentCount: the number of connected components N.
+    std::pair<uint32_t*, uint64_t> getVoxelLabelsAndCount()
     {
         processLeafConnectedComponents();
         processCrossLeafEdges();
         processComponentLabels();
+        processVoxelLabels();
+        return { static_cast<uint32_t*>(mVoxelLabel.deviceData()), mGlobalComponentCount };
     }
+
+private:
+
+    // --- Internal pipeline stages + intermediate device arrays (not part of the public API). ---
 
     /// @brief Compute per-leaf connected components (stage 1 of 3).
     ///
@@ -169,7 +165,9 @@ public:
     ///        valid after processComponentLabels().
     uint64_t* deviceComponentParent() { return static_cast<uint64_t*>(mComponentParent.deviceData()); }
 
-private:
+    /// @brief Materialize the per-active-voxel label sidecar (representative slot per voxel) and the
+    ///        component count. Requires processComponentLabels() first; label() calls it.
+    void processVoxelLabels();
 
     cudaStream_t                 mStream{0};
     util::cuda::Timer            mTimer;
@@ -189,6 +187,9 @@ private:
     nanovdb::cuda::DeviceBuffer  mCrossLeafEdges;           // E × CrossLeafEdge (a<b)
 
     nanovdb::cuda::DeviceBuffer  mComponentParent;          // K × uint64_t: per-component global representative
+
+    nanovdb::cuda::DeviceBuffer  mVoxelLabel;               // (activeVoxelCount+1) × uint32_t: per-active-voxel representative slot (index by leaf.getValue(n); slot 0 = background)
+    uint64_t                     mGlobalComponentCount{0};  // number of connected components N (distinct representatives)
 
 }; // tools::cuda::ConnectedComponents<BuildT>
 
@@ -576,21 +577,75 @@ __device__ inline void ccUnite(uint64_t* parent, uint64_t a, uint64_t b)
     }
 }
 
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Small element-wise functors driven by lambdaKernel. These are named structs (rather than inline
+// extended __device__ lambdas) so their enclosing ConnectedComponents member functions can have
+// private access — nvcc forbids extended __device__ lambdas inside private/protected methods — which
+// also matches the sibling operators (PruneGrid/DilateGrid/... drive lambdaKernel with named functors).
+
+// offsets[i+1] = counts[i]: upcast the per-leaf uint16 component counts into the uint64 offset array.
+struct UpcastCountsFunctor {
+    __device__ void operator()(size_t i, const uint16_t* counts, uint64_t* offsets) const {
+        offsets[i + 1] = uint64_t(counts[i]);
+    }
+};
+
+// Union-find init: every component is its own root.
+struct LabelInitFunctor {
+    __device__ void operator()(size_t s, uint64_t* p) const { p[s] = uint64_t(s); }
+};
+
+// Union-find unite: link the two endpoints of cross-leaf edge e (each ccUnite has its own CAS-retry).
+struct LabelUniteFunctor {
+    __device__ void operator()(size_t e, uint64_t* p, const CrossLeafEdge* edges) const {
+        ccUnite(p, uint64_t(edges[e].a), uint64_t(edges[e].b));
+    }
+};
+
+// Union-find flatten: point every component directly at its representative (class minimum slot).
+struct LabelFlattenFunctor {
+    __device__ void operator()(size_t s, uint64_t* p) const { p[s] = ccFind(p, uint64_t(s)); }
+};
+
+// Count self-roots (parent[s] == s): the number of distinct global components N.
+struct CountSelfRootsFunctor {
+    __device__ void operator()(size_t s, const uint64_t* p, unsigned long long* cnt) const {
+        if (p[s] == uint64_t(s)) atomicAdd(cnt, 1ull);
+    }
+};
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Voxel-label scatter: write each active voxel's representative slot into the per-voxel sidecar.
+//
+// One block per leaf, one thread per voxel offset n. The leaf's components partition its active
+// voxels, so the (short) scan over the leaf's slots finds the unique component containing n; its
+// representative slot parent[s] is written at leaf.getValue(n). No global search is needed.
+
+template <typename BuildT>
+struct VoxelLabelScatterFunctor
+{
+    static constexpr int MaxThreadsPerBlock         = LEAF_SIZE;
+    static constexpr int MinBlocksPerMultiprocessor = 1;
+
+    __device__ void operator()(const NanoGrid<BuildT>* d_grid, const uint64_t* d_offsets,
+                               const nanovdb::Mask<3>* d_masks, const uint64_t* d_parent,
+                               uint32_t* d_voxelLabel)
+    {
+        const int   leafID = blockIdx.x, n = threadIdx.x;
+        const auto& leaf   = d_grid->tree().template getFirstNode<0>()[leafID];
+        if (!leaf.isActive(uint32_t(n))) return;
+        const uint64_t base = d_offsets[leafID], end = d_offsets[leafID + 1];
+        for (uint64_t s = base; s < end; ++s)
+            if (d_masks[s].isOn(uint32_t(n))) {
+                d_voxelLabel[leaf.getValue(uint32_t(n))] = uint32_t(d_parent[s]);
+                return;
+            }
+    }
+};
+
 } // namespace cc_detail
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-
-/// @brief Global slot of the leaf-local component that active voxel n belongs to (scans the leaf's
-///        component masks; each active voxel is in exactly one). Generic CC utility — reused by
-///        downstream tools (e.g. MeshToSDF) to map a voxel to its component and thence its label.
-__device__ inline uint64_t ccVoxelComponentSlot(const nanovdb::Mask<3>* masks, const uint64_t* offsets,
-                                                uint32_t leafID, uint32_t n)
-{
-    const uint64_t base = offsets[leafID], end = offsets[leafID + 1];
-    for (uint64_t s = base; s < end; ++s)
-        if (masks[s].isOn(n)) return s;
-    return base;  // unreachable for an active voxel
-}
 
 template <typename BuildT>
 void ConnectedComponents<BuildT>::processLeafConnectedComponents()
@@ -629,11 +684,7 @@ void ConnectedComponents<BuildT>::processLeafConnectedComponents()
     uint16_t* d_counts  = deviceLeafComponentCounts();
     uint64_t* d_offsets = deviceLeafComponentOffsets();
     util::cuda::lambdaKernel<<<(leafCount + 255) / 256, 256, 0, mStream>>>(
-        leafCount,
-        [] __device__(size_t i, const uint16_t* counts, uint64_t* offsets) {
-            offsets[i + 1] = uint64_t(counts[i]);
-        },
-        d_counts, d_offsets);
+        leafCount, cc_detail::UpcastCountsFunctor{}, d_counts, d_offsets);
     cudaCheckError();
 
     // In-place inclusive sum over offsets[1..leafCount]; offsets[leafCount] = K (total components).
@@ -741,7 +792,7 @@ void ConnectedComponents<BuildT>::processComponentLabels()
     // (a) init: every component is its own root.
     if (mVerbose==1) mTimer.start("Component-label init");
     util::cuda::lambdaKernel<<<blocks(K), 256, 0, mStream>>>(
-        K, [] __device__(size_t s, uint64_t* p) { p[s] = uint64_t(s); }, d_parent);
+        K, cc_detail::LabelInitFunctor{}, d_parent);
     cudaCheckError();
     if (mVerbose==1) mTimer.stop();
 
@@ -749,11 +800,7 @@ void ConnectedComponents<BuildT>::processComponentLabels()
     if (mCrossLeafEdgeCount) {
         if (mVerbose==1) mTimer.start("Component-label unite");
         util::cuda::lambdaKernel<<<blocks(mCrossLeafEdgeCount), 256, 0, mStream>>>(
-            mCrossLeafEdgeCount,
-            [] __device__(size_t e, uint64_t* p, const CrossLeafEdge* edges) {
-                cc_detail::ccUnite(p, uint64_t(edges[e].a), uint64_t(edges[e].b));
-            },
-            d_parent, deviceCrossLeafEdges());
+            mCrossLeafEdgeCount, cc_detail::LabelUniteFunctor{}, d_parent, deviceCrossLeafEdges());
         cudaCheckError();
         if (mVerbose==1) mTimer.stop();
     }
@@ -761,10 +808,51 @@ void ConnectedComponents<BuildT>::processComponentLabels()
     // (c) flatten: point every component directly at its representative (class minimum slot).
     if (mVerbose==1) mTimer.start("Component-label flatten");
     util::cuda::lambdaKernel<<<blocks(K), 256, 0, mStream>>>(
-        K, [] __device__(size_t s, uint64_t* p) { p[s] = cc_detail::ccFind(p, uint64_t(s)); }, d_parent);
+        K, cc_detail::LabelFlattenFunctor{}, d_parent);
     cudaCheckError();
     if (mVerbose==1) mTimer.stop();
 }// ConnectedComponents<BuildT>::processComponentLabels
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+template <typename BuildT>
+void ConnectedComponents<BuildT>::processVoxelLabels()
+{
+    const uint32_t leafCount =
+        util::cuda::DeviceGridTraits<BuildT>::getTreeData(mDeviceSrcGrid).mNodeCount[0];
+    const uint64_t activeCount =
+        util::cuda::DeviceGridTraits<BuildT>::getActiveVoxelCount(mDeviceSrcGrid);
+
+    // Per-active-voxel representative-slot sidecar (indexed by leaf.getValue(n); slot 0 = background).
+    mVoxelLabel = nanovdb::cuda::DeviceBuffer::create((activeCount + 1) * sizeof(uint32_t), nullptr, false);
+    cudaCheck(cudaMemsetAsync(mVoxelLabel.deviceData(), 0xFF, (activeCount + 1) * sizeof(uint32_t), mStream)); // background = 0xFFFFFFFF
+
+    mGlobalComponentCount = 0;
+    const uint64_t K = mLeafComponentAggregateCount;
+    if (leafCount == 0 || K == 0) return;
+
+    // (a) Scatter: each active voxel's representative slot -> sidecar.
+    using ScatterOp = cc_detail::VoxelLabelScatterFunctor<BuildT>;
+    if (mVerbose==1) mTimer.start("Voxel-label scatter");
+    util::cuda::operatorKernel<ScatterOp>
+        <<<leafCount, ScatterOp::MaxThreadsPerBlock, 0, mStream>>>(
+            mDeviceSrcGrid, deviceLeafComponentOffsets(), deviceLeafComponentMasks(),
+            deviceComponentParent(), static_cast<uint32_t*>(mVoxelLabel.deviceData()));
+    cudaCheckError();
+    if (mVerbose==1) mTimer.stop();
+
+    // (b) Component count N = number of self-roots (parent[s] == s).
+    auto cntBuf = nanovdb::cuda::DeviceBuffer::create(sizeof(unsigned long long), nullptr, false);
+    auto* d_cnt = static_cast<unsigned long long*>(cntBuf.deviceData());
+    cudaCheck(cudaMemsetAsync(d_cnt, 0, sizeof(unsigned long long), mStream));
+    util::cuda::lambdaKernel<<<(unsigned int)((K + 255) / 256), 256, 0, mStream>>>(
+        K, cc_detail::CountSelfRootsFunctor{}, deviceComponentParent(), d_cnt);
+    cudaCheckError();
+    unsigned long long hCnt = 0;
+    cudaCheck(cudaMemcpyAsync(&hCnt, d_cnt, sizeof(hCnt), cudaMemcpyDeviceToHost, mStream));
+    cudaCheck(cudaStreamSynchronize(mStream));
+    mGlobalComponentCount = uint64_t(hCnt);
+}// ConnectedComponents<BuildT>::processVoxelLabels
 
 } // namespace tools::cuda
 

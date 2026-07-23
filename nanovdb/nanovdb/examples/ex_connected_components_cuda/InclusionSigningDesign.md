@@ -190,3 +190,41 @@ step is the free diagnostic in §2 (count un-pruned UDF components) to learn `N`
 2. Composition strategy: materialize one grid (a) vs query-time (b).
 3. Performance ceiling: what is `N` on real inputs (foam / bubbles could be large), and does the
    per-component-SDF cost stay acceptable there?
+
+---
+
+## 10. Implementation roadmap
+
+The approach is largely orchestration on top of the existing pipeline (§8), so it is staged into
+milestones that each build on verified ground. The current `buildMeshToSdf` runs six steps —
+rasterize (UDF + nearest-tri index, shared/expensive) → prune → CC → **sign (min-x single-seed)** →
+barrier-sign → invert-mask fill — and this work replaces only the signing step with the decomposition.
+
+| id | milestone | what | reuses | depends on |
+|---|---|---|---|---|
+| **M0** | **un-pruned CC count** | Run CC on the un-pruned grid (`orig`, barrier kept) and report the global-label count `N` per mesh, alongside the derived-grid count. Diagnostic only — existing behaviour unchanged. | `ConnectedComponents::label()`, existing label-count code | — |
+| **M1** | **partition** | Split the labeled grid into `N` per-component sub-grids (one per label). | — | M0 |
+| **M2** | **per-component SDF** | For each γᵢ, run prune → sub-CC → sign → fill restricted to its voxels (triangles shared) → a full φᵢ queryable via `signedSignAt`. | `computeDerivedTopology`, `MeshToSDF::sign*/fill*` | M1 |
+| **M3** | **inclusion test** | `γⱼ ⊂ γᵢ ⟺ φᵢ(V) < 0` for representative V ∈ γⱼ; majority vote over several voxels. O(N²) sign queries. | `signedSignAt` | M2 |
+| **M4** | **forest + compose** | Host-side transitive reduction → inclusion forest → compose per-surface SDFs with depth-parity. Start with query-time composition (§8b), materialize (§8a) only if a standalone grid is needed. | level-set booleans | M3 |
+| **M5** | **validation** | Analytic self-tests: two separated spheres, nested spheres (sphere-in-sphere), sphere-with-cavity. Extend the `--two-spheres` self-test. | existing self-test harness | M4 |
+
+### Ordering strategy
+
+```
+M0 (diagnostic, ~free — establishes N)
+  └─ M1 prototype (per-label PruneGrid)  ──┐
+       └─ M2 → M3 → M4(b) → M5             │  end-to-end algorithm validation
+            └─ swap M1 for a batched partition primitive (optimized)
+```
+
+**Prototype M1 with per-label `PruneGrid` first** (§8): extract each γᵢ as a masked sub-grid so M2–M5
+can proceed and the whole algorithm is validated end to end. Replace that with a dedicated **batched
+partition primitive** (label → `N` index grids in one pass) as a later optimization — a sibling of the
+existing `prune` / `dilate` / `merge` topology ops. Decoupling M1's optimization from M2–M5 keeps the
+algorithm work unblocked.
+
+### Status
+
+- **M0** — next up (the free diagnostic; also answers the §2 feasibility question `N`).
+- **M1–M5** — not started.

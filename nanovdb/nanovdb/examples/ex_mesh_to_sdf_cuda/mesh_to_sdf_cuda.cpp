@@ -34,6 +34,7 @@ using IndexSidecarT = nanovdb::cuda::DeviceBuffer;
 // Summary of validateMeshToSdf's checks (definition must match mesh_to_sdf_cuda_kernels.cu).
 struct SDFResult {
     uint64_t globalComponents            = 0;
+    uint64_t surfaceComponents           = 0;
     bool     openvdbChecked              = false;
     uint64_t confidentSignMismatches     = 0;
     uint64_t inShellTies                 = 0;
@@ -292,11 +293,11 @@ static int runSelfTests(const std::string& which, float voxelSize, float bandWid
         check("some interior upper tiles exist (test is exercising the upper ON path)", r.upperOnTiles > 0);
     }
 
-    // Probe of the single-seed exterior rule (global min-x component = exterior, all others = interior):
-    // two well-separated spheres. The 2nd sphere's OUTER shell is its own component, not the min-x one,
-    // so the single-seed rule would mislabel it interior. This is a DIAGNOSTIC — it only reports, it
-    // does NOT gate the pass/fail count.
-    if (which == "--two-spheres") {
+    // Two well-separated spheres: the case that per-surface exterior seeding exists for. Labeling the
+    // UN-pruned band splits the input into one component per closed surface, and each surface gets its
+    // own min-x exterior seed, so the 2nd sphere's OUTER shell is signed exterior like the 1st. (A
+    // single global seed marks only ONE exterior component and mislabels that shell interior.)
+    if (which == "--two-spheres" || which == "--selftest") {
         std::vector<nanovdb::Vec3f> P; std::vector<nanovdb::Vec3i> T;
         const float  s   = 0.5f * voxelSize;                   // fractional-voxel offset
         const float  R1  = 20.0f * voxelSize, R2 = 15.0f * voxelSize;      // distinct radii
@@ -309,20 +310,127 @@ static int runSelfTests(const std::string& which, float voxelSize, float bandWid
                                     double(C2[0]), double(C2[1]), double(C2[2]), double(R2) };
         const SDFResult r = runPipeline("TWO-SPHERES", P, T, voxelSize, bandWidth, spheres, 2);
 
-        std::cout << "  two-sphere probe (single-seed exterior rule), REPORT ONLY:\n";
-        std::cout << "    CC global components            : " << r.globalComponents << " (expected 4)\n";
-        if (r.openvdbChecked)
-            std::cout << "    OpenVDB confident mismatches    : " << r.confidentSignMismatches << "\n";
-        if (r.analyticChecked)
-            std::cout << "    analytic-union confident mismatch: " << r.analyticConfidentMismatches << "\n";
-        const uint64_t worst = std::max(r.confidentSignMismatches, r.analyticConfidentMismatches);
-        if (worst == 0)
-            std::cout << "    => single-seed rule happens to be FINE here (0 confident mismatches).\n";
-        else
-            std::cout << "    => LIMITATION CONFIRMED: a disconnected object's outer shell is mislabeled\n"
-                      << "       interior (" << worst << " confident mismatches). The single min-x seed only\n"
-                      << "       marks ONE exterior component; a multi-seed rule (every component touching the\n"
-                      << "       domain boundary = exterior) would be needed.\n";
+        std::cout << "  two-spheres assertions:\n";
+        // One component per closed surface on the un-pruned band; the barrier-pruned grid still has
+        // two shells per sphere, hence 4 there.
+        check("exactly 2 closed surfaces", r.surfaceComponents == 2);
+        check("exactly 4 CC global components (2 shells x 2 spheres)", r.globalComponents == 4);
+        check("0 confident-region OpenVDB sign mismatches", r.confidentSignMismatches == 0);
+        check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
+        check("0 leaf invert-mask mismatches (inactive voxels)", r.invertMismatches == 0);
+        check("0 coarse invert-mask mismatches (childless tiles)", r.coarseInvertMismatches == 0);
+        check("0 full-domain sign query mismatches", r.fullDomainMismatches == 0);
+    }
+
+    // Five separated spheres of different radii, scattered over all three axes rather than strung
+    // along one. Only one of them owns the global min-x voxel, so every other sphere's outer shell is
+    // signed correctly only if each surface really gets its own exterior seed.
+    if (which == "--multi-spheres" || which == "--selftest") {
+        std::vector<nanovdb::Vec3f> P; std::vector<nanovdb::Vec3i> T;
+        const float s = 0.5f * voxelSize;                        // fractional-voxel offset
+        const float d = 70.0f * voxelSize;                       // center spacing (gaps >> band ~3 vox)
+        struct { nanovdb::Vec3f c; float r; } S[5] = {
+            { nanovdb::Vec3f(s,     s,     s    ), 20.0f * voxelSize },
+            { nanovdb::Vec3f(s + d, s,     s    ), 15.0f * voxelSize },
+            { nanovdb::Vec3f(s,     s + d, s    ), 12.0f * voxelSize },
+            { nanovdb::Vec3f(s,     s,     s + d), 10.0f * voxelSize },
+            { nanovdb::Vec3f(s + d, s + d, s + d), 18.0f * voxelSize },
+        };
+        double spheres[20];
+        for (int i = 0; i < 5; ++i) {
+            makeUVSphere(S[i].c, S[i].r, 128, 256, P, T);        // appended (composable indices)
+            spheres[4*i+0] = double(S[i].c[0]); spheres[4*i+1] = double(S[i].c[1]);
+            spheres[4*i+2] = double(S[i].c[2]); spheres[4*i+3] = double(S[i].r);
+        }
+        const SDFResult r = runPipeline("MULTI-SPHERES", P, T, voxelSize, bandWidth, spheres, 5);
+
+        std::cout << "  multi-spheres assertions:\n";
+        check("exactly 5 closed surfaces", r.surfaceComponents == 5);
+        check("exactly 10 CC global components (2 shells x 5 spheres)", r.globalComponents == 10);
+        check("0 confident-region OpenVDB sign mismatches", r.confidentSignMismatches == 0);
+        check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
+        check("0 leaf invert-mask mismatches (inactive voxels)", r.invertMismatches == 0);
+        check("0 coarse invert-mask mismatches (childless tiles)", r.coarseInvertMismatches == 0);
+        check("0 full-domain sign query mismatches", r.fullDomainMismatches == 0);
+    }
+
+    // A sphere with a concentric spherical cavity: two nested closed surfaces. By the even-odd rule
+    // the shell between them is solid and the core is empty, so the INNER surface's band must carry
+    // the opposite sign from what it gets on its own — it sits one level deep, and only the inclusion
+    // test plus the depth-parity flip can know that. Per-surface seeding alone signs the core solid.
+    if (which == "--nested-spheres" || which == "--selftest") {
+        std::vector<nanovdb::Vec3f> P; std::vector<nanovdb::Vec3i> T;
+        const float s  = 0.5f * voxelSize;                      // fractional-voxel offset
+        const float Ro = 25.0f * voxelSize, Ri = 12.0f * voxelSize;  // surfaces 13 voxels apart >> band
+        const nanovdb::Vec3f C(s, s, s);
+        makeUVSphere(C, Ro, 128, 256, P, T);
+        makeUVSphere(C, Ri, 128, 256, P, T);                    // appended (composable indices)
+        const double spheres[8] = { double(C[0]), double(C[1]), double(C[2]), double(Ro),
+                                    double(C[0]), double(C[1]), double(C[2]), double(Ri) };
+        const SDFResult r = runPipeline("NESTED-SPHERES", P, T, voxelSize, bandWidth, spheres, 2);
+
+        std::cout << "  nested-spheres assertions:\n";
+        check("exactly 2 closed surfaces", r.surfaceComponents == 2);
+        check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
+        check("0 leaf invert-mask mismatches (inactive voxels)", r.invertMismatches == 0);
+        check("0 coarse invert-mask mismatches (childless tiles)", r.coarseInvertMismatches == 0);
+        check("0 full-domain sign query mismatches", r.fullDomainMismatches == 0);
+    }
+
+    // Three concentric surfaces: solid shell, cavity, solid core. This is the case that needs the
+    // parity and not just "is it enclosed" — the innermost surface sits at depth 2, so its signs must
+    // be left ALONE, while the middle one at depth 1 is flipped.
+    if (which == "--triple-nested" || which == "--selftest") {
+        std::vector<nanovdb::Vec3f> P; std::vector<nanovdb::Vec3i> T;
+        const float s = 0.5f * voxelSize;                        // fractional-voxel offset
+        const float R[3] = { 36.0f * voxelSize, 24.0f * voxelSize, 12.0f * voxelSize };  // 12 voxels apart
+        const nanovdb::Vec3f C(s, s, s);
+        double spheres[12];
+        for (int i = 0; i < 3; ++i) {
+            makeUVSphere(C, R[i], 128, 256, P, T);               // appended (composable indices)
+            spheres[4*i+0] = double(C[0]); spheres[4*i+1] = double(C[1]);
+            spheres[4*i+2] = double(C[2]); spheres[4*i+3] = double(R[i]);
+        }
+        const SDFResult r = runPipeline("TRIPLE-NESTED", P, T, voxelSize, bandWidth, spheres, 3);
+
+        std::cout << "  triple-nested assertions:\n";
+        check("exactly 3 closed surfaces", r.surfaceComponents == 3);
+        check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
+        check("0 leaf invert-mask mismatches (inactive voxels)", r.invertMismatches == 0);
+        check("0 coarse invert-mask mismatches (childless tiles)", r.coarseInvertMismatches == 0);
+        check("0 full-domain sign query mismatches", r.fullDomainMismatches == 0);
+    }
+
+    // Two separated clusters, each with its own nesting: a 3-deep one (shell, cavity, core) next to a
+    // 2-deep one (shell, cavity). The inclusion relation here is a forest with two roots rather than a
+    // single chain, so a surface's depth must be counted against its own enclosing surfaces only.
+    if (which == "--multi-nested" || which == "--selftest") {
+        std::vector<nanovdb::Vec3f> P; std::vector<nanovdb::Vec3i> T;
+        const float s = 0.5f * voxelSize;                     // fractional-voxel offset
+        const nanovdb::Vec3f CA(s, s, s);
+        const nanovdb::Vec3f CB(s + 120.0f * voxelSize, s, s);  // clusters ~54 voxels apart at the surface
+        const float RA[3] = { 36.0f * voxelSize, 24.0f * voxelSize, 12.0f * voxelSize };
+        const float RB[2] = { 30.0f * voxelSize, 18.0f * voxelSize };
+        double spheres[20];
+        int k = 0;
+        for (int i = 0; i < 3; ++i, ++k) {
+            makeUVSphere(CA, RA[i], 128, 256, P, T);
+            spheres[4*k+0] = double(CA[0]); spheres[4*k+1] = double(CA[1]);
+            spheres[4*k+2] = double(CA[2]); spheres[4*k+3] = double(RA[i]);
+        }
+        for (int i = 0; i < 2; ++i, ++k) {
+            makeUVSphere(CB, RB[i], 128, 256, P, T);
+            spheres[4*k+0] = double(CB[0]); spheres[4*k+1] = double(CB[1]);
+            spheres[4*k+2] = double(CB[2]); spheres[4*k+3] = double(RB[i]);
+        }
+        const SDFResult r = runPipeline("MULTI-NESTED", P, T, voxelSize, bandWidth, spheres, 5);
+
+        std::cout << "  multi-nested assertions:\n";
+        check("exactly 5 closed surfaces", r.surfaceComponents == 5);
+        check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
+        check("0 leaf invert-mask mismatches (inactive voxels)", r.invertMismatches == 0);
+        check("0 coarse invert-mask mismatches (childless tiles)", r.coarseInvertMismatches == 0);
+        check("0 full-domain sign query mismatches", r.fullDomainMismatches == 0);
     }
 
     std::cout << "\nSelf-tests: " << (failures == 0 ? "ALL PASS" : "FAILED")
@@ -336,13 +444,16 @@ int main(int argc, char* argv[])
         if (argc < 2)
             throw std::runtime_error("usage: " + std::string(argv[0]) +
                                      " <input.obj | --cube | --sphere | --big-sphere | --selftest |"
-                                     " --two-spheres> [voxelSize] [bandWidth]");
+                                     " --two-spheres | --multi-spheres | --nested-spheres |"
+                                     " --triple-nested | --multi-nested> [voxelSize] [bandWidth]");
 
         const std::string arg1 = argv[1];
 
         // In-code analytic self-tests / probes (no .obj). Default voxelSize 0.02.
         if (arg1 == "--cube" || arg1 == "--sphere" || arg1 == "--big-sphere" ||
-            arg1 == "--selftest" || arg1 == "--two-spheres") {
+            arg1 == "--selftest" || arg1 == "--two-spheres" || arg1 == "--multi-spheres" ||
+            arg1 == "--nested-spheres" || arg1 == "--triple-nested" ||
+            arg1 == "--multi-nested") {
             const float vs = (argc > 2) ? std::stof(argv[2]) : 0.02f;
             const float bw = (argc > 3) ? std::stof(argv[3]) : 3.0f;
             return runSelfTests(arg1, vs, bw) == 0 ? 0 : 1;

@@ -1,8 +1,11 @@
 # Inclusion-forest signing — the per-component-SDF approach
 
 > Design notes for a more robust replacement of the step-4 sign rule. It handles **separated objects**
-> and **nested / hollow** shapes that the current *min-x single-seed* rule mislabels. **Not yet
-> implemented.**
+> and **nested / hollow** shapes that a *single* min-x seed mislabels.
+>
+> **Status: implemented** (§10). Surfaces are separated by labeling the un-pruned band, each is signed
+> on its own by a per-surface exterior seed, and nesting is folded in by per-component sign fields, an
+> inclusion test and a depth-parity flip. Self-tests cover separated, nested and doubly-nested cases.
 >
 > Pipeline reference: [`MeshToSDF_PipelinePlan.md`](./MeshToSDF_PipelinePlan.md).
 
@@ -47,9 +50,23 @@ the barrier kept**, so the inner and outer shells stay glued → **one component
 - Surfaces closer than the band width → their bands merge into one component (the hard case, §7).
 
 `ConnectedComponents<ValueOnIndex>` is domain-agnostic, so this is literally "run CC on the original
-grid instead of the derived one." It is also a useful **first diagnostic**: *for the problem meshes
-(e.g. cavities), how many components does the UDF have before barrier removal?* — which tells us the
-component count `N` this whole approach must scale to.
+grid instead of the derived one."
+
+**Measured component counts.** The number `N` decides whether the whole approach is affordable, so it
+was measured before building on it (voxel size 0.004, hairball coarser):
+
+| mesh | un-pruned `N` | barrier-pruned components |
+|---|---|---|
+| sphere / bunny / armadillo / hand / cat | **1** | 2 / 4 / 2 / 1 / 2 |
+| dragon | **1** | 40 |
+| hairball @ 0.02 | **1** | 14,500 |
+| hairball @ 0.01 (118 M active voxels) | **1** | 334,000 |
+| two separated spheres | **2** | 4 |
+
+So `N` is the count of genuinely distinct closed surfaces — not of shell fragments. The large pruned
+counts (dragon's 40, bunny's ear pockets, hairball's hundreds of thousands) are all artifacts of
+splitting each band into an inner and an outer shell; they vanish on the un-pruned band. Per-surface
+work is therefore cheap, and for any single-object mesh (`N == 1`) this decomposition is the identity.
 
 ---
 
@@ -226,5 +243,37 @@ algorithm work unblocked.
 
 ### Status
 
-- **M0** — next up (the free diagnostic; also answers the §2 feasibility question `N`).
-- **M1–M5** — not started.
+- **M0 — done.** Component counts measured for the whole mesh suite; see the table in §2.
+- **Per-surface exterior seeding — done.** This is the part of the scheme that needs no inclusion
+  test: separated surfaces are all at depth 0, so composing them is a plain union and the only thing
+  required is *one min-x seed per surface* instead of one globally. Labeling the un-pruned band
+  (§2) gives each voxel a surface id; those ids are carried onto the barrier-pruned grid with
+  `util::cuda::InjectGridDataFunctor` (which is renumbering-safe), and `MeshToSDF::signNonBarrier`
+  now reduces to one exterior representative per surface. Barrier signing and the invert-mask fill
+  needed no change — both work off the signed band. With one surface the code path reduces exactly
+  to the previous behaviour. The `--two-spheres` case went from 7808 confident sign mismatches to 0
+  and is now an asserting self-test rather than a report-only probe.
+- **Nesting — done.** Once every surface is signed on its own (through `signBarrier`), each one's band
+  is carved out as a sub-grid with `PruneGrid`, its signs are carried across with
+  `InjectGridDataFunctor`, and the step-6 fill is run on it — giving φᵢ, the sign field surface i would
+  have alone, defined everywhere. Probing φᵢ at one voxel of every other surface's band yields the
+  inclusion relation; a surface's nesting depth is simply how many surfaces report it as inside, and
+  its signs are flipped iff that depth is odd. The composed signs then go through the ordinary step-6
+  fill once, so the output has exactly the same shape as before and the whole validation harness
+  applies unchanged. The three fill methods gained an optional external sign array to make this
+  possible; with one surface the entire stage is skipped.
+- **M5 — done for the analytic cases.** The oracle was generalized from a union (`min` over
+  primitives) to the **even-odd rule** (inside iff an odd number of primitives contain the point,
+  magnitude `min|dᵢ|`), which is what a closed-surface soup means and coincides with the union when
+  primitives do not overlap. Self-tests, in increasing generality:
+  | case | surfaces | depths | what it pins down |
+  |---|---|---|---|
+  | `--two-spheres` | 2 | 0, 0 | separated objects — the original failure |
+  | `--multi-spheres` | 5 | all 0 | many siblings, only one owning the global min-x voxel |
+  | `--nested-spheres` | 2 | 0, 1 | a cavity — the inner band must be flipped |
+  | `--triple-nested` | 3 | 0, 1, 2 | parity, not mere enclosure: depth 2 is solid again |
+  | `--multi-nested` | 5 | 0,1,2 + 0,1 | separation and nesting combined — the relation is a forest with two roots, so depth must be counted against a surface's own ancestors |
+- **Still open:** intersecting surfaces and surfaces nested closer than the band width (§7), the
+  majority-vote hardening of the inclusion probe (§4 — one representative voxel per surface is used
+  today), and the transitive-reduction consistency check of §5 (depth is counted directly, so the
+  forest is never materialized).

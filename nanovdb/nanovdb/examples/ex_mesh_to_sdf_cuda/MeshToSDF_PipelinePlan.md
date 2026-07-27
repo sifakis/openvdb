@@ -13,9 +13,13 @@ detailed notes in [`MeshToSDFDevelopmentPlan.md`](./MeshToSDFDevelopmentPlan.md)
 > **`exportMeshToSdf`** (Polyscope visualization dump, viewed with `mesh_to_sdf_viewer.py`).
 > The design notes on this page match what shipped.
 >
-> **Known limitation.** Step 4's exterior rule is *single-seed* (the min-axis component is the only
-> region called exterior), so it mislabels **separated objects** and **nested / hollow** shapes
-> (reproduced by the `--two-spheres` probe). A more robust replacement is under design.
+> **Signing beyond one object.** Step 4 seeds one exterior component **per closed surface**, and a
+> step 5b folds in how the surfaces nest (inclusion test + depth parity), so separated objects,
+> cavities and nested solids are all signed correctly — see
+> [`InclusionSigningDesign.md`](./InclusionSigningDesign.md), asserted by the `--two-spheres`,
+> `--multi-spheres`, `--nested-spheres`, `--triple-nested` and `--multi-nested` self-tests. Surfaces
+> that intersect, or
+> that are nested closer together than the band width, remain out of scope.
 
 ---
 
@@ -26,12 +30,12 @@ detailed notes in [`MeshToSDFDevelopmentPlan.md`](./MeshToSDFDevelopmentPlan.md)
 | 1 | **Compute UDF + triangle-index sidecar** | ✅ done | `MeshToGrid.cuh` (`getHandleAndUDFAndIndex`) | Rasterize mesh → narrow-band `ValueOnIndex` grid + **two** sidecars: the UDF (float per active voxel) and the **nearest-triangle index** (uint32 per active voxel), written together via a packed-64 `atomicMin`. |
 | 2 | **Prune barrier voxels → derived topology** | ✅ done | `computeDerivedTopology` (`MeshToSDF.cuh`) | Drop voxels with `udf² < 0.75·voxelSize²` (the surface shell), rebuild a clean `ValueOnIndex` grid via `PruneGrid`. |
 | 3 | **Connected components on the pruned topology** | ✅ done | `ConnectedComponents.cuh` | Per-leaf CC → cross-leaf edges → global union-find. Output: `deviceComponentParent[]`. Detailed in the companion doc. |
-| 4 | **Sign the non-barrier voxels** | ✅ done | `MeshToSDF::signNonBarrier` | Exterior CC = the one holding the global min-x active voxel → `+`; all other CCs → `−`. **Single-seed** — see the limitation note above. |
+| 4 | **Sign the non-barrier voxels** | ✅ done | `MeshToSDF::signNonBarrier` | Per closed surface, the exterior CC is the one holding *that surface's* min-x active voxel → `+`; its other CCs → `−`. Surface ids come from CC on the **un-pruned** band, carried onto the pruned grid by `InjectGridDataFunctor`. |
 | 5 | **Sign the barrier voxels** | ✅ done | `MeshToSDF::signBarrier` | Mirrors OpenVDB's `ComputeIntersectingVoxelSign` (double precision): each barrier voxel takes the side it shares with an already-signed neighbor via that neighbor's nearest triangle. Reads a sign snapshot → order-independent. |
 | 6 | **Complete the level set (gap-free fill)** | ✅ done | `MeshToSDF::fill{Leaf,Coarse}InvertMask`, `fillRootInteriorMask` | Per-level invert-mask sidecars carry the sign into inactive voxels/tiles; filled bottom-up leaf → lower → upper → root. Sidecar-only — grid topology never rebuilt. `signedSignAt` composes the query. |
 
-**Status:** the full steps-1→6 pipeline is implemented and validated; current work is code cleanup
-and a more robust step-4 rule (the single-seed limitation above).
+**Status:** the full steps-1→6 pipeline is implemented and validated, including multi-object and
+nested signing; current work is code cleanup and packaging for upstream.
 
 ---
 

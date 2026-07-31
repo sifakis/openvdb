@@ -22,91 +22,9 @@ bool bufferCheck(const T* deviceBuffer, const T* hostBuffer, size_t elem_count) 
     return same;
 }
 
-/// @brief Report where a computed grid diverges from a reference grid. Only invoked when the
-///        byte-wise comparison has already failed, to make the nature of the mismatch apparent
-///        (topological difference vs. metadata/padding difference).
-template<typename GridT>
-void reportGridDiff(const GridT* reference, const GridT* computed)
-{
-    std::cout << "  [diff] gridSize   ref=" << reference->gridSize()         << " got=" << computed->gridSize()         << std::endl;
-    std::cout << "  [diff] activeVox  ref=" << reference->activeVoxelCount() << " got=" << computed->activeVoxelCount() << std::endl;
-    std::cout << "  [diff] valueCount ref=" << reference->valueCount()       << " got=" << computed->valueCount()       << std::endl;
-    for (int l = 0; l < 3; ++l)
-        std::cout << "  [diff] nodeCount[" << l << "] ref=" << reference->tree().nodeCount(l)
-                  << " got=" << computed->tree().nodeCount(l) << std::endl;
-    auto rbb = reference->indexBBox(), gbb = computed->indexBBox();
-    std::cout << "  [diff] indexBBox  ref=[" << rbb.min()[0] << "," << rbb.min()[1] << "," << rbb.min()[2] << "]->["
-              << rbb.max()[0] << "," << rbb.max()[1] << "," << rbb.max()[2] << "]  got=["
-              << gbb.min()[0] << "," << gbb.min()[1] << "," << gbb.min()[2] << "]->["
-              << gbb.max()[0] << "," << gbb.max()[1] << "," << gbb.max()[2] << "]" << std::endl;
-
-    // Contiguous runs of differing bytes, annotated with the GridData field they land in
-    auto fieldName = [](size_t off) -> const char* {
-        if (off <   8) return "mMagic";
-        if (off <  16) return "mChecksum";
-        if (off <  20) return "mVersion";
-        if (off <  24) return "mFlags";
-        if (off <  28) return "mGridIndex";
-        if (off <  32) return "mGridCount";
-        if (off <  40) return "mGridSize";
-        if (off < 296) return "mGridName";
-        if (off < 560) return "mMap";
-        if (off < 608) return "mWorldBBox";
-        if (off < 632) return "mVoxelSize";
-        if (off < 636) return "mGridClass";
-        if (off < 640) return "mGridType";
-        if (off < 648) return "mBlindMetadataOffset";
-        if (off < 652) return "mBlindMetadataCount";
-        if (off < 664) return "mData0/mData1";
-        if (off < 672) return "mData2";
-        if (off < 736) return "TreeData";
-        return "<node data>";
-    };
-    const char*  ref = reinterpret_cast<const char*>(reference);
-    const char*  got = reinterpret_cast<const char*>(computed);
-    const size_t n   = std::min(reference->gridSize(), computed->gridSize());
-    size_t nDiff = 0, nRuns = 0;
-    for (size_t i = 0; i < n; ) {
-        if (ref[i] != got[i]) {
-            size_t j = i; while (j < n && ref[j] != got[j]) ++j;
-            nDiff += j - i;
-            if (++nRuns <= 24) std::cout << "  [diff]   bytes [" << i << "," << j << ") in " << fieldName(i) << std::endl;
-            i = j;
-        } else ++i;
-    }
-    std::cout << "  [diff] " << nDiff << " of " << n << " bytes differ, in " << nRuns << " runs" << std::endl;
-}
-
 /// @brief Log2 of the number of active voxels handled by each VBM block (and each CUDA
 ///        thread block) in the voxelsToGrid dilation baselines.
 static constexpr int BaselineLog2BlockWidth = 7;
-
-/// @brief Decide whether a voxelsToGrid rebuild of @c coordCount coordinates can be attempted.
-///
-/// PointsToGrid holds, concurrently, the coordinate list itself (12 bytes each), 64-bit keys and
-/// 32-bit indices in two copies (24 bytes each), and CUB radix-sort scratch of comparable size to
-/// one key/value pair (~12 bytes each) -- roughly 50 bytes per coordinate at peak, plus whatever
-/// the caller keeps resident.
-///
-/// This has to be predicted rather than attempted: NanoVDB routes allocation failures through
-/// cudaCheck, which calls exit() rather than throwing, so an OOM would terminate the process and
-/// take the remaining benchmarks with it.
-///
-/// @warning The 50-bytes-per-coordinate figure is an estimate derived from reading the
-///          allocations in PointsToGrid::countNodes; CUB's exact temporary storage was not
-///          measured. A run reported as skipped here might in principle have fit.
-inline bool rebuildWouldFit(uint64_t coordCount, uint64_t residentBytes, const char* label)
-{
-    size_t freeBytes = 0, totalBytes = 0;
-    cudaCheck(cudaMemGetInfo(&freeBytes, &totalBytes));
-    const uint64_t needed = coordCount * 50ull + residentBytes;
-    const double   toGB   = 1. / (1024. * 1024. * 1024.);
-    if (double(needed) < 0.92 * double(freeBytes)) return true;
-    std::cout << label << " SKIPPED: estimated peak " << double(needed) * toGB
-              << " GB exceeds the " << double(freeBytes) * toGB << " GB currently free"
-              << " (prediction, not an attempt -- see rebuildWouldFit)" << std::endl;
-    return false;
-}
 
 /// @brief Build the list of index-space offsets of a dilation stencil, with the center first.
 ///
@@ -179,18 +97,9 @@ __device__ inline bool decodeThreadVoxel(
 /// @c stencilSize copies of its voxel, offset by each spoke of the stencil. Duplicates are left
 /// in place; voxelsToGrid dedups them during the rebuild.
 ///
-/// The list is written voxel-major (@c dstCoords[idx*stencilSize + s]), keeping a voxel's taps
-/// adjacent, so that it has the same spatial coherence as the list the deduplicating baseline
-/// produces -- that one cannot choose, since a variable number of taps per voxel forces each
-/// thread to write a contiguous run. Matching them means the difference between the two baselines
-/// isolates the deduplication rather than confounding it with layout.
-///
-/// The alternative, spoke-major (@c dstCoords[s*voxelCount + idx]), makes the writes perfectly
-/// coalesced but scatters each root tile's coordinates across all @c stencilSize runs of the
-/// array, which penalizes the gather in PointsToGrid's voxel-key pass (@c points[d_indx[tid]] in
-/// BulkVoxelKeyFunctor). Measured against each other the two were close to a wash -- spoke-major
-/// serializes ~3x faster, voxel-major rebuilds slightly faster on some inputs and identically on
-/// others -- so comparability decided it. Both produce the same multiset, hence the same grid.
+/// The list is written voxel-major (@c dstCoords[idx*stencilSize + s]) to match the layout the
+/// deduplicating baseline is forced into, so that the difference between the two isolates the
+/// deduplication rather than confounding it with spatial coherence.
 template<typename BuildT, int Log2BlockWidth>
 __global__ void serializeDilatedCoordsKernel(
     const nanovdb::NanoGrid<BuildT>* grid,
@@ -309,8 +218,6 @@ void benchmarkVoxelsToGridDilation(
     std::cout << "Coordinate list size                  : "
               << (coordCount * sizeof(nanovdb::Coord)) / (1024. * 1024.) << " MB" << std::endl;
 
-    if (!rebuildWouldFit(coordCount, 0, "v0 baseline")) return;
-
     // Untimed: upload the stencil and allocate the (large) coordinate list once, then reuse it
     // across all benchmark iterations so that the timings do not measure cudaMalloc.
     auto stencilBuffer = nanovdb::cuda::DeviceBuffer::create(
@@ -367,11 +274,8 @@ void benchmarkVoxelsToGridDilation(
 
     if (bufferCheck((char*)dstGrid, (char*)indexGridDilated->data(), indexGridDilated->gridSize()))
         std::cout << "Result of voxelsToGrid baseline check out CORRECT against reference" << std::endl;
-    else {
+    else
         std::cout << "Result of voxelsToGrid baseline compares INCORRECT against reference" << std::endl;
-        handle.deviceDownload();
-        reportGridDiff(indexGridDilated, handle.template grid<BuildT>());
-    }
 
     // Re-run warm-started iterations of the complete baseline (serialization + rebuild)
     for (uint32_t i = 0; i < benchmark_iters; i++) {
@@ -496,9 +400,6 @@ void benchmarkDedupedVoxelsToGridDilation(
     std::cout << "Reduction vs v0                       : "
               << double(undedupedCount) / double(coordCount) << "x" << std::endl;
 
-    // The counts and offsets arrays stay resident across the rebuild, so charge them too
-    if (!rebuildWouldFit(coordCount, voxelCount * 2ull * sizeof(uint64_t), "v1 baseline")) return;
-
     auto coordBuffer = nanovdb::cuda::DeviceBuffer::create(coordCount * sizeof(nanovdb::Coord), nullptr, false);
     auto* deviceCoords = static_cast<nanovdb::Coord*>(coordBuffer.deviceData());
     if (!deviceCoords) throw std::runtime_error("No GPU buffer for the deduplicated coordinate list");
@@ -529,11 +430,8 @@ void benchmarkDedupedVoxelsToGridDilation(
 
     if (bufferCheck((char*)dstGrid, (char*)indexGridDilated->data(), indexGridDilated->gridSize()))
         std::cout << "Result of deduplicated baseline check out CORRECT against reference" << std::endl;
-    else {
+    else
         std::cout << "Result of deduplicated baseline compares INCORRECT against reference" << std::endl;
-        handle.deviceDownload();
-        reportGridDiff(indexGridDilated, handle.template grid<BuildT>());
-    }
 
     // Honest end-to-end cost: probing + scan + emission + rebuild
     for (uint32_t i = 0; i < benchmark_iters; i++) {
@@ -564,6 +462,11 @@ void benchmarkDedupedVoxelsToGridDilation(
     }
 }
 
+/// @param baselines Bitmask selecting which rebuild baselines to run: 1 = v0 (no dedup),
+///        2 = v1 (partial dedup). Running them one at a time matters on large inputs, where the
+///        rebuild may exhaust device memory: NanoVDB routes allocation failure through cudaCheck,
+///        which calls exit(), so a baseline that runs out of memory terminates the process and
+///        everything that would have followed it.
 template<typename BuildT>
 void mainDilateGrid(
     nanovdb::NanoGrid<BuildT> *deviceGridOriginal,
@@ -571,7 +474,8 @@ void mainDilateGrid(
     nanovdb::NanoGrid<BuildT> *indexGridOriginal,
     nanovdb::NanoGrid<BuildT> *indexGridDilated,
     uint32_t nnType,
-    uint32_t benchmark_iters)
+    uint32_t benchmark_iters,
+    uint32_t baselines)
 {
     nanovdb::util::cuda::Timer gpuTimer;
 
@@ -601,18 +505,10 @@ void mainDilateGrid(
     // Additional points of comparison for the dilation operation: emulate it by serializing the
     // stencil-expanded active voxels and rebuilding the grid from scratch with voxelsToGrid,
     // both without (v0) and with (v1) the elision of taps landing on already-active voxels
-    // Either baseline may exhaust device memory on large inputs -- which is itself a reportable
-    // result -- so a failure of one must not prevent the others from running.
-    try {
+    if (baselines & 1u)
         benchmarkVoxelsToGridDilation( deviceGridOriginal, indexGridOriginal, indexGridDilated, nnType, benchmark_iters );
-    } catch (const std::exception& e) {
-        std::cout << "v0 baseline FAILED: " << e.what() << std::endl;
-    }
-    try {
+    if (baselines & 2u)
         benchmarkDedupedVoxelsToGridDilation( deviceGridOriginal, indexGridOriginal, indexGridDilated, nnType, benchmark_iters );
-    } catch (const std::exception& e) {
-        std::cout << "v1 baseline FAILED: " << e.what() << std::endl;
-    }
 
     uint32_t dstLeafCount = nanovdb::util::cuda::DeviceGridTraits<BuildT>::getTreeData(dstGrid).mNodeCount[0];
     nanovdb::cuda::DeviceBuffer dstLeafMaskBuffer;
@@ -663,5 +559,6 @@ void mainDilateGrid(
     nanovdb::NanoGrid<nanovdb::ValueOnIndex> *indexGridOriginal,
     nanovdb::NanoGrid<nanovdb::ValueOnIndex> *indexGridDilated,
     uint32_t nnType,
-    uint32_t benchmark_iters
+    uint32_t benchmark_iters,
+    uint32_t baselines
 );

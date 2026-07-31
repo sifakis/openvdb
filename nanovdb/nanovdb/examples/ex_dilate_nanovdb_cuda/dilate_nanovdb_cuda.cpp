@@ -17,7 +17,8 @@ void mainDilateGrid(
     nanovdb::NanoGrid<BuildT> *indexGridOriginal,
     nanovdb::NanoGrid<BuildT> *indexGridDilated,
     uint32_t nnType,
-    uint32_t benchmark_iters
+    uint32_t benchmark_iters,
+    uint32_t baselines
 );
 
 /// @brief This example depends on OpenVDB, NanoVDB, and CUDA
@@ -35,9 +36,16 @@ int main(int argc, char *argv[])
 
     try {
 
-        if (argc<2) OPENVDB_THROW(openvdb::ValueError, "usage: "+std::string(argv[0])+" input.vdb [<iterations>]\n");
+        if (argc<2) OPENVDB_THROW(openvdb::ValueError, "usage: "+std::string(argv[0])
+            +" input.vdb [<iterations>] [<baselines>]\n"
+            "  baselines: bitmask of the voxelsToGrid rebuild baselines to run,\n"
+            "             1 = v0 (no dedup), 2 = v1 (partial dedup), 3 = both (default).\n"
+            "             Run them separately on large inputs: a rebuild that exhausts device\n"
+            "             memory aborts the process, taking any later benchmark with it.\n");
         int benchmark_iters = 10;
         if (argc > 2) sscanf(argv[2], "%d", &benchmark_iters);
+        int baselines = 3;
+        if (argc > 3) sscanf(argv[3], "%d", &baselines);
 
         // Read the initial level set from file
 
@@ -123,7 +131,7 @@ int main(int argc, char *argv[])
             OPENVDB_THROW(openvdb::RuntimeError, "Failure while uploading indexGrids to GPU");
 
         // Launch benchmark
-        mainDilateGrid( deviceGridOriginal, deviceGridDilated, indexGridOriginal, indexGridDilated, nnType, benchmark_iters );
+        mainDilateGrid( deviceGridOriginal, deviceGridDilated, indexGridOriginal, indexGridDilated, nnType, benchmark_iters, baselines );
 
     }
     catch (const std::exception& e) {

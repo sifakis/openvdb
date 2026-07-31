@@ -179,15 +179,24 @@ __device__ inline bool decodeThreadVoxel(
 /// @c stencilSize copies of its voxel, offset by each spoke of the stencil. Duplicates are left
 /// in place; voxelsToGrid dedups them during the rebuild.
 ///
-/// The output is written spoke-major (@c dstCoords[s * voxelCount + idx]) so that the writes of
-/// each spoke are fully coalesced across the thread block.
+/// The list is written voxel-major (@c dstCoords[idx*stencilSize + s]), keeping a voxel's taps
+/// adjacent, so that it has the same spatial coherence as the list the deduplicating baseline
+/// produces -- that one cannot choose, since a variable number of taps per voxel forces each
+/// thread to write a contiguous run. Matching them means the difference between the two baselines
+/// isolates the deduplication rather than confounding it with layout.
+///
+/// The alternative, spoke-major (@c dstCoords[s*voxelCount + idx]), makes the writes perfectly
+/// coalesced but scatters each root tile's coordinates across all @c stencilSize runs of the
+/// array, which penalizes the gather in PointsToGrid's voxel-key pass (@c points[d_indx[tid]] in
+/// BulkVoxelKeyFunctor). Measured against each other the two were close to a wash -- spoke-major
+/// serializes ~3x faster, voxel-major rebuilds slightly faster on some inputs and identically on
+/// others -- so comparability decided it. Both produce the same multiset, hence the same grid.
 template<typename BuildT, int Log2BlockWidth>
 __global__ void serializeDilatedCoordsKernel(
     const nanovdb::NanoGrid<BuildT>* grid,
     const uint32_t*                  firstLeafIDArray,
     const uint64_t*                  jumpMapArray,
     const uint64_t                   firstOffset,
-    const uint64_t                   voxelCount,
     const nanovdb::Coord* __restrict stencil,
     const int                        stencilSize,
     nanovdb::Coord* __restrict       dstCoords)
@@ -199,7 +208,7 @@ __global__ void serializeDilatedCoordsKernel(
                                                    smemLeafIndex, smemVoxelOffset, coord, idx)) return;
 
     for (int s = 0; s < stencilSize; ++s)
-        dstCoords[uint64_t(s) * voxelCount + idx] = coord + stencil[s];
+        dstCoords[idx * uint64_t(stencilSize) + s] = coord + stencil[s];
 }
 
 /// @brief Count, for each active voxel, how many stencil taps it must contribute to the
@@ -329,7 +338,7 @@ void benchmarkVoxelsToGridDilation(
     auto runSerialize = [&]() {
         serializeDilatedCoordsKernel<BuildT, BaselineLog2BlockWidth><<<nBlocks, BlockWidth>>>(
             deviceGridOriginal, vbmHandle.deviceFirstLeafID(), vbmHandle.deviceJumpMap(),
-            vbmHandle.firstOffset(), voxelCount, deviceStencil, stencilSize, deviceCoords);
+            vbmHandle.firstOffset(), deviceStencil, stencilSize, deviceCoords);
         cudaCheckError();
     };
 
@@ -387,6 +396,11 @@ void benchmarkVoxelsToGridDilation(
         cudaCheck(cudaStreamSynchronize(0));
         gpuTimer.stop();
     }
+
+    // A/B the two coordinate-list layouts. Both hold the coordinate count and the key multiset
+    // exactly constant, so this isolates the effect of layout alone: spoke-major writes are
+    // perfectly coalesced but scatter each root tile's coordinates across the whole array, which
+    // penalizes the gather in PointsToGrid's voxel-key pass; voxel-major trades the reverse.
 }
 
 /// @brief Benchmark dilation by rebuild-from-scratch, from a partially deduplicated coordinate

@@ -22,6 +22,7 @@
 #include <vector>
 #include <tuple>
 #include <cinttypes>
+#include <algorithm>
 
 #include <nanovdb/NanoVDB.h>
 #include <nanovdb/cuda/DeviceBuffer.h>
@@ -792,6 +793,14 @@ inline BufferT PointsToGrid<BuildT, ResourceT>::getBuffer(const PtrT, size_t poi
 
     mData.d_bufferPtr = buffer.deviceData();
     if (mData.d_bufferPtr == nullptr) throw std::runtime_error("Failed to allocate grid buffer on the device");
+    // Zero-initialize the buffer. The node structures contain padding bytes that arise from
+    // aliasing and 32B alignment (e.g. GridData::mGridName beyond the terminating NULL,
+    // RootData::padding(), and the pad between RootData::Tile::state and ::value) which no
+    // subsequent kernel writes to. Leaving them uninitialized makes the grid's checksum depend
+    // on whatever previously occupied the recycled device memory, i.e. non-deterministic across
+    // otherwise identical invocations, and prevents byte-wise comparison against grids produced
+    // by other means (e.g. tools::createNanoGrid).
+    cudaCheck(cudaMemsetAsync(mData.d_bufferPtr, 0, mData.size, mStream));
     cudaCheck(cudaMemcpyAsync(mDeviceData, &mData, sizeof(PointsToGridData<BuildT>), cudaMemcpyHostToDevice, mStream));// copy Data CPU -> GPU
     return buffer;
 }// PointsToGrid<BuildT, ResourceT>::getBuffer
@@ -938,12 +947,14 @@ inline void PointsToGrid<BuildT, ResourceT>::processGridTreeRoot(const PtrT poin
     util::cuda::lambdaKernel<<<1, 1, 0, mStream>>>(1, BuildGridTreeRootFunctor<BuildT, PtrT>(), mDeviceData, mPointType, pointCount);// lambdaKernel
     cudaCheckError();
 
-    char *dst = mData.getGrid().mGridName;
-    if (const char *src = mGridName.data()) {
-        cudaCheck(cudaMemcpyAsync(dst, src, GridData::MaxNameSize, cudaMemcpyHostToDevice, mStream));
-    } else {
-        cudaCheck(cudaMemsetAsync(dst, 0, GridData::MaxNameSize, mStream));
-    }
+    // Copy only the characters actually held by mGridName (plus the terminating NULL) and zero
+    // the remainder of the field. Copying the full MaxNameSize from mGridName.data() would read
+    // past the end of the std::string's buffer, splicing unrelated host memory into the grid and
+    // making the grid's checksum depend on it.
+    char        *dst = mData.getGrid().mGridName;
+    const size_t len = std::min(mGridName.size(), size_t(GridData::MaxNameSize - 1));// truncate, leaving room for the NULL
+    if (len) cudaCheck(cudaMemcpyAsync(dst, mGridName.data(), len, cudaMemcpyHostToDevice, mStream));
+    cudaCheck(cudaMemsetAsync(dst + len, 0, GridData::MaxNameSize - len, mStream));
 }// PointsToGrid<BuildT, ResourceT>::processGridTreeRoot
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------

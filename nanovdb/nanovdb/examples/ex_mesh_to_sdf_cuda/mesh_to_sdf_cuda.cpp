@@ -35,6 +35,9 @@ using IndexSidecarT = nanovdb::cuda::DeviceBuffer;
 struct SDFResult {
     uint64_t globalComponents            = 0;
     uint64_t surfaceComponents           = 0;
+    uint64_t barrierMismatches           = 0;      // CPU-mirror barrier signing, per surface (must be 0)
+    uint64_t barrierResidualZeros        = 0;      // barrier voxels left unsigned (must be 0)
+    uint64_t mergeMismatches             = 0;      // per-surface signs vs the composed array (must be 0)
     bool     openvdbChecked              = false;
     uint64_t confidentSignMismatches     = 0;
     uint64_t inShellTies                 = 0;
@@ -317,6 +320,8 @@ static int runSelfTests(const std::string& which, float voxelSize, float bandWid
         check("exactly 4 CC global components (2 shells x 2 spheres)", r.globalComponents == 4);
         check("0 confident-region OpenVDB sign mismatches", r.confidentSignMismatches == 0);
         check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
+        check("0 barrier-signing mismatches (CPU mirror)", r.barrierMismatches == 0 && r.barrierResidualZeros == 0);
+        check("0 surface-merge mismatches (per-surface signs vs composed)", r.mergeMismatches == 0);
         check("0 leaf invert-mask mismatches (inactive voxels)", r.invertMismatches == 0);
         check("0 coarse invert-mask mismatches (childless tiles)", r.coarseInvertMismatches == 0);
         check("0 full-domain sign query mismatches", r.fullDomainMismatches == 0);
@@ -349,6 +354,8 @@ static int runSelfTests(const std::string& which, float voxelSize, float bandWid
         check("exactly 10 CC global components (2 shells x 5 spheres)", r.globalComponents == 10);
         check("0 confident-region OpenVDB sign mismatches", r.confidentSignMismatches == 0);
         check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
+        check("0 barrier-signing mismatches (CPU mirror)", r.barrierMismatches == 0 && r.barrierResidualZeros == 0);
+        check("0 surface-merge mismatches (per-surface signs vs composed)", r.mergeMismatches == 0);
         check("0 leaf invert-mask mismatches (inactive voxels)", r.invertMismatches == 0);
         check("0 coarse invert-mask mismatches (childless tiles)", r.coarseInvertMismatches == 0);
         check("0 full-domain sign query mismatches", r.fullDomainMismatches == 0);
@@ -372,6 +379,8 @@ static int runSelfTests(const std::string& which, float voxelSize, float bandWid
         std::cout << "  nested-spheres assertions:\n";
         check("exactly 2 closed surfaces", r.surfaceComponents == 2);
         check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
+        check("0 barrier-signing mismatches (CPU mirror)", r.barrierMismatches == 0 && r.barrierResidualZeros == 0);
+        check("0 surface-merge mismatches (per-surface signs vs composed)", r.mergeMismatches == 0);
         check("0 leaf invert-mask mismatches (inactive voxels)", r.invertMismatches == 0);
         check("0 coarse invert-mask mismatches (childless tiles)", r.coarseInvertMismatches == 0);
         check("0 full-domain sign query mismatches", r.fullDomainMismatches == 0);
@@ -396,6 +405,8 @@ static int runSelfTests(const std::string& which, float voxelSize, float bandWid
         std::cout << "  triple-nested assertions:\n";
         check("exactly 3 closed surfaces", r.surfaceComponents == 3);
         check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
+        check("0 barrier-signing mismatches (CPU mirror)", r.barrierMismatches == 0 && r.barrierResidualZeros == 0);
+        check("0 surface-merge mismatches (per-surface signs vs composed)", r.mergeMismatches == 0);
         check("0 leaf invert-mask mismatches (inactive voxels)", r.invertMismatches == 0);
         check("0 coarse invert-mask mismatches (childless tiles)", r.coarseInvertMismatches == 0);
         check("0 full-domain sign query mismatches", r.fullDomainMismatches == 0);
@@ -428,6 +439,8 @@ static int runSelfTests(const std::string& which, float voxelSize, float bandWid
         std::cout << "  multi-nested assertions:\n";
         check("exactly 5 closed surfaces", r.surfaceComponents == 5);
         check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
+        check("0 barrier-signing mismatches (CPU mirror)", r.barrierMismatches == 0 && r.barrierResidualZeros == 0);
+        check("0 surface-merge mismatches (per-surface signs vs composed)", r.mergeMismatches == 0);
         check("0 leaf invert-mask mismatches (inactive voxels)", r.invertMismatches == 0);
         check("0 coarse invert-mask mismatches (childless tiles)", r.coarseInvertMismatches == 0);
         check("0 full-domain sign query mismatches", r.fullDomainMismatches == 0);

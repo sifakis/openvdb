@@ -277,3 +277,63 @@ algorithm work unblocked.
   majority-vote hardening of the inclusion probe (§4 — one representative voxel per surface is used
   today), and the transitive-reduction consistency check of §5 (depth is counted directly, so the
   forest is never materialized).
+
+### Partition first — done
+
+The implementation originally grew in two increments and the seams showed: multi-surface handling was
+*threaded through* the single-grid pipeline rather than layered on top of it. The pipeline now has the
+shape §2-§5 describes, and the whole signing sequence runs once per closed surface:
+
+```
+1  rasterize                                   (shared — the expensive step, done once)
+2  connected components on the un-pruned band  → surfaces γ₁..γ_N
+3  for each γᵢ:  carve a sub-grid, then run the ordinary pipeline on it  → φᵢ
+4  inclusion test → nesting depth per surface
+5  compose: fold each φᵢ back with its depth parity, then one final fill
+```
+
+Restructuring removed machinery rather than adding it:
+
+- `signNonBarrier` lost its `d_surfaceLabel` / `surfaceCount` arguments — a sub-grid holds exactly one
+  closed surface, so a plain global min-x seed is provably correct again. The per-surface indexing in
+  `FindExteriorRepFunctor` / `SignNonBarrierFunctor` went away with it, along with
+  `ExteriorRepFromKeyFunctor` and the per-surface seed buffer.
+- Carrying surface ids onto the pruned grid disappeared entirely — nothing downstream needs them.
+- The inclusion stage no longer rebuilds the per-surface fields at the end: they *are* the pipeline's
+  output, and it only probes them, counts depths, and merges.
+- The host-side barrier oracle lost its nesting-parity parameters, since each φᵢ is surface-local.
+
+The costs are that each sub-grid needs its UDF and nearest-triangle-index sidecars remapped
+(`InjectGridDataFunctor<float>` / `<uint32_t>`, mechanical), that composing means injecting each φᵢ's
+signs back onto the original grid, and that prune / CC / barrier signing run once per surface instead
+of once overall — though the voxels are a partition, so the summed cost is still about one pass (§6).
+
+### The single-surface path
+
+A mesh with one closed surface — every ordinary watertight model — skips the carve: the original grid
+already *is* that surface's band. This is a memory decision, and it was measured rather than assumed.
+Forcing the multi-surface path for a single surface costs, on the hairball:
+
+| voxelSize | active voxels | carve skipped | carve forced | wall |
+|---|---:|---:|---:|---|
+| 0.01 | 118 M | 2,556 MiB | 3,676 MiB (+44%) | 9.11 → 9.25 s |
+| 0.006 | — | 7,036 MiB | 10,268 MiB (+46%) | 19.61 → 19.94 s |
+
+Time is unaffected (within noise; rasterization dominates), but peak memory rises by ~45% in both
+cases, because carving duplicates not only the grid but the UDF (float), nearest-triangle index
+(uint32) and sign (int8) sidecars — 9 bytes per voxel. Peak memory is the binding constraint at
+production resolutions, so the carve stays conditional.
+
+Everything downstream of the carve is unconditional. Composition detects that a lone uncarved surface
+already holds its signs on the original grid and *aliases* them rather than allocating and gathering a
+second full-length array; the final fill reads the same signal (an empty composed-sign buffer) and
+adopts the fill that surface already ran. So there is exactly one branch in the flow, at the carve.
+
+### Verification
+
+The self-tests (`--two-spheres` … `--multi-nested`, plus the analytic, invert-mask and full-domain
+checks) were the safety net for the rewrite, and a new **surface-merge check** was added: the host
+gathers each surface's signs, applies the same depth parity, and compares against what the GPU
+composed. After restructuring, every self-test assertion and every real-mesh figure (bunny, dragon,
+armadillo, cat at 0.004 — component counts, interior/exterior counts, barrier counts, OpenVDB in-shell
+ties) is unchanged.

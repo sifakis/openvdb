@@ -13,42 +13,43 @@ validation on, since the count is printed by the CC label validator.
 - **CUDA arch:** 90-virtual
 - **CPU:** Intel Core Ultra 7 265H
 - **RAM:** 62Gi
-- **OS:** Ubuntu 24.04.4 LTS / kernel 6.17.0-1028-oem
-- **commit:** d5f570ed
+- **OS:** Ubuntu 24.04.4 LTS / kernel 6.17.0-1030-oem
+- **commit:** a49bf9bf
 - **build:** Release, NANOVDB_USE_CUDA + NANOVDB_USE_OPENVDB
 
 ## 1. Per-step timing (moderate example)
 
-`dragon.obj` @ voxelSize 0.003 — 1,148,514 active voxels, 12 connected components. **GPU pipeline total 233.7 ms** (validation excluded).
+`dragon.obj` @ voxelSize 0.003 — 1,148,514 active voxels, 12 connected components. **GPU pipeline total 257.3 ms** (validation excluded).
 
 ### Steps, sorted by time (bottleneck first)
 
 | step | ms | % |
 |---|---:|---:|
-| 1 rasterize (UDF+index) | 224.62 | 96.1% |
-| 5 barrier signing | 6.76 | 2.9% |
-| 2 prune -> derived | 0.76 | 0.3% |
-| 3 connected components | 0.60 | 0.3% |
-| 4 sign non-barrier+inject | 0.50 | 0.2% |
-| 6 invert-mask fill | 0.49 | 0.2% |
-| **total** | **233.73** | 100% |
+| 1 rasterize (UDF+index) | 247.02 | 96.0% |
+| 5 barrier signing | 6.78 | 2.6% |
+| 2 prune -> derived | 0.95 | 0.4% |
+| 3a surface labels (un-pruned CC) | 0.79 | 0.3% |
+| 3 connected components | 0.63 | 0.2% |
+| 6 invert-mask fill | 0.57 | 0.2% |
+| 4 sign non-barrier+inject | 0.52 | 0.2% |
+| **total** | **257.27** | 100% |
 
 ### Top 12 individual sub-steps
 
 | sub-step | step | ms |
 |---|---|---:|
-| Rasterizing leaf nodes | 1 | 79.83 |
-| Computing UDF+index via leaf/triangle pairs | 1 | 75.78 |
-| Computing candidate LeafNode-Triangle intersection pairs | 1 | 39.30 |
-| Transforming triangles to grid index space | 1 | 25.37 |
-| Sign: barrier voxels (intersecting-voxel-sign mirror) | 5 | 6.76 |
-| Pruning empty leaves | 1 | 1.46 |
-| Rasterizing internal nodes | 1 | 1.12 |
-| Allocating internal node mask buffers | 2 | 0.46 |
-| Allocating internal mask buffers | 1 | 0.43 |
-| Sign: find exterior component | 4 | 0.37 |
-| Enumerating unique root tiles | 1 | 0.35 |
-| Computing candidate RootTile-Triangle intersection pairs | 1 | 0.35 |
+| Rasterizing leaf nodes | 1 | 78.54 |
+| Computing UDF+index via leaf/triangle pairs | 1 | 75.60 |
+| Transforming triangles to grid index space | 1 | 48.46 |
+| Computing candidate LeafNode-Triangle intersection pairs | 1 | 38.74 |
+| Sign: barrier voxels (intersecting-voxel-sign mirror) | 5 | 6.78 |
+| Pruning empty leaves | 1 | 2.04 |
+| Rasterizing internal nodes | 1 | 1.38 |
+| Allocating internal node mask buffers | 2 | 0.61 |
+| Allocating internal mask buffers | 1 | 0.60 |
+| Enumerating unique root tiles | 1 | 0.44 |
+| Computing candidate RootTile-Triangle intersection pairs | 1 | 0.42 |
+| Sign: find exterior component | 4 | 0.39 |
 
 ## 2. Scalability (validation-free)
 
@@ -58,65 +59,62 @@ Wall and pipeline both exclude validation. `pipeline ms` = sum of GPU-step timer
 
 | voxelSize | active voxels | pipeline ms | wall s | status |
 |---:|---:|---:|---:|---|
-| 0.01 | 98,542 | 222.0 | 1.1 | OK |
-| 0.006 | 282,440 | 215.5 | 1.0 | OK |
-| 0.004 | 643,378 | 227.8 | 1.1 | OK |
-| 0.003 | 1,148,514 | 238.9 | 1.2 | OK |
-| 0.002 | 2,590,314 | 278.5 | 1.3 | OK |
-| 0.0015 | 4,607,856 | 284.7 | 1.3 | OK |
-| 0.001 | 10,370,083 | 338.4 | 1.5 | OK |
-| 0.0007 | 21,165,961 | 445.1 | 2.0 | OK |
-| 0.0005 | 41,492,695 | 619.3 | 2.9 | OK |
-| 0.0003 | 115,265,050 | 1487.4 | 6.4 | OK |
-| 0.0002 | 259,360,730 | 2341.3 | 12.3 | OK |
-| 0.00015 | 461,087,199 | 3918.1 | 20.5 | OK |
+| 0.01 | 98,542 | 219.1 | 1.1 | OK |
+| 0.006 | 282,440 | 220.2 | 1.1 | OK |
+| 0.004 | 643,378 | 225.5 | 1.1 | OK |
+| 0.003 | 1,148,514 | 240.1 | 1.1 | OK |
+| 0.002 | 2,590,314 | 261.4 | 1.3 | OK |
+| 0.0015 | 4,607,856 | 302.7 | 1.5 | OK |
+| 0.001 | 10,370,083 | 368.5 | 2.0 | OK |
+| 0.0007 | 21,165,961 | 452.6 | 2.9 | OK |
+| 0.0005 | 41,492,695 | 639.9 | 4.5 | OK |
+| 0.0003 | 115,265,050 | 1834.7 | 9.7 | OK |
+| 0.0002 | 259,360,730 | 2510.9 | 20.9 | OK |
+| 0.00015 | 461,087,199 | 4470.3 | 33.6 | OK |
 | 0.0001 | — | — | — | **OOM** |
 
 ### hairball (stress mesh — 236 MB, dense tangle of thin strands)
 
 | voxelSize | active voxels | pipeline ms | wall s | status |
 |---:|---:|---:|---:|---|
-| 0.02 | 27,393,938 | 1488.2 | 4.4 | OK |
-| 0.01 | 118,262,654 | 2804.0 | 11.6 | OK |
-| 0.006 | 339,548,463 | 5359.1 | 26.4 | OK |
+| 0.02 | 27,393,938 | 1507.0 | 4.8 | OK |
+| 0.01 | 118,262,654 | 2852.7 | 9.1 | OK |
+| 0.006 | 339,548,463 | 5519.9 | 20.8 | OK |
 | 0.004 | — | — | — | **OOM** |
 
 `status`: OK = full pipeline completed; OOM = `cudaError 2: out of memory` at allocation.
 
-## 3. Connected-component count per mesh
+## 3. Component counts per mesh
 
-Component count = distinct global CC labels on the barrier-pruned grid (ideal 2 for a clean closed surface; extra = trapped pockets in thin/concave regions and/or separate objects). Fixed voxelSize across meshes → very different voxel counts (the meshes have different world scales).
+Two different counts. **Closed surfaces** = components of the UN-pruned band, which is what the signing partitions by: one per closed surface. **Pruned components** = components after the barrier shell is removed, which splits every surface into an inner and an outer shell and additionally strands a component in each thin/concave pocket. Fixed voxelSize across meshes → very different voxel counts (the meshes have different world scales).
 
-| mesh | voxelSize | active voxels | components | status |
-|---|---:|---:|---:|---|
-| bunny.obj | 0.004 | 2,121,564 | 4 | OK |
-| dragon.obj | 0.004 | 643,378 | 40 | OK |
-| armadillo.obj | 0.004 | 600,114 | 2 | OK |
-| cow.obj | 0.004 | 40,536,394 | 4 | OK |
-| hand.obj | 0.004 | 297,914 | 1 | OK |
-| cat.obj | 0.004 | 5,004,032 | 2 | OK |
-| hairball.obj | 0.02 | 27,393,938 | 14,550 | OK |
-| hairball.obj | 0.01 | 118,262,654 | 333,703 | OK |
+| mesh | voxelSize | active voxels | closed surfaces | pruned components | status |
+|---|---:|---:|---:|---:|---|
+| bunny.obj | 0.004 | 2,121,564 | 1 | 4 | OK |
+| dragon.obj | 0.004 | 643,378 | 1 | 40 | OK |
+| armadillo.obj | 0.004 | 600,114 | 1 | 2 | OK |
+| cow.obj | 0.004 | 40,536,394 | 1 | 4 | OK |
+| hand.obj | 0.004 | 297,914 | 1 | 1 | OK |
+| cat.obj | 0.004 | 5,004,032 | 1 | 2 | OK |
+| hairball.obj | 0.02 | 27,393,938 | 1 | 14,550 | OK |
+| hairball.obj | 0.01 | 118,262,654 | 1 | 333,703 | OK |
 
-(hairball is shown at coarser voxelSizes because it OOMs at 0.004; it is a dense tangle of thin strands,
-so almost every strand/gap becomes its own trapped/disconnected component — **hundreds of thousands**
-of components, growing with resolution.)
+## 4. Inclusion-signing cost (multi-surface input)
 
-## 4. Findings
+The nesting stage builds one sign field per closed surface to recover how the surfaces enclose one another, so it costs roughly one extra invert-mask fill per surface. It is skipped entirely for a single closed surface, which is every real mesh in the suite — hence the in-code analytic cases here. `inclusion ms` is the stage's own GPU timer; `pipeline ms` is the whole GPU pipeline.
 
-- **Rasterization dominates at low–mid resolution.** Step 1 (mesh → UDF + index) is ~96% of the
-  pipeline and is triangle-bound (dragon 871 K triangles), so the pipeline time is roughly flat
-  (~220–340 ms) up to ~10 M voxels. **Beyond ~10 M it grows ~linearly with voxel count** (0.6 s @
-  41 M, 3.9 s @ 461 M) as the voxel-bound steps take over.
-- **Signing / CC / fill are cheap.** Steps 2–4 and 6 are each < 0.3%; barrier signing (step 5, ~3%)
-  is the only voxel-bound step visible at moderate resolution.
-- **Scalability ceiling (12 GB GPU):** dragon completes to **461 M** active voxels (3.9 s pipeline,
-  ~20 s wall) and OOMs at the next step (~1 B); the hairball stress mesh completes to **340 M** and
-  OOMs at 0.004 (its huge triangle count raises rasterization memory). Validation-free wall at 461 M
-  is ~20 s vs ~156 s with the OpenVDB cross-check on.
-- **Component count is resolution- and mesh-dependent.** Clean objects give ~1–2 (armadillo 2, hand 1,
-  cat 2); thin/concave features trap extra pockets (dragon 12 @ 0.003 but 40 @ 0.004 — coarser pinches
-  off more). The **hairball is the extreme — hundreds of thousands** of components (14.5 K @ 0.02,
-  334 K @ 0.01), one per strand/gap. All extras are correctly signed (interior); they only inflate the
-  raw count.
+| case | surfaces | active voxels | inclusion ms | pipeline ms | % |
+|---|---:|---:|---:|---:|---:|
+| `--two-spheres` | 2 | 47,688 | 4.71 | 61.9 | 7.6% |
+| `--multi-spheres` | 5 | 91,456 | 10.61 | 115.3 | 9.2% |
+| `--nested-spheres` | 2 | 58,592 | 3.85 | 57.8 | 6.7% |
+| `--triple-nested` | 3 | 152,760 | 6.13 | 81.3 | 7.5% |
+| `--multi-nested` | 5 | 245,616 | 12.58 | 122.5 | 10.3% |
 
+## 5. Findings
+
+- **Rasterization dominates at low-mid resolution.** Step 1 (mesh -> UDF + index) is ~96% of the pipeline and is triangle-bound (dragon 871 K triangles), so the time is roughly flat (~220-370 ms) up to ~10 M voxels. **Beyond ~10 M it grows ~linearly with voxel count** (0.6 s @ 41 M, 4.5 s @ 461 M) as the voxel-bound steps take over.
+- **Everything after rasterization is cheap.** Barrier signing (step 5, ~2.6%) is the only voxel-bound step visible at moderate resolution; the prune, both connected-components passes, the signing and the invert-mask fill are each < 0.5%. Labeling the un-pruned band for the surface partition (step 3a) costs 0.79 ms on 1.1 M voxels — about the same as the pruned-grid pass it sits next to, and 0.3% of the pipeline.
+- **Scalability ceiling (12 GB GPU):** dragon completes to **461 M** active voxels (4.5 s pipeline, 34 s wall) and OOMs at the next step (~1 B); the hairball stress mesh completes to **340 M** and OOMs at 0.004, its huge triangle count raising rasterization memory. Wall times here exclude the CPU and OpenVDB validation, which dominates at these sizes.
+- **Every mesh in the suite is a single closed surface.** That is the count the signing actually partitions by, and it is **1 for all of them** — including the hairball, at both resolutions. The much larger pruned-component counts (dragon 40, hairball 333,703 @ 0.01) are artifacts of removing the barrier shell: each surface splits into an inner and an outer shell, and every thin or concave pocket strands one more. They are all signed correctly; they only inflate the raw count. Multi-object and nested input is what actually produces more than one surface.
+- **Nesting costs about one extra fill per surface, and only when there is more than one.** The inclusion stage builds a sign field per closed surface, so it grows with the surface count (~4 ms at 2 surfaces, ~11-13 ms at 5) and lands at 7-10% of the pipeline on the small analytic cases. On every real mesh it is skipped outright, so single-object input pays nothing for it.

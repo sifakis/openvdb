@@ -51,6 +51,9 @@ using IndexSidecarT = nanovdb::cuda::DeviceBuffer;
 struct SDFResult {
     uint64_t globalComponents            = 0;      // distinct global CC labels (on the barrier-pruned grid)
     uint64_t surfaceComponents           = 0;      // distinct labels on the UN-pruned band = closed-surface count
+    uint64_t barrierMismatches           = 0;      // CPU-mirror barrier signing, per surface (must be 0)
+    uint64_t barrierResidualZeros        = 0;      // barrier voxels left unsigned (must be 0)
+    uint64_t mergeMismatches             = 0;      // per-surface signs vs the composed array (must be 0)
     bool     openvdbChecked              = false;  // OpenVDB cross-check ran (needs NANOVDB_USE_OPENVDB)
     uint64_t confidentSignMismatches     = 0;      // OpenVDB cross-check, beyond-shell (must be 0)
     uint64_t inShellTies                 = 0;      // OpenVDB cross-check, within √3/2-voxel shell
@@ -70,23 +73,62 @@ struct SDFResult {
     uint64_t fullDomainTies              = 0;      // sampled coords within the on-surface tie band
 };
 
+using ConnectedComponentsT = nanovdb::tools::cuda::ConnectedComponents<nanovdb::ValueOnIndex>;
+using MeshToSDFT           = nanovdb::tools::cuda::MeshToSDF<nanovdb::ValueOnIndex>;
+
+// Everything the pipeline produces for ONE closed surface: that surface's band as a stand-alone grid,
+// plus the complete sign field the band would have if it were the only object in the scene (phi_i in
+// InclusionSigningDesign.md). Steps 3-6 run here, once per surface; nothing in this struct knows that
+// other surfaces exist, which is exactly what makes a single global exterior seed valid again.
+struct SurfaceField {
+    GridHandleT   subGrid;   // this surface's band, carved out of the original grid. EMPTY when the mesh
+                             // has a single closed surface — the original grid is then used as-is.
+    UDFSidecarT   subUdf;    // udf / nearest-triangle index re-indexed onto subGrid (carving renumbers
+    IndexSidecarT subIndex;  // the value slots). Both empty in that same single-surface case.
+    GridHandleT   derived;   // barrier-pruned copy of the surface grid = connected-components input
+    std::unique_ptr<ConnectedComponentsT> cc;
+    std::pair<uint32_t*, uint64_t>        ccLabels{nullptr, 0};  // { label sidecar (owned by cc), count }
+    std::unique_ptr<MeshToSDFT>           sdf;                   // signs + invert masks = phi_i
+};
+
 // All live device state produced by buildMeshToSdf and consumed (read-only) by validateMeshToSdf /
 // exportMeshToSdf. Opaque to the host driver (which only holds an SdfPipeline*), since it embeds the
-// CUDA-only pipeline objects. The two objects own device buffers and are built once the derived grid
-// exists, hence unique_ptr. (Phase 2 will move this struct to a .cu-only header.)
+// CUDA-only pipeline objects. Those objects own device buffers and are built once their grid exists,
+// hence unique_ptr. (Phase 2 will move this struct to a .cu-only header.)
 struct SdfPipeline {
-    GridHandleT   orig, derived;   // original (pre-prune) + derived (barrier-pruned) index grids
+    GridHandleT   orig;            // the rasterized narrow band, all surfaces together
     UDFSidecarT   udf;             // per-active-voxel unsigned distance (world units)
-    IndexSidecarT index;          // per-active-voxel nearest-triangle index
-    nanovdb::Map  map;            // index<->world transform
+    IndexSidecarT index;           // per-active-voxel nearest-triangle index
+    nanovdb::Map  map;             // index<->world transform
     float         bandWidth = 0.f;
-    std::unique_ptr<nanovdb::tools::cuda::ConnectedComponents<nanovdb::ValueOnIndex>> surfCC; // step 3a surface labels
-    std::pair<uint32_t*, uint64_t> surfLabels{nullptr, 0};  // { per-voxel surface id on ORIG (owned by surfCC), surface count }
-    nanovdb::cuda::DeviceBuffer    derivedSurfLabel;        // (derived activeVoxelCount+1) × uint32: same ids on DERIVED
-    std::unique_ptr<nanovdb::tools::cuda::ConnectedComponents<nanovdb::ValueOnIndex>> cc;   // step 3 labels
-    std::pair<uint32_t*, uint64_t> ccLabels{nullptr, 0};   // { per-voxel label sidecar (owned by cc), component count N }
-    std::unique_ptr<nanovdb::tools::cuda::MeshToSDF<nanovdb::ValueOnIndex>>           sdf;  // steps 4-6 signs+fill
+
+    // Step 2 - surface partition: one component per closed surface, on the UN-pruned band.
+    std::unique_ptr<ConnectedComponentsT> surfCC;
+    std::pair<uint32_t*, uint64_t>        surfLabels{nullptr, 0};  // { per-voxel surface id on ORIG, count }
+
+    // Step 3 - one independently signed field per closed surface.
+    std::vector<SurfaceField> surfaces;
+
+    // Step 4 - composition by nesting parity. A lone uncarved surface already holds its signs on the
+    // original grid, so composedSign stays EMPTY there and d_signOnOrig aliases surfaces[0]'s array —
+    // which is also the flag step 5 reads to know its fill is already done.
+    std::vector<uint8_t>        surfFlip;      // per surface: 1 iff its nesting depth is odd
+    nanovdb::cuda::DeviceBuffer composedSign;  // (orig activeVoxelCount+1) × int8_t
+    int8_t*                     d_signOnOrig = nullptr;  // the signs every later stage reads
+
+    // Step 5 - invert-mask fill on the original grid; origSdf is empty when surfaces[0]'s fill is adopted.
+    std::unique_ptr<MeshToSDFT> origSdf;
+    MeshToSDFT*                 finalSdf = nullptr;
 };
+
+// The grid / sidecars a surface field was built on: its own carved band, or the original grid when the
+// mesh has a single closed surface (nothing to carve).
+inline const GridHandleT& surfaceGrid(const SdfPipeline& p, const SurfaceField& sf)
+{ return sf.subGrid.bufferSize() ? sf.subGrid : p.orig; }
+inline const float* surfaceUdf(const SdfPipeline& p, const SurfaceField& sf)
+{ return static_cast<const float*>(sf.subUdf.size() ? sf.subUdf.deviceData() : p.udf.deviceData()); }
+inline const uint32_t* surfaceIndex(const SdfPipeline& p, const SurfaceField& sf)
+{ return static_cast<const uint32_t*>(sf.subIndex.size() ? sf.subIndex.deviceData() : p.index.deviceData()); }
 
 /// @brief Step 1: rasterize the mesh into the index grid + UDF sidecar AND a per-active-voxel
 ///        NEAREST-TRIANGLE-INDEX sidecar (uint32), needed by step 5
@@ -224,18 +266,6 @@ void printGridDiagnostics(const GridHandleT& handle, const std::string& title)
               << (leafNodes ? 100.f * float(activeVoxels) / float(leafNodes * 512) : 0.f)
               << "%\n";
     std::cout << "Memory usage                          : " << gridSize << " bytes\n";
-}
-
-// Step 2 (SDF domain): prune the surface/barrier shell into the derived CC-input grid. The barrier
-// test, retain mask, and PruneGrid call all live in the MeshToSDF library tool; this is a thin seam.
-GridHandleT computeDerivedTopology(const GridHandleT& srcHandle, const UDFSidecarT& udfSidecar,
-                                   float voxelSize)
-{
-    using BuildT = nanovdb::ValueOnIndex;
-    nanovdb::tools::cuda::MeshToSDF<BuildT> sdf;
-    sdf.setVerbose(1);
-    return sdf.computeDerivedTopology(srcHandle.deviceGrid<BuildT>(),
-                                      static_cast<const float*>(udfSidecar.deviceData()), voxelSize);
 }
 
 namespace {
@@ -520,30 +550,12 @@ void exportMeshToSdf(const SdfPipeline* p, const std::string& path)
 {
     using BuildT = nanovdb::ValueOnIndex;
     using Traits = nanovdb::util::cuda::DeviceGridTraits<BuildT>;
-    const auto& origHandle    = p->orig;
-    const auto& derivedHandle = p->derived;
-    auto&       sdf           = *p->sdf;
-    const auto& udfSidecar    = p->udf;
-    const auto& map           = p->map;
+    const auto& origHandle = p->orig;
+    auto&       sdf        = *p->finalSdf;
+    const auto& udfSidecar = p->udf;
+    const auto& map        = p->map;
 
-    const auto* d_grid = derivedHandle.deviceGrid<BuildT>();
     const auto* o_grid = origHandle.deviceGrid<BuildT>();
-
-    // --- derived grid (host copy) + CC voxel-label sidecar: every non-barrier voxel's component label ---
-    const uint32_t derLeafCount = Traits::getTreeData(d_grid).mNodeCount[0];
-    const uint64_t derBytes     = derivedHandle.bufferSize();
-    void* derBlob = nullptr;
-    cudaCheck(cudaMallocHost(&derBlob, derBytes));
-    cudaCheck(cudaMemcpy(derBlob, derivedHandle.deviceData(), derBytes, cudaMemcpyDeviceToHost));
-    const auto* h_der = reinterpret_cast<const nanovdb::NanoGrid<BuildT>*>(derBlob);
-
-    // Per-active-voxel component label (representative slot), indexed by derived leaf.getValue(n).
-    const uint64_t derActive = Traits::getActiveVoxelCount(d_grid);
-    std::vector<uint32_t> voxelLabel(derActive + 1);
-    cudaCheck(cudaMemcpy(voxelLabel.data(), p->ccLabels.first,
-                         std::size_t(derActive + 1) * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-
-    const auto* dFirst = derLeafCount ? h_der->tree().getFirstLeaf() : nullptr;
 
     // --- original grid (host copy) + final signs + UDF: the voxel set we actually export ---
     const uint64_t origActive = Traits::getActiveVoxelCount(o_grid);
@@ -553,8 +565,43 @@ void exportMeshToSdf(const SdfPipeline* p, const std::string& path)
     cudaCheck(cudaMemcpy(origBlob, origHandle.deviceData(), origBytes, cudaMemcpyDeviceToHost));
     const auto* h_orig = reinterpret_cast<const nanovdb::NanoGrid<BuildT>*>(origBlob);
 
+    // --- per-voxel component label, gathered from every surface's derived grid ---
+    // Component labels are local to a surface, so each surface's block is shifted by a running base to
+    // keep them distinct. Barrier voxels appear in no derived grid and keep -1, which the viewer shows
+    // as its own category.
+    std::vector<int32_t> ccOfOrig(origActive + 1, -1);
+    {
+        uint32_t base = 0;
+        for (const auto& sf : p->surfaces) {
+            const auto*    d_der     = sf.derived.deviceGrid<BuildT>();
+            const uint32_t derLeaves = Traits::getTreeData(d_der).mNodeCount[0];
+            const uint64_t derActive = Traits::getActiveVoxelCount(d_der);
+
+            std::vector<uint32_t> label(derActive + 1);
+            cudaCheck(cudaMemcpy(label.data(), sf.ccLabels.first,
+                                 std::size_t(derActive + 1) * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+            const uint64_t derBytes = sf.derived.bufferSize();
+            void* derBlob = nullptr;
+            cudaCheck(cudaMallocHost(&derBlob, derBytes));
+            cudaCheck(cudaMemcpy(derBlob, sf.derived.deviceData(), derBytes, cudaMemcpyDeviceToHost));
+            const auto* h_der = reinterpret_cast<const nanovdb::NanoGrid<BuildT>*>(derBlob);
+
+            const auto* dFirst = derLeaves ? h_der->tree().getFirstLeaf() : nullptr;
+            for (uint32_t li = 0; li < derLeaves; ++li) {
+                const auto& dleaf = dFirst[li];
+                const auto* oleaf = h_orig->tree().root().probeLeaf(dleaf.origin());  // same origin
+                if (!oleaf) continue;
+                for (uint32_t n = 0; n < 512; ++n)
+                    if (dleaf.isActive(n))
+                        ccOfOrig[oleaf->getValue(n)] = int32_t(base + label[dleaf.getValue(n)]);
+            }
+            cudaCheck(cudaFreeHost(derBlob));
+            base += uint32_t(sf.ccLabels.second);
+        }
+    }
+
     std::vector<int8_t> signs(origActive + 1);
-    cudaCheck(cudaMemcpy(signs.data(), sdf.deviceSignedVoxelSign(),
+    cudaCheck(cudaMemcpy(signs.data(), p->d_signOnOrig,
                          std::size_t(origActive + 1) * sizeof(int8_t), cudaMemcpyDeviceToHost));
     std::vector<float> udf(origActive + 1);
     cudaCheck(cudaMemcpy(udf.data(), static_cast<const float*>(udfSidecar.deviceData()),
@@ -581,15 +628,12 @@ void exportMeshToSdf(const SdfPipeline* p, const std::string& path)
         for (uint32_t li = 0; li < origLeafCount; ++li) {
             const auto& oleaf = oFirst[li];
             const nanovdb::Coord o = oleaf.origin();
-            // matching derived leaf (same origin) gives each voxel's CC label from the sidecar
-            const auto* dleaf = dFirst ? h_der->tree().root().probeLeaf(o) : nullptr;
             for (uint32_t n = 0; n < 512; ++n) {
                 if (!oleaf.isActive(n)) continue;
                 const nanovdb::Coord ijk = o + nanovdb::NanoLeaf<BuildT>::OffsetToLocalCoord(n);
-                int32_t cclabel = -1;                                 // -1 = barrier (not in derived grid)
-                if (dleaf && dleaf->isActive(n)) cclabel = int32_t(voxelLabel[dleaf->getValue(n)]);
-                else ++barrier;
-                const uint64_t vi = oleaf.getValue(n);
+                const uint64_t vi      = oleaf.getValue(n);
+                const int32_t  cclabel = ccOfOrig[vi];                // -1 = barrier (in no derived grid)
+                if (cclabel < 0) ++barrier;
                 const int32_t  ii[5] = { ijk[0], ijk[1], ijk[2], cclabel, int32_t(signs[vi]) };
                 const float    d     = udf[vi];
                 out.write(reinterpret_cast<const char*>(ii), sizeof(ii));
@@ -675,18 +719,22 @@ void exportMeshToSdf(const SdfPipeline* p, const std::string& path)
         }
     }
 
-    cudaCheck(cudaFreeHost(derBlob));
     cudaCheck(cudaFreeHost(origBlob));
 }
 
 // ---------------------------------------------------------------------------------------------------
-// INCLUSION SIGNING (nesting): each closed surface is signed on its own by the per-surface seeding of
-// step 4, which is right for surfaces sitting side by side but not for one enclosed by another — a
-// cavity's band comes out with the sign of a solid. Composing them needs the nesting depth: a point
-// enclosed by k surfaces is inside iff k is odd, so surface i's own signs must be flipped once per
-// enclosing surface. Depth is recovered by building, for each surface, the full sign field it would
-// have alone (φᵢ) and asking it about a voxel of every other surface's band: φᵢ(V) < 0 means Γⱼ is
-// inside Γᵢ. See InclusionSigningDesign.md §3-§5.
+// PER-SURFACE FIELDS AND INCLUSION SIGNING
+//
+// The band is partitioned into closed surfaces first, and the whole signing pipeline then runs once per
+// surface, on a grid holding nothing but that surface. That is what makes the "the min-x component is
+// the exterior" rule valid: it is a statement about one closed surface, and a grid carrying only one
+// closed surface is the setting where it is provably true.
+//
+// Each surface's field φᵢ is therefore signed as if it stood alone. Side by side that is already the
+// answer; enclosed it is not, since a cavity's band comes out with the sign of a solid. A point wrapped
+// by k surfaces is inside iff k is odd, so surface i's own signs are negated exactly when its nesting
+// depth is odd. Depth comes from asking φᵢ about a voxel of every other surface's band: φᵢ(Vⱼ) < 0 means
+// Γⱼ lies inside Γᵢ. See InclusionSigningDesign.md §3-§5.
 // ---------------------------------------------------------------------------------------------------
 namespace {
 
@@ -719,13 +767,6 @@ __hostdev__ inline unsigned long long packCoord(const nanovdb::Coord& c)
            ((unsigned long long)(c[1] + (1 << 20)) << 21) |
             (unsigned long long)(c[2] + (1 << 20));
 }
-inline nanovdb::Coord unpackCoord(unsigned long long k)
-{
-    return nanovdb::Coord(int((k >> 42) & 0x1FFFFF) - (1 << 20),
-                          int((k >> 21) & 0x1FFFFF) - (1 << 20),
-                          int( k        & 0x1FFFFF) - (1 << 20));
-}
-
 // One representative voxel per surface (the packed-coordinate minimum, so it is deterministic).
 template <typename BuildT>
 struct SurfaceRepFunctor
@@ -778,24 +819,119 @@ struct FlipSignByDepthFunctor
     }
 };
 
-/// @brief Recover the nesting depth of every closed surface and fold it into the signs on the original
-///        grid. Requires the per-surface signs to be complete (through signBarrier); leaves the
-///        original grid's sign sidecar holding the composed, even-odd-correct signs, ready for the
-///        step-6 fill. Only called when there is more than one surface.
+/// @brief Steps 3-6 for ONE closed surface: carve its band out of the original grid, prune the barrier
+///        shell, label what remains, sign it from a single global exterior seed, sign the barrier, and
+///        fill the invert masks. The result is φᵢ — a sign field for that surface alone, answerable
+///        anywhere in space.
+///
+///        The global seed is legitimate here precisely because the grid holds one closed surface: its
+///        min-x active voxel is necessarily outside it. A mesh with a single closed surface needs no
+///        carving at all — the original grid already IS that surface's band — so subGrid/subUdf/subIndex
+///        stay empty and the original arrays are used directly.
+void buildSurfaceField(SdfPipeline* p, uint32_t surface,
+                       const nanovdb::Vec3f* d_points, const nanovdb::Vec3i* d_triangles)
+{
+    using BuildT = nanovdb::ValueOnIndex;
+    using Traits = nanovdb::util::cuda::DeviceGridTraits<BuildT>;
+
+    SurfaceField&  sf         = p->surfaces[surface];
+    const auto*    d_orig     = p->orig.deviceGrid<BuildT>();
+    const uint32_t origLeaves = Traits::getTreeData(d_orig).mNodeCount[0];
+    const float    voxelSize  = float(p->map.getVoxelSize()[0]);
+
+    // (a) Carve this surface out of the original grid, and re-index onto the carved grid the two
+    //     sidecars the steps below read. Carving renumbers the value slots, so the transfer goes
+    //     through the injection functor (leaf-origin pairing + popcount rank) rather than a memcpy.
+    if (p->surfaces.size() > 1) {
+        auto  maskBuf    = nanovdb::cuda::DeviceBuffer::create(
+            std::size_t(origLeaves) * sizeof(nanovdb::Mask<3>), nullptr, false);
+        auto* d_partMask = static_cast<nanovdb::Mask<3>*>(maskBuf.deviceData());
+        using MaskOp = SurfaceMaskFunctor<BuildT>;
+        nanovdb::util::cuda::operatorKernel<MaskOp><<<origLeaves, MaskOp::MaxThreadsPerBlock>>>(
+            d_orig, p->surfLabels.first, surface, d_partMask);
+        cudaCheckError();
+
+        nanovdb::tools::cuda::PruneGrid<BuildT> pruner(d_orig, d_partMask);
+        sf.subGrid = pruner.getHandle();
+
+        const auto*    d_sub     = sf.subGrid.deviceGrid<BuildT>();
+        const uint64_t subActive = Traits::getActiveVoxelCount(d_sub);
+        sf.subUdf   = nanovdb::cuda::DeviceBuffer::create((subActive + 1) * sizeof(float), nullptr, false);
+        sf.subIndex = nanovdb::cuda::DeviceBuffer::create((subActive + 1) * sizeof(uint32_t), nullptr, false);
+        cudaCheck(cudaMemset(sf.subUdf.deviceData(),   0,    (subActive + 1) * sizeof(float)));
+        cudaCheck(cudaMemset(sf.subIndex.deviceData(), 0xFF, (subActive + 1) * sizeof(uint32_t)));
+
+        using InjectUdf   = nanovdb::util::cuda::InjectGridDataFunctor<BuildT, float>;
+        using InjectIndex = nanovdb::util::cuda::InjectGridDataFunctor<BuildT, uint32_t>;
+        nanovdb::util::cuda::operatorKernel<InjectUdf><<<origLeaves, InjectUdf::MaxThreadsPerBlock>>>(
+            d_orig, d_sub, static_cast<const float*>(p->udf.deviceData()),
+            static_cast<float*>(sf.subUdf.deviceData()));
+        cudaCheckError();
+        nanovdb::util::cuda::operatorKernel<InjectIndex><<<origLeaves, InjectIndex::MaxThreadsPerBlock>>>(
+            d_orig, d_sub, static_cast<const uint32_t*>(p->index.deviceData()),
+            static_cast<uint32_t*>(sf.subIndex.deviceData()));
+        cudaCheckError();
+        cudaCheck(cudaDeviceSynchronize());
+    }
+
+    const auto* d_grid = surfaceGrid(*p, sf).deviceGrid<BuildT>();
+    sf.sdf = std::make_unique<MeshToSDFT>();
+    sf.sdf->setVerbose(1);
+
+    // (b) Steps 2-3: drop the barrier shell, then label what remains. This surface's inner and outer
+    //     sides fall apart into separate components — the split the signing rule relies on.
+    sf.derived = sf.sdf->computeDerivedTopology(d_grid, surfaceUdf(*p, sf), voxelSize);
+    printGridDiagnostics(sf.derived, "Derived CC-input grid");
+    const auto* d_derived = sf.derived.deviceGrid<BuildT>();
+
+    sf.cc = std::make_unique<ConnectedComponentsT>(d_derived);
+    sf.cc->setVerbose(1);
+    sf.ccLabels = sf.cc->getVoxelLabelsAndCount();  cudaCheck(cudaDeviceSynchronize());
+
+    // (c) Steps 4-5: sign the non-barrier voxels, carry the signs onto the un-pruned surface grid, then
+    //     sign the barrier shell that step 2 set aside.
+    sf.sdf->signNonBarrier(d_derived, sf.ccLabels.first);   cudaCheck(cudaDeviceSynchronize());
+    sf.sdf->injectSignsToOriginal(d_grid, d_derived);       cudaCheck(cudaDeviceSynchronize());
+    sf.sdf->signBarrier(d_grid, surfaceIndex(*p, sf), d_points, d_triangles, p->map);
+    cudaCheck(cudaDeviceSynchronize());
+
+    // (d) Step 6: extend the sign off the band. That is what lets the inclusion test below query φᵢ at
+    //     another surface's band — and, for a single-surface mesh, it is already the finished level set.
+    sf.sdf->fillLeafInvertMask(d_grid);      cudaCheck(cudaDeviceSynchronize());
+    sf.sdf->fillCoarseInvertMasks(d_grid);   cudaCheck(cudaDeviceSynchronize());
+    sf.sdf->fillRootInteriorMask(d_grid);    cudaCheck(cudaDeviceSynchronize());
+}
+
+/// @brief Recover the nesting depth of every closed surface from the per-surface fields, then merge
+///        those fields into one sign array on the original grid, negating the odd-depth surfaces on the
+///        way in. Requires every φᵢ to be complete through its invert-mask fill.
 void composeByInclusion(SdfPipeline* p)
 {
     using BuildT = nanovdb::ValueOnIndex;
     using Traits = nanovdb::util::cuda::DeviceGridTraits<BuildT>;
 
-    const auto*    d_orig     = p->orig.deviceGrid<BuildT>();
-    const uint32_t origLeaves = Traits::getTreeData(d_orig).mNodeCount[0];
-    const uint64_t origActive = Traits::getActiveVoxelCount(d_orig);
-    const uint32_t N          = uint32_t(p->surfLabels.second);
-    const uint32_t* d_surfaceLabel = p->surfLabels.first;
-    auto& sdf = *p->sdf;
+    const uint32_t N = uint32_t(p->surfaces.size());
+    if (N == 0) return;
 
-    // (1) One representative voxel per surface. Any voxel of a surface's band serves: the band hugs
-    //     its own surface, so it lies wholly inside, or wholly outside, every other surface.
+    // Nothing encloses a lone surface, and an uncarved one already carries its signs on the original
+    // grid — so there is no depth to recover and nothing to gather. Aliasing here is what keeps the
+    // single-surface case free of the extra full-length sign array a merge would allocate.
+    if (N == 1 && !p->surfaces[0].subGrid.bufferSize()) {
+        p->surfFlip.assign(1, 0);
+        p->d_signOnOrig = p->surfaces[0].sdf->deviceSignedVoxelSign();
+        return;
+    }
+
+    const auto*     d_orig         = p->orig.deviceGrid<BuildT>();
+    const uint32_t  origLeaves     = Traits::getTreeData(d_orig).mNodeCount[0];
+    const uint64_t  origActive     = Traits::getActiveVoxelCount(d_orig);
+    const uint32_t* d_surfaceLabel = p->surfLabels.first;
+
+    nanovdb::util::cuda::Timer timer;
+    timer.start("Inclusion: nesting depth + merge onto the original grid");
+
+    // (1) One representative voxel per surface. Any voxel of a surface's band serves: the band hugs its
+    //     own surface, so it lies wholly inside, or wholly outside, every other surface.
     auto  repBuf   = nanovdb::cuda::DeviceBuffer::create(N * sizeof(unsigned long long), nullptr, false);
     auto* d_repKey = static_cast<unsigned long long*>(repBuf.deviceData());
     cudaCheck(cudaMemset(d_repKey, 0xFF, N * sizeof(unsigned long long)));
@@ -806,81 +942,96 @@ void composeByInclusion(SdfPipeline* p)
         cudaCheckError();
     }
 
-    // (2) For each surface, build the sign field it would have on its own (φᵢ): carve out its band as
-    //     a sub-grid, carry its signs across (pruning renumbers the value slots, so this goes through
-    //     the injection functor), and run the step-6 fill on it. Filling is what makes φᵢ answer
-    //     anywhere, including at the other surfaces' bands.
+    // (2) Ask each surface's own field about every surface's representative. φᵢ was completed through
+    //     the invert-mask fill, so it answers off its band too — including at the other bands.
     auto  incBuf = nanovdb::cuda::DeviceBuffer::create(std::size_t(N) * N * sizeof(int8_t), nullptr, false);
     auto* d_inc  = static_cast<int8_t*>(incBuf.deviceData());  // d_inc[i*N + j] = sign of φᵢ at surface j's voxel
-
-    auto  maskBuf   = nanovdb::cuda::DeviceBuffer::create(
-        std::size_t(origLeaves) * sizeof(nanovdb::Mask<3>), nullptr, false);
-    auto* d_partMask = static_cast<nanovdb::Mask<3>*>(maskBuf.deviceData());
-
     for (uint32_t i = 0; i < N; ++i) {
-        using MaskOp = SurfaceMaskFunctor<BuildT>;
-        nanovdb::util::cuda::operatorKernel<MaskOp><<<origLeaves, MaskOp::MaxThreadsPerBlock>>>(
-            d_orig, d_surfaceLabel, i, d_partMask);
-        cudaCheckError();
-
-        nanovdb::tools::cuda::PruneGrid<BuildT> pruner(d_orig, d_partMask);
-        auto        subHandle = pruner.getHandle();
-        const auto* d_sub     = subHandle.template deviceGrid<BuildT>();
-        const uint64_t subActive = Traits::getActiveVoxelCount(d_sub);
-
-        auto  subSignBuf = nanovdb::cuda::DeviceBuffer::create((subActive + 1) * sizeof(int8_t), nullptr, false);
-        auto* d_subSign  = static_cast<int8_t*>(subSignBuf.deviceData());
-        cudaCheck(cudaMemset(d_subSign, 1, (subActive + 1) * sizeof(int8_t)));   // background = +1
-        using InjectOp = nanovdb::util::cuda::InjectGridDataFunctor<BuildT, int8_t>;
-        nanovdb::util::cuda::operatorKernel<InjectOp><<<origLeaves, InjectOp::MaxThreadsPerBlock>>>(
-            d_orig, d_sub, sdf.deviceSignedVoxelSign(), d_subSign);
-        cudaCheckError();
-
-        nanovdb::tools::cuda::MeshToSDF<BuildT> phi;   // grid-agnostic: one instance per surface is fine
-        phi.fillLeafInvertMask(d_sub, d_subSign);
-        phi.fillCoarseInvertMasks(d_sub, d_subSign);
-        phi.fillRootInteriorMask(d_sub, d_subSign);
-        cudaCheck(cudaDeviceSynchronize());
-
+        const SurfaceField& sf    = p->surfaces[i];
+        const auto*         d_sub = surfaceGrid(*p, sf).deviceGrid<BuildT>();
+        auto&               phi   = *sf.sdf;
         using ProbeOp = InclusionProbeFunctor<BuildT>;
         nanovdb::util::cuda::lambdaKernel<<<1, N>>>(
-            N, ProbeOp{}, d_sub, d_repKey, d_subSign,
+            N, ProbeOp{}, d_sub, d_repKey, phi.deviceSignedVoxelSign(),
             phi.deviceLeafInvertMask(), phi.deviceLowerInvertMask(), phi.deviceUpperInvertMask(),
             phi.deviceRootInterior(), phi.rootTileMin(), phi.rootTileDims(), d_inc + std::size_t(i) * N);
         cudaCheckError();
-        cudaCheck(cudaDeviceSynchronize());
     }
+    cudaCheck(cudaDeviceSynchronize());
 
-    // (3) Nesting depth = how many other surfaces report this one as inside them. The forest itself is
-    //     not needed for the signs — only the parity of the depth is (InclusionSigningDesign.md §5).
+    // (3) Nesting depth = how many other surfaces report this one as inside them. The inclusion forest
+    //     itself is not needed for the signs — only the parity of the depth is (design doc §5).
     std::vector<int8_t> inc(std::size_t(N) * N);
     cudaCheck(cudaMemcpy(inc.data(), d_inc, inc.size() * sizeof(int8_t), cudaMemcpyDeviceToHost));
 
-    std::vector<uint8_t> flip(N, 0);
+    std::vector<uint32_t> depth(N, 0);
+    p->surfFlip.assign(N, 0);
     for (uint32_t j = 0; j < N; ++j) {
-        uint32_t depth = 0;
         for (uint32_t i = 0; i < N; ++i)
-            if (i != j && inc[std::size_t(i) * N + j] < 0) ++depth;   // φᵢ(Vⱼ) < 0 => Γⱼ inside Γᵢ
-        flip[j] = uint8_t(depth & 1u);
-        std::cout << "  surface " << j << ": nesting depth " << depth
-                  << (flip[j] ? "  (odd -> signs flipped)" : "") << "\n";
+            if (i != j && inc[std::size_t(i) * N + j] < 0) ++depth[j];   // φᵢ(Vⱼ) < 0 => Γⱼ inside Γᵢ
+        p->surfFlip[j] = uint8_t(depth[j] & 1u);
     }
 
-    // (4) Fold the depth parity into the signs on the original grid.
+    // (4) Merge. Gather every surface's signs back onto the original grid — the surfaces partition its
+    //     active voxels, so the N injections write disjoint slots and together cover all of them — then
+    //     negate the odd-depth ones in place.
+    p->composedSign = nanovdb::cuda::DeviceBuffer::create((origActive + 1) * sizeof(int8_t), nullptr, false);
+    p->d_signOnOrig = static_cast<int8_t*>(p->composedSign.deviceData());
+    cudaCheck(cudaMemset(p->d_signOnOrig, 1, (origActive + 1) * sizeof(int8_t)));   // slot 0 = background +1
+    using InjectOp = nanovdb::util::cuda::InjectGridDataFunctor<BuildT, int8_t>;
+    for (uint32_t i = 0; i < N; ++i) {
+        const auto*    d_sub     = surfaceGrid(*p, p->surfaces[i]).deviceGrid<BuildT>();
+        const uint32_t subLeaves = Traits::getTreeData(d_sub).mNodeCount[0];
+        nanovdb::util::cuda::operatorKernel<InjectOp><<<subLeaves, InjectOp::MaxThreadsPerBlock>>>(
+            d_sub, d_orig, p->surfaces[i].sdf->deviceSignedVoxelSign(), p->d_signOnOrig);
+        cudaCheckError();
+    }
     auto  flipBuf = nanovdb::cuda::DeviceBuffer::create(N * sizeof(uint8_t), nullptr, false);
     auto* d_flip  = static_cast<uint8_t*>(flipBuf.deviceData());
-    cudaCheck(cudaMemcpy(d_flip, flip.data(), N * sizeof(uint8_t), cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(d_flip, p->surfFlip.data(), N * sizeof(uint8_t), cudaMemcpyHostToDevice));
     nanovdb::util::cuda::lambdaKernel<<<(unsigned int)((origActive + 256) / 256), 256>>>(
-        origActive + 1, FlipSignByDepthFunctor{}, d_surfaceLabel, d_flip, N, sdf.deviceSignedVoxelSign());
+        origActive + 1, FlipSignByDepthFunctor{}, d_surfaceLabel, d_flip, N, p->d_signOnOrig);
     cudaCheckError();
     cudaCheck(cudaDeviceSynchronize());
+
+    timer.stop();   // report the depths after stopping, so the timer's own line stays intact
+    for (uint32_t j = 0; j < N; ++j)
+        std::cout << "  surface " << j << ": nesting depth " << depth[j]
+                  << (p->surfFlip[j] ? "  (odd -> signs flipped)" : "") << "\n";
+}
+
+/// @brief Step 6 over the whole original grid, from the composed signs: extend the sign off the band so
+///        the field answers at any coordinate. When the composition aliased a lone uncarved surface, the
+///        fill it already ran covered this very grid with these very signs, so it is adopted as-is.
+void fillOnOriginal(SdfPipeline* p)
+{
+    using BuildT = nanovdb::ValueOnIndex;
+    if (p->surfaces.empty()) return;
+
+    if (!p->composedSign.size()) {              // composition aliased surface 0 -> its fill is the answer
+        p->finalSdf = p->surfaces[0].sdf.get();
+        return;
+    }
+
+    const auto* d_orig = p->orig.deviceGrid<BuildT>();
+    p->origSdf = std::make_unique<MeshToSDFT>();
+    p->origSdf->setVerbose(1);
+    p->origSdf->fillLeafInvertMask(d_orig, p->d_signOnOrig);     cudaCheck(cudaDeviceSynchronize());
+    p->origSdf->fillCoarseInvertMasks(d_orig, p->d_signOnOrig);  cudaCheck(cudaDeviceSynchronize());
+    p->origSdf->fillRootInteriorMask(d_orig, p->d_signOnOrig);   cudaCheck(cudaDeviceSynchronize());
+    p->finalSdf = p->origSdf.get();
 }
 
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------------------------------
-// BUILD : run the full mesh->SDF pipeline (steps 1-6) in order and return the live device state. No
-// validation, no visualization — those are separate passes over the returned SdfPipeline.
+// BUILD : run the full mesh->SDF pipeline and return the live device state. No validation, no
+// visualization — those are separate passes over the returned SdfPipeline.
+//
+// Partition first, then sign: the band is split into closed surfaces up front, each surface is signed
+// independently on a grid of its own, and the finished fields are composed by nesting parity. A mesh
+// with one closed surface — every ordinary watertight model — takes the single-surface path, where no
+// carving and no composition happen at all and the work is exactly the classic pipeline.
 // ---------------------------------------------------------------------------------------------------
 SdfPipeline* buildMeshToSdf(const std::vector<nanovdb::Vec3f>& points,
                             const std::vector<nanovdb::Vec3i>& triangles,
@@ -890,81 +1041,36 @@ SdfPipeline* buildMeshToSdf(const std::vector<nanovdb::Vec3f>& points,
     auto* p = new SdfPipeline;
     p->map = map;
     p->bandWidth = bandWidth;
-    const float voxelSize = float(map.getVoxelSize()[0]);
 
     // STEP 1: rasterize the mesh -> UDF + nearest-triangle-index sidecars (index oracle runs inside).
     std::tie(p->orig, p->udf, p->index) = computeUDFAndIndex(points, triangles, map, bandWidth);
     printGridDiagnostics(p->orig, "Rasterized UDF grid");
-
     auto* d_orig = p->orig.deviceGrid<BuildT>();
 
-    // STEP 3a: surface partition. Connected components on the UN-pruned band, where each closed
-    // surface's shell stays glued into ONE component (pruning the barrier would split it into a
-    // separate inner and outer shell). These labels say which surface a voxel belongs to, which is
-    // what lets step 4 seed an exterior component per surface instead of a single global one.
-    p->surfCC = std::make_unique<nanovdb::tools::cuda::ConnectedComponents<BuildT>>(d_orig);
+    // STEP 2: partition the band into closed surfaces, by labeling it while it is still UN-PRUNED. The
+    // barrier shell is what glues a surface's inner and outer sides together, so leaving it in makes
+    // each closed surface exactly one component — and the component count the surface count.
+    p->surfCC = std::make_unique<ConnectedComponentsT>(d_orig);
     p->surfCC->setVerbose(1);
     p->surfLabels = p->surfCC->getVoxelLabelsAndCount();  cudaCheck(cudaDeviceSynchronize());
-    std::cout << "Closed surfaces (un-pruned components): " << p->surfLabels.second << "\n";
+    const uint32_t N = uint32_t(p->surfLabels.second);
+    std::cout << "Closed surfaces (un-pruned components): " << N << "\n";
 
-    // STEP 2: prune the surface/barrier shell -> derived (CC-input) topology.
-    p->derived = computeDerivedTopology(p->orig, p->udf, voxelSize);
-    printGridDiagnostics(p->derived, "Derived CC-input grid");
-    auto* d_grid = p->derived.deviceGrid<BuildT>();
-
-    // STEP 3: connected components on the derived grid (per-leaf -> cross-leaf edges -> global labels).
-    p->cc = std::make_unique<nanovdb::tools::cuda::ConnectedComponents<BuildT>>(d_grid);
-    auto& cc = *p->cc;
-    cc.setVerbose(1);
-    p->ccLabels = cc.getVoxelLabelsAndCount();  cudaCheck(cudaDeviceSynchronize());
-
-    // STEP 3b: carry the surface labels onto the derived grid. Pruning renumbers the value slots, so
-    // this goes through the injection functor, which pairs leaves by origin and remaps slots by
-    // popcount rank. The derived grid is a subset of the original, so every derived slot is written.
-    {
-        using Traits = nanovdb::util::cuda::DeviceGridTraits<BuildT>;
-        const uint64_t derActive  = Traits::getActiveVoxelCount(d_grid);
-        const uint32_t origLeaves = Traits::getTreeData(d_orig).mNodeCount[0];
-        p->derivedSurfLabel = nanovdb::cuda::DeviceBuffer::create(
-            (derActive + 1) * sizeof(uint32_t), nullptr, false);
-        cudaCheck(cudaMemset(p->derivedSurfLabel.deviceData(), 0, (derActive + 1) * sizeof(uint32_t)));
-        using InjectOp = nanovdb::util::cuda::InjectGridDataFunctor<BuildT, uint32_t>;
-        nanovdb::util::cuda::operatorKernel<InjectOp><<<origLeaves, InjectOp::MaxThreadsPerBlock>>>(
-            d_orig, d_grid, p->surfLabels.first,
-            static_cast<uint32_t*>(p->derivedSurfLabel.deviceData()));
-        cudaCheckError();
-        cudaCheck(cudaDeviceSynchronize());
-    }
-
-    p->sdf = std::make_unique<nanovdb::tools::cuda::MeshToSDF<BuildT>>();
-    auto& sdf = *p->sdf;
-    sdf.setVerbose(1);
-
-    // STEP 4: sign the non-barrier voxels from the labeling, seeding one exterior component PER
-    // SURFACE, then inject the signs onto the original.
-    sdf.signNonBarrier(d_grid, p->ccLabels.first,
-                       static_cast<const uint32_t*>(p->derivedSurfLabel.deviceData()),
-                       uint32_t(p->surfLabels.second));                cudaCheck(cudaDeviceSynchronize());
-    sdf.injectSignsToOriginal(d_orig, d_grid);                         cudaCheck(cudaDeviceSynchronize());
-
-    // STEP 5: sign the barrier voxels in place on the original grid (mirror of OpenVDB's
-    // ComputeIntersectingVoxelSign); needs the mesh on the device + the nearest-triangle-index sidecar.
+    // STEP 3: sign each closed surface on its own -> φ₀ .. φ_{N-1}.
     thrust::universal_vector<nanovdb::Vec3f> dPoints(points.begin(), points.end());
     thrust::universal_vector<nanovdb::Vec3i> dTriangles(triangles.begin(), triangles.end());
-    sdf.signBarrier(p->orig.deviceGrid<BuildT>(),
-                    static_cast<const uint32_t*>(p->index.deviceData()),
-                    dPoints.data().get(), dTriangles.data().get(), map);
-    cudaCheck(cudaDeviceSynchronize());
+    p->surfaces.resize(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        if (N > 1) std::cout << "-- surface " << i << " of " << N << " --\n";
+        buildSurfaceField(p, i, dPoints.data().get(), dTriangles.data().get());
+    }
 
-    // STEP 5b: nesting. Every surface is now signed as if it were alone; recover how they enclose one
-    // another and flip each surface's signs once per enclosing surface. A single surface is enclosed
-    // by nothing, so this whole stage is skipped and the pipeline behaves exactly as before.
-    if (p->surfLabels.second >= 2) composeByInclusion(p);
+    // STEP 4: compose. Each φᵢ was signed as if it stood alone, which is wrong exactly for the surfaces
+    // some other surface encloses; recover the nesting depths and merge, negating the odd ones.
+    composeByInclusion(p);
 
-    // STEP 6: complete the level set via per-level invert-mask sidecars (leaf -> lower/upper -> root).
-    sdf.fillLeafInvertMask(p->orig.deviceGrid<BuildT>());    cudaCheck(cudaDeviceSynchronize());
-    sdf.fillCoarseInvertMasks(p->orig.deviceGrid<BuildT>());  cudaCheck(cudaDeviceSynchronize());
-    sdf.fillRootInteriorMask(p->orig.deviceGrid<BuildT>());   cudaCheck(cudaDeviceSynchronize());
+    // STEP 5: extend the composed sign off the band, over the whole original grid.
+    fillOnOriginal(p);
 
     return p;
 }
@@ -987,62 +1093,225 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
     using BuildT = nanovdb::ValueOnIndex;
     using Traits = nanovdb::util::cuda::DeviceGridTraits<BuildT>;
 
-    const auto&                  origHandle    = p->orig;
-    const auto&                  derivedHandle = p->derived;
-    const auto&                  indexSidecar  = p->index;
-    const auto&                  map           = p->map;
-    [[maybe_unused]] const float bandWidth     = p->bandWidth;   // used only by the OpenVDB cross-check
-    [[maybe_unused]] auto&       cc            = *p->cc;          // used only by the retained #if 0 checks
-    auto&                        sdf           = *p->sdf;
+    const auto&                  origHandle   = p->orig;
+    const auto&                  indexSidecar = p->index;
+    const auto&                  map          = p->map;
+    [[maybe_unused]] const float bandWidth    = p->bandWidth;   // used only by the OpenVDB cross-check
+    auto&                        sdf          = *p->finalSdf;   // the fill that answers on the original grid
 
-    const auto* d_grid = derivedHandle.deviceGrid<BuildT>();
+    const auto*    d_orig        = origHandle.deviceGrid<BuildT>();
+    const uint32_t origLeafCount = Traits::getTreeData(d_orig).mNodeCount[0];
+    if (origLeafCount == 0) { std::cout << "CC validation: empty grid, nothing to check\n"; return result; }
 
-    const uint32_t leafCount = Traits::getTreeData(d_grid).mNodeCount[0];
-    if (leafCount == 0) { std::cout << "CC validation: empty grid, nothing to check\n"; return result; }
-
-    // Host copy of the derived grid. NanoVDB grids are position-independent (relative offsets), so a
+    // Host copy of the original grid. NanoVDB grids are position-independent (relative offsets), so a
     // raw byte copy of the device blob into a 32B-aligned pinned buffer is itself a valid host grid.
-    // Shared by the voxel-label contract check and the non-barrier sign check below.
-    const uint64_t gridBytes = derivedHandle.bufferSize();
-    void* hostBlob = nullptr;
-    cudaCheck(cudaMallocHost(&hostBlob, gridBytes));   // pinned, >=32B aligned
-    cudaCheck(cudaMemcpy(hostBlob, derivedHandle.deviceData(), gridBytes, cudaMemcpyDeviceToHost));
-    const auto* h_grid = reinterpret_cast<const nanovdb::NanoGrid<BuildT>*>(hostBlob);
+    const uint64_t origActive = Traits::getActiveVoxelCount(d_orig);
+    const uint64_t origBytes  = origHandle.bufferSize();
+    void* origBlob = nullptr;
+    cudaCheck(cudaMallocHost(&origBlob, origBytes));   // pinned, >=32B aligned
+    cudaCheck(cudaMemcpy(origBlob, origHandle.deviceData(), origBytes, cudaMemcpyDeviceToHost));
+    const auto* h_orig     = reinterpret_cast<const nanovdb::NanoGrid<BuildT>*>(origBlob);
+    const auto* origLeaves = h_orig->tree().getFirstLeaf();
 
-    // ---- CC voxel-label contract validation (public API: getVoxelLabelsAndCount) ----
-    // Independent connectivity property: any two 6-adjacent active voxels must carry the same component
-    // label. This catches a cross-leaf under-merge without touching CC internals; N is the reported
-    // component count. The deeper white-box cross-checks (per-leaf counts, masks/faces, cross-leaf
-    // edges, union-find labels) that used the now-private accessors are retained under `#if 0` below.
-    const uint64_t derActive = Traits::getActiveVoxelCount(d_grid);
-    std::vector<uint32_t> voxelLabel(derActive + 1);
-    cudaCheck(cudaMemcpy(voxelLabel.data(), p->ccLabels.first,
-                         std::size_t(derActive + 1) * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    {
-        auto acc = h_grid->getAccessor();
-        const nanovdb::Coord dirs[6] = { nanovdb::Coord(1,0,0), nanovdb::Coord(-1,0,0),
-                                         nanovdb::Coord(0,1,0), nanovdb::Coord(0,-1,0),
-                                         nanovdb::Coord(0,0,1), nanovdb::Coord(0,0,-1) };
-        const auto* leaves0 = h_grid->tree().getFirstLeaf();
-        std::size_t adjViolations = 0;
-        for (uint32_t li = 0; li < leafCount; ++li) {
-            const auto& leaf = leaves0[li];
-            for (uint32_t n = 0; n < 512; ++n) {
-                if (!leaf.isActive(n)) continue;
-                const nanovdb::Coord c = leaf.origin() + nanovdb::NanoLeaf<BuildT>::OffsetToLocalCoord(n);
-                const uint32_t lc = voxelLabel[leaf.getValue(n)];
-                for (const auto& d : dirs) {
-                    const nanovdb::Coord nb = c + d;
-                    if (acc.isActive(nb) && voxelLabel[acc.getValue(nb)] != lc) ++adjViolations;
+    result.surfaceComponents = p->surfLabels.second;
+
+    // =============================== per-surface band validation ===============================
+    // Each surface was signed on a grid holding nothing but itself, so every check below is the ordinary
+    // single-surface check — run once per surface and accumulated. That also means no surface labels or
+    // nesting parity appear here: those belong to the composition, which is validated separately after.
+    std::vector<uint32_t> hIndexOrig(origActive + 1);
+    cudaCheck(cudaMemcpy(hIndexOrig.data(), static_cast<const uint32_t*>(indexSidecar.deviceData()),
+                         std::size_t(origActive + 1) * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+    uint64_t    totalComponents = 0, derActiveTotal = 0;
+    std::size_t adjViolations = 0, signMismatch = 0, injMismatch = 0, barrierMism = 0;
+    std::size_t barrierCount = 0, residualZeros = 0, ambiguous = 0;
+    uint64_t    nInterior = 0, nExterior = 0, nSigned = 0, nBarrier = 0;
+    bool        repPass = true;
+
+    // The composed signs on the original grid, and the per-surface signs that must add up to them.
+    std::vector<int8_t> gpuSigned(origActive + 1);
+    cudaCheck(cudaMemcpy(gpuSigned.data(), p->d_signOnOrig,
+                         std::size_t(origActive + 1) * sizeof(int8_t), cudaMemcpyDeviceToHost));
+    std::vector<int8_t> mergeExpected(origActive + 1, int8_t(1));   // slot 0 = background +1
+
+    for (uint32_t si = 0; si < p->surfaces.size(); ++si) {
+        const SurfaceField& sf = p->surfaces[si];
+
+        // ---- host copies: this surface's own grid (what steps 5-6 ran on) and its pruned derived grid ----
+        const auto&    surfHandle = surfaceGrid(*p, sf);
+        const auto*    d_surf     = surfHandle.deviceGrid<BuildT>();
+        const uint64_t surfActive = Traits::getActiveVoxelCount(d_surf);
+        const uint32_t surfLeaves = Traits::getTreeData(d_surf).mNodeCount[0];
+        void* surfBlob = nullptr;
+        cudaCheck(cudaMallocHost(&surfBlob, surfHandle.bufferSize()));
+        cudaCheck(cudaMemcpy(surfBlob, surfHandle.deviceData(), surfHandle.bufferSize(), cudaMemcpyDeviceToHost));
+        const auto* h_surf = reinterpret_cast<const nanovdb::NanoGrid<BuildT>*>(surfBlob);
+
+        const auto*    d_der     = sf.derived.deviceGrid<BuildT>();
+        const uint64_t derActive = Traits::getActiveVoxelCount(d_der);
+        const uint32_t derLeaves = Traits::getTreeData(d_der).mNodeCount[0];
+        void* derBlob = nullptr;
+        cudaCheck(cudaMallocHost(&derBlob, sf.derived.bufferSize()));
+        cudaCheck(cudaMemcpy(derBlob, sf.derived.deviceData(), sf.derived.bufferSize(), cudaMemcpyDeviceToHost));
+        const auto* h_der = reinterpret_cast<const nanovdb::NanoGrid<BuildT>*>(derBlob);
+
+        std::vector<uint32_t> voxelLabel(derActive + 1);
+        cudaCheck(cudaMemcpy(voxelLabel.data(), sf.ccLabels.first,
+                             std::size_t(derActive + 1) * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        totalComponents += sf.ccLabels.second;
+        derActiveTotal  += derActive;
+
+        // ---- CC voxel-label contract (public API: getVoxelLabelsAndCount) ----
+        // Independent connectivity property: any two 6-adjacent active voxels must carry the same
+        // component label. This catches a cross-leaf under-merge without touching CC internals.
+        {
+            auto acc = h_der->getAccessor();
+            const nanovdb::Coord dirs[6] = { nanovdb::Coord(1,0,0), nanovdb::Coord(-1,0,0),
+                                             nanovdb::Coord(0,1,0), nanovdb::Coord(0,-1,0),
+                                             nanovdb::Coord(0,0,1), nanovdb::Coord(0,0,-1) };
+            const auto* leaves0 = derLeaves ? h_der->tree().getFirstLeaf() : nullptr;
+            for (uint32_t li = 0; li < derLeaves; ++li) {
+                const auto& leaf = leaves0[li];
+                for (uint32_t n = 0; n < 512; ++n) {
+                    if (!leaf.isActive(n)) continue;
+                    const nanovdb::Coord c = leaf.origin() + nanovdb::NanoLeaf<BuildT>::OffsetToLocalCoord(n);
+                    const uint32_t lc = voxelLabel[leaf.getValue(n)];
+                    for (const auto& d : dirs) {
+                        const nanovdb::Coord nb = c + d;
+                        if (acc.isActive(nb) && voxelLabel[acc.getValue(nb)] != lc) ++adjViolations;
+                    }
                 }
             }
         }
-        const uint64_t N = p->ccLabels.second;
-        result.globalComponents  = N;
-        result.surfaceComponents = p->surfLabels.second;
-        std::cout << "CC voxel-label contract validation:     " << (adjViolations == 0 ? "PASS" : "FAIL")
-                  << " (" << derActive << " active voxels, " << N << " components, "
-                  << adjViolations << " adjacency violations)\n";
+
+        // ---- Non-barrier voxel signs (public API: signNonBarrier) ----
+        // Independently pick the exterior component — the one holding the minimum-x active voxel — and
+        // sign every active voxel from it. One closed surface per grid is what makes that seed correct.
+        constexpr uint32_t NO_REP = 0xFFFFFFFFu;   // no non-barrier voxel at all (matches the GPU sentinel)
+        uint32_t exteriorRepCpu = NO_REP;
+        {
+            const auto* leaves0 = derLeaves ? h_der->tree().getFirstLeaf() : nullptr;
+            int32_t bestX = 0; bool seen = false;
+            for (uint32_t li = 0; li < derLeaves; ++li) {
+                const auto& leaf = leaves0[li];
+                for (uint32_t n = 0; n < 512; ++n) {
+                    if (!leaf.isActive(n)) continue;
+                    const auto ijk = leaf.origin() + nanovdb::NanoLeaf<BuildT>::OffsetToLocalCoord(n);
+                    if (!seen || ijk[0] < bestX) { bestX = ijk[0]; exteriorRepCpu = voxelLabel[leaf.getValue(n)]; seen = true; }
+                }
+            }
+        }
+
+        std::vector<int8_t> cpuSign(derActive + 1, int8_t(1));   // slot 0 = background +1
+        std::vector<int8_t> gpuSign(derActive + 1);
+        cudaCheck(cudaMemcpy(gpuSign.data(), sf.sdf->deviceVoxelSign(),
+                             std::size_t(derActive + 1) * sizeof(int8_t), cudaMemcpyDeviceToHost));
+        {
+            const auto* leaves0 = derLeaves ? h_der->tree().getFirstLeaf() : nullptr;
+            for (uint32_t li = 0; li < derLeaves; ++li) {
+                const auto& leaf = leaves0[li];
+                for (uint32_t n = 0; n < 512; ++n) {
+                    if (!leaf.isActive(n)) continue;
+                    const uint64_t v = leaf.getValue(n);
+                    cpuSign[v] = (voxelLabel[v] == exteriorRepCpu) ? int8_t(1) : int8_t(-1);
+                }
+            }
+            for (uint64_t i = 1; i <= derActive; ++i) {
+                if (gpuSign[i] > 0) ++nExterior; else ++nInterior;
+                if (gpuSign[i] != cpuSign[i]) ++signMismatch;
+            }
+            if (sf.sdf->exteriorRepresentative() != exteriorRepCpu) repPass = false;
+        }
+
+        // ---- Sign injection (derived -> surface grid) ----
+        // Every active voxel of the surface grid must hold the derived sign if it is non-barrier
+        // (present in the derived grid), or the sentinel 0 if it is a barrier voxel (present only here).
+        std::vector<int8_t> gpuSurfSign(surfActive + 1);
+        cudaCheck(cudaMemcpy(gpuSurfSign.data(), sf.sdf->deviceOriginalVoxelSign(),
+                             std::size_t(surfActive + 1) * sizeof(int8_t), cudaMemcpyDeviceToHost));
+        const auto* sFirst = surfLeaves ? h_surf->tree().getFirstLeaf() : nullptr;
+        for (uint32_t li = 0; li < surfLeaves; ++li) {
+            const auto& sleaf = sFirst[li];
+            const auto* dleaf = h_der->tree().root().probeLeaf(sleaf.origin());  // derived leaf, same origin
+            for (uint32_t n = 0; n < 512; ++n) {
+                if (!sleaf.isActive(n)) continue;
+                int8_t expected;
+                if (dleaf && dleaf->isActive(n)) { expected = gpuSign[dleaf->getValue(n)]; ++nSigned; }
+                else                             { expected = int8_t(0);                   ++nBarrier; }
+                if (gpuSurfSign[sleaf.getValue(n)] != expected) ++injMismatch;
+            }
+        }
+        if (gpuSurfSign[0] != int8_t(1)) ++injMismatch;
+
+        // ---- Barrier signing (pipeline step 5) ----
+        // The post-injection signs are the anchor snapshot; re-run the identical faithful-mirror logic
+        // on the host and check the GPU signed array. No surface bookkeeping: this field is one surface.
+        std::vector<int8_t> gpuSurfSigned(surfActive + 1);
+        cudaCheck(cudaMemcpy(gpuSurfSigned.data(), sf.sdf->deviceSignedVoxelSign(),
+                             std::size_t(surfActive + 1) * sizeof(int8_t), cudaMemcpyDeviceToHost));
+        std::vector<uint32_t> hSurfIndex(surfActive + 1);
+        cudaCheck(cudaMemcpy(hSurfIndex.data(), surfaceIndex(*p, sf),
+                             std::size_t(surfActive + 1) * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+        std::size_t bCount = 0, bZeros = 0, bAmbig = 0;
+        barrierMism   += cpuSignBarrier(h_surf, gpuSurfSign, gpuSurfSigned, hSurfIndex,
+                                        points, triangles, map, bCount, bZeros, bAmbig);
+        barrierCount  += bCount;
+        residualZeros += bZeros;
+        ambiguous     += bAmbig;
+        if (gpuSurfSigned[0] != int8_t(1)) ++residualZeros;
+
+        // ---- Contribution to the merge oracle: this surface's signs, negated iff its depth is odd ----
+        const bool flip = (si < p->surfFlip.size()) && p->surfFlip[si];
+        for (uint32_t li = 0; li < surfLeaves; ++li) {
+            const auto& sleaf = sFirst[li];
+            const auto* oleaf = h_orig->tree().root().probeLeaf(sleaf.origin());
+            if (!oleaf) continue;
+            for (uint32_t n = 0; n < 512; ++n) {
+                if (!sleaf.isActive(n)) continue;
+                const int8_t s = gpuSurfSigned[sleaf.getValue(n)];
+                mergeExpected[oleaf->getValue(n)] = flip ? int8_t(-s) : s;
+            }
+        }
+
+        cudaCheck(cudaFreeHost(derBlob));
+        cudaCheck(cudaFreeHost(surfBlob));
+    }
+
+    result.globalComponents = totalComponents;
+    std::cout << "CC voxel-label contract validation:     " << (adjViolations == 0 ? "PASS" : "FAIL")
+              << " (" << derActiveTotal << " active voxels, " << totalComponents << " components over "
+              << p->surfaces.size() << " surfaces, " << adjViolations << " adjacency violations)\n";
+    std::cout << "CC non-barrier sign validation:         "
+              << ((signMismatch == 0 && repPass) ? "PASS" : "FAIL") << " (" << derActiveTotal
+              << " voxels, interior=" << nInterior << " exterior=" << nExterior
+              << ", " << signMismatch << " mismatches, exterior seed "
+              << (repPass ? "matches" : "DIFFERS") << ")\n";
+    std::cout << "CC sign-injection validation:           " << (injMismatch == 0 ? "PASS" : "FAIL")
+              << " (signed(non-barrier)=" << nSigned << " barrier(sentinel)=" << nBarrier
+              << ", " << injMismatch << " mismatches)\n";
+    const bool barrierPass = (barrierMism == 0) && (residualZeros == 0);
+    result.barrierMismatches    = barrierMism;
+    result.barrierResidualZeros = residualZeros;
+    std::cout << "CC barrier sign validation:             " << (barrierPass ? "PASS" : "FAIL") << " ("
+              << barrierCount << " barrier voxels, " << barrierMism << " mismatches, "
+              << ambiguous << " surface-tangent ties, " << residualZeros << " residual zeros)\n";
+
+    // ---- Validate the merge (per-surface fields -> one sign array on the original grid) ----
+    // The surfaces partition the original grid's active voxels, so gathering their signs must cover
+    // every slot exactly once; the odd-depth ones are negated on the way in. Reproduced above while
+    // walking each surface, and compared here against what the GPU actually composed.
+    {
+        std::size_t mergeMismatch = 0;
+        for (uint64_t i = 0; i <= origActive; ++i)
+            if (gpuSigned[i] != mergeExpected[i]) ++mergeMismatch;
+        std::size_t odd = 0;
+        for (uint8_t f : p->surfFlip) odd += f;
+        result.mergeMismatches = mergeMismatch;
+        std::cout << "Surface-merge validation:               " << (mergeMismatch == 0 ? "PASS" : "FAIL")
+                  << " (" << origActive << " orig voxels, " << p->surfaces.size() << " surfaces, "
+                  << odd << " at odd nesting depth, " << mergeMismatch << " mismatches)\n";
     }
 
 #if 0  // [Retained for reference] white-box CC cross-checks — used the now-private CC internal accessors.
@@ -1191,120 +1460,6 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
               << K << " components, " << distinct << " global labels, "
               << labelMismatch << " mismatches)\n";
 #endif  // [Retained for reference] white-box CC cross-checks
-
-    // ---- Validate non-barrier voxel signs (public API: signNonBarrier's per-surface seeding) ----
-    // Independently pick, FOR EACH closed surface, the exterior component (the one holding that
-    // surface's min-x active voxel), sign every active voxel (+ exterior / - interior), and compare
-    // to the GPU per-voxel buffer. Uses the voxel-label sidecar downloaded above plus the surface
-    // labels carried onto the derived grid.
-    const uint64_t activeCount   = derActive;
-    const uint64_t surfaceCount  = p->surfLabels.second;
-    const auto*    leaves        = h_grid->tree().getFirstLeaf();
-
-    std::vector<uint32_t> surfLabel(activeCount + 1, 0u);
-    cudaCheck(cudaMemcpy(surfLabel.data(), p->derivedSurfLabel.deviceData(),
-                         std::size_t(activeCount + 1) * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-
-    // Per surface: exterior representative = component label of that surface's minimum-x active voxel.
-    constexpr uint32_t NO_REP = 0xFFFFFFFFu;   // surface with no non-barrier voxel (matches the GPU sentinel)
-    std::vector<uint32_t> exteriorRepCpu(surfaceCount ? surfaceCount : 1, NO_REP);
-    std::vector<int32_t>  bestX(exteriorRepCpu.size(), 0);
-    std::vector<char>     seen(exteriorRepCpu.size(), 0);
-    for (uint32_t li = 0; li < leafCount; ++li) {
-        const auto& leaf = leaves[li];
-        for (uint32_t n = 0; n < 512; ++n) {
-            if (!leaf.isActive(n)) continue;
-            const uint64_t v = leaf.getValue(n);
-            const uint32_t s = surfLabel[v];
-            if (s >= exteriorRepCpu.size()) continue;   // defensive: unlabeled voxel
-            const auto ijk = leaf.origin() + nanovdb::NanoLeaf<BuildT>::OffsetToLocalCoord(n);
-            if (!seen[s] || ijk[0] < bestX[s]) { bestX[s] = ijk[0]; exteriorRepCpu[s] = voxelLabel[v]; seen[s] = 1; }
-        }
-    }
-
-    // host per-voxel signs (slot 0 = background +1): exterior iff the voxel's component is its own
-    // surface's exterior representative.
-    std::vector<int8_t> cpuSign(activeCount + 1, int8_t(1));
-    for (uint32_t li = 0; li < leafCount; ++li) {
-        const auto& leaf = leaves[li];
-        for (uint32_t n = 0; n < 512; ++n) {
-            if (!leaf.isActive(n)) continue;
-            const uint64_t v = leaf.getValue(n);
-            const uint32_t s = surfLabel[v];
-            const uint32_t rep = (s < exteriorRepCpu.size()) ? exteriorRepCpu[s] : NO_REP;
-            cpuSign[v] = (voxelLabel[v] == rep) ? int8_t(1) : int8_t(-1);
-        }
-    }
-
-    std::vector<int8_t> gpuSign(activeCount + 1);
-    cudaCheck(cudaMemcpy(gpuSign.data(), sdf.deviceVoxelSign(),
-                         std::size_t(activeCount + 1) * sizeof(int8_t), cudaMemcpyDeviceToHost));
-
-    std::size_t signMismatch = 0; uint64_t nInterior = 0, nExterior = 0;
-    for (uint64_t i = 1; i <= activeCount; ++i) {
-        if (gpuSign[i] > 0) ++nExterior; else ++nInterior;
-        if (gpuSign[i] != cpuSign[i]) ++signMismatch;
-    }
-    const bool signPass = (signMismatch == 0) && (sdf.exteriorRepresentative() == exteriorRepCpu[0]);
-    std::cout << "CC non-barrier sign validation:         " << (signPass ? "PASS" : "FAIL") << " ("
-              << activeCount << " voxels, " << surfaceCount << " surfaces, exteriorRep[0] gpu="
-              << sdf.exteriorRepresentative() << " cpu=" << exteriorRepCpu[0]
-              << ", interior=" << nInterior << " exterior=" << nExterior
-              << ", " << signMismatch << " mismatches)\n";
-
-    // ---- Validate sign injection (derived -> original grid) ----
-    // Every original active voxel must hold: the derived sign if it is non-barrier (present in the
-    // derived grid), or the sentinel 0 if it is a barrier voxel (present only in the original).
-    const auto*    d_orig     = origHandle.deviceGrid<BuildT>();
-    const uint64_t origActive = Traits::getActiveVoxelCount(d_orig);
-
-    const uint64_t origBytes = origHandle.bufferSize();
-    void* origBlob = nullptr;
-    cudaCheck(cudaMallocHost(&origBlob, origBytes));
-    cudaCheck(cudaMemcpy(origBlob, origHandle.deviceData(), origBytes, cudaMemcpyDeviceToHost));
-    const auto* h_orig = reinterpret_cast<const nanovdb::NanoGrid<BuildT>*>(origBlob);
-
-    std::vector<int8_t> gpuOrigSign(origActive + 1);
-    cudaCheck(cudaMemcpy(gpuOrigSign.data(), sdf.deviceOriginalVoxelSign(),
-                         std::size_t(origActive + 1) * sizeof(int8_t), cudaMemcpyDeviceToHost));
-
-    std::size_t injMismatch = 0; uint64_t nBarrier = 0, nSigned = 0;
-    const uint32_t origLeafCount = h_orig->tree().nodeCount(0);
-    const auto*    origLeaves    = h_orig->tree().getFirstLeaf();
-    for (uint32_t li = 0; li < origLeafCount; ++li) {
-        const auto& oleaf = origLeaves[li];
-        const auto* dleaf = h_grid->tree().root().probeLeaf(oleaf.origin());  // derived leaf, same origin
-        for (uint32_t n = 0; n < 512; ++n) {
-            if (!oleaf.isActive(n)) continue;
-            int8_t expected;
-            if (dleaf && dleaf->isActive(n)) { expected = gpuSign[dleaf->getValue(n)]; ++nSigned; }
-            else                             { expected = int8_t(0);                   ++nBarrier; }
-            if (gpuOrigSign[oleaf.getValue(n)] != expected) ++injMismatch;
-        }
-    }
-    const bool injPass = (injMismatch == 0) && (gpuOrigSign[0] == int8_t(1));
-    std::cout << "CC sign-injection validation:           " << (injPass ? "PASS" : "FAIL") << " ("
-              << origActive << " orig voxels, signed(non-barrier)=" << nSigned
-              << " barrier(sentinel)=" << nBarrier << ", " << injMismatch << " mismatches)\n";
-
-    // ---- Validate barrier signing (pipeline step 5) ----
-    // The post-injection signs (gpuOrigSign: +1/-1 non-barrier, 0 barrier) are the anchor snapshot.
-    // Re-run the identical faithful-mirror logic on the host and check the GPU signed array; assert
-    // no sentinel-0 remains (slot 0 stays +1).
-    std::vector<int8_t> gpuSigned(origActive + 1);
-    cudaCheck(cudaMemcpy(gpuSigned.data(), sdf.deviceSignedVoxelSign(),
-                         std::size_t(origActive + 1) * sizeof(int8_t), cudaMemcpyDeviceToHost));
-    std::vector<uint32_t> hIndex(origActive + 1);
-    cudaCheck(cudaMemcpy(hIndex.data(), static_cast<const uint32_t*>(indexSidecar.deviceData()),
-                         std::size_t(origActive + 1) * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-
-    std::size_t barrierCount = 0, residualZeros = 0, ambiguous = 0;
-    const std::size_t barrierMism = cpuSignBarrier(h_orig, gpuOrigSign, gpuSigned, hIndex,
-                                                   points, triangles, map, barrierCount, residualZeros, ambiguous);
-    const bool barrierPass = (barrierMism == 0) && (residualZeros == 0) && (gpuSigned[0] == int8_t(1));
-    std::cout << "CC barrier sign validation:             " << (barrierPass ? "PASS" : "FAIL") << " ("
-              << barrierCount << " barrier voxels, " << barrierMism << " mismatches, "
-              << ambiguous << " surface-tangent ties, " << residualZeros << " residual zeros)\n";
 
 #ifdef NANOVDB_USE_OPENVDB
     // ---- Independent cross-check: our final signs vs OpenVDB meshToLevelSet (same mesh + transform) ----
@@ -1667,8 +1822,6 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
     }
 
     cudaCheck(cudaFreeHost(origBlob));
-
-    cudaCheck(cudaFreeHost(hostBlob));
     return result;
 }
 

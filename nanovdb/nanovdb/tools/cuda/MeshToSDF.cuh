@@ -7,16 +7,35 @@
     \authors Efty Sifakis and JaeHyun Lee
 
     \brief SDF-domain stages of the GPU mesh-to-signed-distance-field pipeline on NanoVDB index
-           grids. This is the layer that knows about meshes / UDF / barriers / signs; it builds on
-           two domain-agnostic primitives:
-             - nanovdb::tools::cuda::MeshToGrid       (mesh -> narrow-band ValueOnIndex grid + UDF),
-             - nanovdb::tools::cuda::ConnectedComponents (generic CC labeling of a ValueOnIndex grid).
+           grids. This is the layer that knows about meshes, unsigned distances, barriers and signs;
+           it builds on two domain-agnostic primitives:
+             - nanovdb::tools::cuda::MeshToGrid            (mesh -> narrow-band ValueOnIndex + UDF),
+             - nanovdb::tools::cuda::ConnectedComponents   (generic CC labeling of such a grid).
 
-           Stages implemented here:
-             - computeDerivedTopology(): prune the surface/barrier shell (UDF^2 < 0.75*voxelSize^2)
-               into a clean ValueOnIndex grid that CC then runs on.
-             - signNonBarrier(): given a CC-labeled grid, sign every non-barrier active voxel
-               (+ exterior / - interior; convention +outside / -inside).
+           The pipeline, in call order (steps 1 and 3 belong to the two primitives above):
+
+             2  computeDerivedTopology()  drop the surface shell, leaving the grid CC labels
+             4  signNonBarrier()          the min-x component is the exterior; the rest is interior
+                injectSignsToOriginal()   carry those signs back onto the un-pruned grid
+             5  signBarrier()             sign the shell that step 2 set aside
+             6  fillLeafInvertMask()      \
+                fillCoarseInvertMasks()    | extend the sign off the band, level by level
+                fillRootInteriorMask()    /
+
+           A single sdf_detail::signedSignAt() query then composes those sidecars into the sign at
+           any coordinate. The grid is never rebuilt: everything the steps produce is a sidecar
+           indexed by leaf.getValue(n), or a per-node invert mask.
+
+           These stages describe ONE closed surface. Step 4's rule — the leftmost active voxel is
+           outside — is only true of a lone closed surface, so a scene with several (separate
+           objects, cavities, nesting) is handled by partitioning it first, above this class: label
+           the UN-pruned band to get one component per closed surface, carve each into a grid of its
+           own, run the stages above on it, and compose the finished fields by nesting parity (a
+           point wrapped by k surfaces is inside iff k is odd). The three fill methods accept an
+           external sign array so the last step can also be run on the composed signs.
+
+           Reading order below: the class first, then sdf_detail (the CUDA functors, grouped by the
+           step that launches them), then the method definitions.
 
     \warning The header file contains cuda device code so be sure
              to only include it in .cu files (or other .cuh files)
@@ -30,7 +49,6 @@
 #include <nanovdb/cuda/DeviceBuffer.h>
 #include <nanovdb/math/Proximity.h>                    // closestPointOnTriangleToPoint
 #include <nanovdb/tools/cuda/PruneGrid.cuh>
-#include <nanovdb/tools/cuda/ConnectedComponents.cuh>  // ConnectedComponents<>
 #include <nanovdb/util/cuda/Injection.cuh>             // InjectGridDataFunctor
 #include <nanovdb/util/cuda/DeviceGridTraits.cuh>
 #include <nanovdb/util/cuda/Timer.h>
@@ -40,9 +58,189 @@ namespace nanovdb {
 
 namespace tools::cuda {
 
+/// @brief SDF-domain operations over a narrow-band ValueOnIndex grid + its UDF sidecar.
+/// @tparam BuildT Build type of the index grid (e.g. nanovdb::ValueOnIndex).
+template <typename BuildT>
+class MeshToSDF
+{
+    using GridT = NanoGrid<BuildT>;
+
+public:
+
+    /// @brief Constructor
+    /// @param stream optional CUDA stream (defaults to CUDA stream 0)
+    MeshToSDF(cudaStream_t stream = 0) : mStream(stream), mTimer(stream) {}
+
+    /// @brief Toggle on and off verbose mode
+    /// @param level Verbose level: 0=quiet, 1=timing
+    void setVerbose(int level = 1) { mVerbose = level; }
+
+    /// @brief Prune the surface/barrier shell of a narrow-band UDF index grid, producing a clean
+    ///        ValueOnIndex grid of the non-barrier voxels (the input to connected components).
+    ///        A voxel is dropped iff udf^2 < 0.75·voxelSize^2 (within √3/2 voxels of the surface).
+    /// @param d_srcGrid device narrow-band ValueOnIndex grid
+    /// @param d_udf     device UDF sidecar (WORLD units), indexed by leaf.getValue(n); slot 0 = background
+    /// @param voxelSize world-space voxel size (to convert the √3/2-voxel barrier into world units)
+    /// @return a handle to the derived (barrier-pruned) ValueOnIndex grid
+    template <typename BufferT = nanovdb::cuda::DeviceBuffer>
+    GridHandle<BufferT> computeDerivedTopology(const GridT* d_srcGrid, const float* d_udf,
+                                               float voxelSize, const BufferT& buffer = BufferT());
+
+    /// @brief Sign the non-barrier voxels of a CC-labeled grid: the component containing the grid's
+    ///        minimum-x active voxel is the exterior (+); every other component is interior (-).
+    ///        Convention: +outside / -inside.
+    ///
+    ///        The rule is a statement about ONE closed surface, and holds only on a grid that carries
+    ///        one — the leftmost voxel of a lone closed surface is necessarily outside it. Several
+    ///        objects at once would need one seed each, which is why the caller partitions the band
+    ///        into closed surfaces first and runs this per surface (see the header notes above).
+    /// @param d_grid        the CC-labeled (derived) device grid
+    /// @param d_voxelLabel  per-active-voxel component-label sidecar for @a d_grid (from
+    ///                      ConnectedComponents::getVoxelLabelsAndCount()), indexed by leaf.getValue(n).
+    void signNonBarrier(const GridT* d_grid, const uint32_t* d_voxelLabel);
+
+    /// @brief Carry the derived-grid signs (from signNonBarrier) back onto the original grid. The
+    ///        derived grid is the barrier-pruned subset of the original, so the injection covers all
+    ///        non-barrier voxels; barrier voxels (present only in the original) keep the sentinel 0
+    ///        ("unsigned barrier") for step 5 to fill. Requires signNonBarrier() first.
+    /// @param d_origGrid    the original (pre-prune) grid — injection target.
+    /// @param d_derivedGrid the barrier-pruned grid that was signed.
+    void injectSignsToOriginal(const GridT* d_origGrid, const GridT* d_derivedGrid);
+
+    /// @brief Sign every barrier voxel (sign == 0) of the original grid, completing the sign field so
+    ///        no sentinel-0 voxel remains. Faithful mirror of OpenVDB MeshToVolume.h
+    ///        ComputeIntersectingVoxelSign: a barrier voxel is exterior (+1) iff some exterior (+1)
+    ///        neighbor's nearest triangle places it on the same side of the surface, else interior (-1).
+    ///        Requires injectSignsToOriginal() first (it reads those signs as the anchor snapshot); the
+    ///        completed signs land in a new buffer exposed via deviceSignedVoxelSign().
+    /// @param d_grid      the original (post-injection) grid being signed.
+    /// @param d_index     nearest-triangle-index sidecar of the original grid (uint32; 0xFFFFFFFF = none).
+    /// @param d_points    device mesh vertices (WORLD space).
+    /// @param d_triangles device triangle vertex-index list.
+    /// @param map         the world<->index transform used to build the grid.
+    void signBarrier(const GridT* d_grid, const uint32_t* d_index,
+                     const nanovdb::Vec3f* d_points, const nanovdb::Vec3i* d_triangles,
+                     const nanovdb::Map& map);
+
+    /// @brief Step 6 (chunk A, leaf level): build the per-leaf invert masks that sign the INACTIVE
+    ///        voxels inside materialized leaves — bit ON => interior (-background), bit OFF =>
+    ///        exterior (+background, the default). Floods interior signs from the interior active
+    ///        band through each leaf's inactive voxels (active voxels are walls). Needs
+    ///        completed signs (from signBarrier(), or supplied via @a d_sign). Coarser levels (lower/upper/
+    ///        root) are later pipeline chunks.
+    /// @param d_grid the original (fully signed) device grid.
+    /// @param d_sign optional per-active-voxel sign array for @a d_grid, overriding the one this
+    ///               object computed. Lets the fill run on a grid it did not sign — a per-component
+    ///               sub-grid, or the original grid after the signs were recomposed.
+    void fillLeafInvertMask(const GridT* d_grid, const int8_t* d_sign = nullptr);
+
+    /// @brief Step 6 (chunk B, lower + upper levels): fill the coarse invert masks that sign the
+    ///        CHILDLESS child slots of lower and upper internal nodes (bit ON => that tile is
+    ///        interior / -background). Bottom-up per plan §7a: leaf faces seed lower/upper tiles ->
+    ///        flood lower -> lower faces seed upper tiles -> flood upper. Root-level tiles and the
+    ///        topology rebuild are chunk C. Requires fillLeafInvertMask() first.
+    /// @param d_grid the original (fully signed) device grid.
+    /// @param d_sign optional per-active-voxel sign array for @a d_grid, overriding the one this
+    ///               object computed. Lets the fill run on a grid it did not sign — a per-component
+    ///               sub-grid, or the original grid after the signs were recomposed.
+    void fillCoarseInvertMasks(const GridT* d_grid, const int8_t* d_sign = nullptr);
+
+    /// @brief Step 6 (chunk C, root level): build the root-interior SIDECAR that signs the deep
+    ///        interior beyond any upper node. A small P×Q×R cell array over the grid's root-tile
+    ///        bounding range (one uint8 per 4096^3 root region): pre-existing root entries are walls,
+    ///        faces from ALL THREE levels seed interior evidence into abutting ABSENT cells, and a
+    ///        multi-seed flood fills enclosed interiors. The GRID IS NOT MUTATED — queries consult the
+    ///        sidecar via sdf_detail::signedSignAt(). Requires fillCoarseInvertMasks() first.
+    /// @param d_grid the original (fully signed) device grid.
+    /// @param d_sign optional per-active-voxel sign array for @a d_grid, overriding the one this
+    ///               object computed. Lets the fill run on a grid it did not sign — a per-component
+    ///               sub-grid, or the original grid after the signs were recomposed.
+    void fillRootInteriorMask(const GridT* d_grid, const int8_t* d_sign = nullptr);
+
+    /// @brief Device pointer to the per-active-voxel sign array (+1 exterior / -1 interior),
+    ///        valid after signNonBarrier(). Length activeVoxelCount+1, indexed by leaf.getValue(n);
+    ///        slot 0 is the background (+1).
+    int8_t* deviceVoxelSign() { return static_cast<int8_t*>(mVoxelSign.deviceData()); }
+
+    /// @brief Representative (slot) of the exterior component, valid after signNonBarrier().
+    uint64_t exteriorRepresentative() const { return mExteriorRep; }
+
+    /// @brief Device pointer to the per-active-voxel sign array on the ORIGINAL grid, valid after
+    ///        injectSignsToOriginal(). Length origActiveVoxelCount+1, indexed by leaf.getValue(n);
+    ///        slot 0 = background (+1); non-barrier voxels carry +1/-1; barrier voxels carry the
+    ///        sentinel 0 (still unsigned, awaiting step 5).
+    int8_t* deviceOriginalVoxelSign() { return static_cast<int8_t*>(mOriginalVoxelSign.deviceData()); }
+
+    /// @brief Device pointer to the fully-signed per-active-voxel array on the ORIGINAL grid, valid
+    ///        after signBarrier(): every active voxel is +1 (exterior) or -1 (interior), no sentinel-0
+    ///        remains. Length origActiveVoxelCount+1, indexed by leaf.getValue(n); slot 0 = +1.
+    int8_t* deviceSignedVoxelSign() { return static_cast<int8_t*>(mSignedVoxelSign.deviceData()); }
+
+    /// @brief Device pointer to the per-leaf invert masks (nodeCount[0] × Mask<3>), valid after
+    ///        fillLeafInvertMask(). For each materialized leaf, bit n ON means the INACTIVE voxel n
+    ///        is interior (-background); OFF means exterior (+background). Bits of active voxels are
+    ///        always OFF (their sign lives in the sign sidecar).
+    nanovdb::Mask<3>* deviceLeafInvertMask() { return static_cast<nanovdb::Mask<3>*>(mLeafInvertMask.deviceData()); }
+
+    /// @brief Device pointer to the lower-level invert masks (nodeCount[1] × Mask<4>), valid after
+    ///        fillCoarseInvertMasks(). Bit n ON means the CHILDLESS lower slot n (an 8^3-voxel tile)
+    ///        is interior; OFF means exterior. Refined slots (childMask ON) carry no invert bit.
+    nanovdb::Mask<4>* deviceLowerInvertMask() { return static_cast<nanovdb::Mask<4>*>(mLowerInvertMask.deviceData()); }
+
+    /// @brief Device pointer to the upper-level invert masks (nodeCount[2] × Mask<5>), valid after
+    ///        fillCoarseInvertMasks(). Bit n ON means the CHILDLESS upper slot n (a 128^3-voxel tile)
+    ///        is interior; OFF means exterior. Refined slots carry no invert bit.
+    nanovdb::Mask<5>* deviceUpperInvertMask() { return static_cast<nanovdb::Mask<5>*>(mUpperInvertMask.deviceData()); }
+
+    /// @brief Device pointer to the root-interior sidecar (rootTileDims() cells, one uint8 per 4096^3
+    ///        root region; 1 = deep interior), valid after fillRootInteriorMask(). Cell (i,j,k) covers
+    ///        the root region at (rootTileMin()+(i,j,k))*4096. Cells outside the array are exterior.
+    uint8_t* deviceRootInterior() { return static_cast<uint8_t*>(mRootInterior.deviceData()); }
+
+    /// @brief Origin of the root-cell array, in 4096-tile units (valid after fillRootInteriorMask()).
+    nanovdb::Coord rootTileMin() const { return mRootTileMin; }
+
+    /// @brief Dimensions P×Q×R of the root-cell array (valid after fillRootInteriorMask()).
+    nanovdb::Coord rootTileDims() const { return mRootDims; }
+
+private:
+
+    // Shorthands for the two device-grid queries the stages keep asking for.
+    static uint32_t leafCountOf(const GridT* g) {
+        return util::cuda::DeviceGridTraits<BuildT>::getTreeData(g).mNodeCount[0];
+    }
+    static uint64_t activeCountOf(const GridT* g) {
+        return util::cuda::DeviceGridTraits<BuildT>::getActiveVoxelCount(g);
+    }
+
+    cudaStream_t                 mStream{0};
+    util::cuda::Timer            mTimer;
+    int                          mVerbose{0};
+
+    uint64_t                     mExteriorRep{0};  // the exterior component (see exteriorRepresentative())
+    nanovdb::cuda::DeviceBuffer  mVoxelSign;       // (derived activeVoxelCount+1) × int8_t: +1 ext / -1 int
+    nanovdb::cuda::DeviceBuffer  mOriginalVoxelSign; // (orig activeVoxelCount+1) × int8_t: +1/-1 non-barrier, 0 barrier
+    nanovdb::cuda::DeviceBuffer  mSignedVoxelSign;   // (orig activeVoxelCount+1) × int8_t: +1/-1 everywhere (barriers signed)
+    nanovdb::cuda::DeviceBuffer  mLeafInvertMask;    // nodeCount[0] × Mask<3>: inactive-voxel interior bits
+    nanovdb::cuda::DeviceBuffer  mLowerInvertMask;   // nodeCount[1] × Mask<4>: childless-lower-tile interior bits
+    nanovdb::cuda::DeviceBuffer  mUpperInvertMask;   // nodeCount[2] × Mask<5>: childless-upper-tile interior bits
+    nanovdb::cuda::DeviceBuffer  mRootInterior;      // P×Q×R × uint8: deep-interior bits of absent root regions
+    nanovdb::Coord               mRootTileMin{0, 0, 0};  // root-cell array origin (4096-tile units)
+    nanovdb::Coord               mRootDims{0, 0, 0};     // root-cell array dims P×Q×R
+
+}; // tools::cuda::MeshToSDF<BuildT>
+
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
 namespace sdf_detail {
 
 static constexpr int LEAF_SIZE = 512;  // 8^3 voxels per leaf
+
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Step 2 - prune the surface/barrier shell.
+// Voxels within sqrt(3)/2 of the surface straddle it, so which side they are on is not yet decided.
+// Dropping them splits each closed surface's band into a separate inner and outer shell, which is
+// what connected components then labels.
 
 /// @brief CUDA functor: build a per-leaf retain bitmask that drops the surface/barrier shell. A
 ///        voxel is PRUNED iff it is within √3/2 voxels of the surface (half a voxel space-diagonal —
@@ -81,11 +279,15 @@ struct UDFBarrierPruneMaskFunctor
     }
 };
 
-/// @brief Reduce over each surface's active voxels to that surface's minimum x, carrying the voxel's
-///        component representative into d_minKey[surface] = (unsigned(x) << 32) | uint32(rep). A
-///        surface's min-x voxels are all exterior to it (and share one representative), so the low 32
-///        bits resolve to that surface's exterior rep. With d_surfaceLabel == nullptr every voxel is
-///        treated as surface 0, i.e. a single global reduction.
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Step 4 - sign the non-barrier voxels.
+// Within one closed surface, the component holding that surface's minimum-x voxel is its exterior and
+// every other component of the same surface is interior. Seeding per surface rather than once globally
+// is what makes the rule hold for several disconnected objects.
+
+/// @brief Reduce over the active voxels to the minimum x, carrying the voxel's component representative
+///        into *d_minKey = (unsigned(x) << 32) | uint32(rep). The min-x voxels are all exterior (and
+///        share one representative), so the low 32 bits resolve to the exterior rep.
 template <typename BuildT>
 struct FindExteriorRepFunctor
 {
@@ -93,7 +295,7 @@ struct FindExteriorRepFunctor
     static constexpr int MinBlocksPerMultiprocessor = 1;
 
     __device__ void operator()(const NanoGrid<BuildT>* d_grid, const uint32_t* d_voxelLabel,
-                               const uint32_t* d_surfaceLabel, unsigned long long* d_minKey)
+                               unsigned long long* d_minKey)
     {
         const int leafID = blockIdx.x, n = threadIdx.x;
         const auto& leaf = d_grid->tree().template getFirstNode<0>()[leafID];
@@ -101,16 +303,14 @@ struct FindExteriorRepFunctor
         const uint64_t v = leaf.getValue(uint32_t(n));
         const nanovdb::Coord ijk = leaf.origin() + nanovdb::NanoLeaf<BuildT>::OffsetToLocalCoord(uint32_t(n));
         const uint32_t rep = d_voxelLabel[v];                              // component representative slot
-        const uint32_t s   = d_surfaceLabel ? d_surfaceLabel[v] : 0u;      // which closed surface
         const uint32_t ux  = uint32_t(int64_t(ijk[0]) + (int64_t(1) << 31));  // x, shifted to unsigned-comparable
-        const unsigned long long key = (static_cast<unsigned long long>(ux) << 32) | rep;
-        atomicMin(&d_minKey[s], key);
+        atomicMin(d_minKey, (static_cast<unsigned long long>(ux) << 32) | rep);
     }
 };
 
 /// @brief Write per-active-voxel signs (+1 exterior / -1 interior), indexed by leaf.getValue(n),
 ///        into d_sign (length activeVoxelCount+1; slot 0 = background, pre-filled +1). A voxel is
-///        exterior iff its component is its own surface's exterior representative.
+///        exterior iff its component is the exterior representative.
 template <typename BuildT>
 struct SignNonBarrierFunctor
 {
@@ -118,28 +318,21 @@ struct SignNonBarrierFunctor
     static constexpr int MinBlocksPerMultiprocessor = 1;
 
     __device__ void operator()(const NanoGrid<BuildT>* d_grid, const uint32_t* d_voxelLabel,
-                               const uint32_t* d_surfaceLabel, const uint32_t* d_exteriorRep,
-                               int8_t* d_sign)
+                               uint32_t exteriorRep, int8_t* d_sign)
     {
         const int leafID = blockIdx.x, n = threadIdx.x;
         const auto& leaf = d_grid->tree().template getFirstNode<0>()[leafID];
         if (!leaf.isActive(uint32_t(n))) return;
-        const uint64_t v   = leaf.getValue(uint32_t(n));
-        const uint32_t rep = d_voxelLabel[v];                          // component representative slot
-        const uint32_t s   = d_surfaceLabel ? d_surfaceLabel[v] : 0u;  // which closed surface
-        d_sign[v] = (rep == d_exteriorRep[s]) ? int8_t(1) : int8_t(-1);
+        const uint64_t v = leaf.getValue(uint32_t(n));
+        d_sign[v] = (d_voxelLabel[v] == exteriorRep) ? int8_t(1) : int8_t(-1);
     }
 };
 
-/// @brief Unpack each surface's exterior representative from the low 32 bits of its min key.
-///        A surface with no non-barrier voxel keeps the ~0ull sentinel, whose low half is
-///        0xFFFFFFFF — a value no component label can take, so none of its voxels is called exterior.
-struct ExteriorRepFromKeyFunctor
-{
-    __device__ void operator()(size_t s, const unsigned long long* d_minKey, uint32_t* d_rep) const {
-        d_rep[s] = uint32_t(d_minKey[s] & 0xFFFFFFFFull);
-    }
-};
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Step 5 - sign the barrier voxels.
+// A faithful mirror of OpenVDB MeshToVolume's ComputeIntersectingVoxelSign: a barrier voxel is exterior
+// iff some already-signed exterior neighbour's nearest triangle places both of them on the same side of
+// the surface. Anchors come from an immutable snapshot, so the result is independent of execution order.
 
 static constexpr uint32_t INVALID_TRIANGLE = 0xFFFFFFFFu;  // nearest-triangle-index sentinel
 
@@ -266,6 +459,12 @@ struct SignBarrierFunctor
     }
 };
 
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Step 6A - inactive voxels inside materialized leaves.
+// The band only covers the surface's neighbourhood; everywhere else the sign is carried implicitly by a
+// per-level invert mask whose bits mark the interior regions. Each level is flooded outwards from the
+// signed band, with the active voxels acting as walls.
+
 /// @brief Step 6 (chunk A, leaf level): build one invert Mask<3> per materialized leaf that signs the
 ///        INACTIVE voxels — bit ON => interior (-background), bit OFF => exterior (+background, the
 ///        default). One block per leaf, 512 threads (one per voxel), shared-memory Jacobi flood:
@@ -332,6 +531,11 @@ struct FillLeafInvertMaskFunctor
         }
     }
 };
+
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Step 6B - childless lower (8^3) and upper (128^3) tiles.
+// Built bottom-up: leaf faces seed the tiles they abut, those tiles flood among themselves, then lower
+// faces seed the upper level and it floods in turn.
 
 /// @brief Descend root -> upper -> lower for the 8^3 leaf-region at coord @a c and report where the
 ///        finest CHILDLESS tile containing it lives (the face->coarser seeding target, plan §7a).
@@ -550,7 +754,7 @@ struct CoarseInvertFloodFunctor
 };
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-// Step 6, chunk C (root level): the deep interior beyond any upper node is represented in a small
+// Step 6C - the deep interior beyond any upper node, held in a small
 // provisional P×Q×R cell array over the grid's root-tile bounding range (one cell per 4096^3 root
 // region) — a SIDECAR consulted by signedSignAt(); the grid itself is never mutated.
 
@@ -711,6 +915,12 @@ struct RootInteriorFloodFunctor
     }
 };
 
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Query - compose the per-level sidecars into a sign at any coordinate.
+// Descends the tree and answers from whichever level owns the coordinate: the sign sidecar for an active
+// voxel, the leaf/lower/upper invert mask for an inactive voxel or a childless tile, and the
+// root-interior array beyond the last upper node.
+
 /// @brief Full-domain sign query (host + device): the completed level-set sign at ANY index coord,
 ///        composed from the grid plus the step-6 sidecars — no grid mutation anywhere. Descends:
 ///          active voxel            -> sign sidecar (±1)
@@ -761,180 +971,6 @@ signedSignAt(const NanoGrid<BuildT>& grid, const nanovdb::Coord& ijk,
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-/// @brief SDF-domain operations over a narrow-band ValueOnIndex grid + its UDF sidecar.
-/// @tparam BuildT Build type of the index grid (e.g. nanovdb::ValueOnIndex).
-template <typename BuildT>
-class MeshToSDF
-{
-    using GridT = NanoGrid<BuildT>;
-
-public:
-
-    /// @brief Constructor
-    /// @param stream optional CUDA stream (defaults to CUDA stream 0)
-    MeshToSDF(cudaStream_t stream = 0) : mStream(stream), mTimer(stream) {}
-
-    /// @brief Toggle on and off verbose mode
-    /// @param level Verbose level: 0=quiet, 1=timing
-    void setVerbose(int level = 1) { mVerbose = level; }
-
-    /// @brief Prune the surface/barrier shell of a narrow-band UDF index grid, producing a clean
-    ///        ValueOnIndex grid of the non-barrier voxels (the input to connected components).
-    ///        A voxel is dropped iff udf^2 < 0.75·voxelSize^2 (within √3/2 voxels of the surface).
-    /// @param d_srcGrid device narrow-band ValueOnIndex grid
-    /// @param d_udf     device UDF sidecar (WORLD units), indexed by leaf.getValue(n); slot 0 = background
-    /// @param voxelSize world-space voxel size (to convert the √3/2-voxel barrier into world units)
-    /// @return a handle to the derived (barrier-pruned) ValueOnIndex grid
-    template <typename BufferT = nanovdb::cuda::DeviceBuffer>
-    GridHandle<BufferT> computeDerivedTopology(const GridT* d_srcGrid, const float* d_udf,
-                                               float voxelSize, const BufferT& buffer = BufferT());
-
-    /// @brief Sign the non-barrier voxels of a CC-labeled grid: within each closed surface, the
-    ///        component containing that surface's minimum-x active voxel is the exterior (+); every
-    ///        other component of that surface is interior (-). Convention: +outside / -inside.
-    ///
-    ///        Seeding per surface is what makes the rule valid for several disconnected objects: a
-    ///        single global seed would mark only one object's outer shell exterior. Omitting
-    ///        @a d_surfaceLabel treats the whole grid as one surface (a single global seed).
-    /// @param d_grid        the CC-labeled (derived) device grid
-    /// @param d_voxelLabel  per-active-voxel component-label sidecar for @a d_grid (from
-    ///                      ConnectedComponents::getVoxelLabelsAndCount()), indexed by leaf.getValue(n).
-    /// @param d_surfaceLabel optional per-active-voxel surface id in [0, surfaceCount), same indexing;
-    ///                      obtained by labeling the UN-pruned band (one component per closed surface).
-    /// @param surfaceCount  number of surfaces (length of the internal per-surface seed arrays).
-    void signNonBarrier(const GridT* d_grid, const uint32_t* d_voxelLabel,
-                        const uint32_t* d_surfaceLabel = nullptr, uint32_t surfaceCount = 1);
-
-    /// @brief Carry the derived-grid signs (from signNonBarrier) back onto the original grid. The
-    ///        derived grid is the barrier-pruned subset of the original, so the injection covers all
-    ///        non-barrier voxels; barrier voxels (present only in the original) keep the sentinel 0
-    ///        ("unsigned barrier") for step 5 to fill. Requires signNonBarrier() first.
-    /// @param d_origGrid    the original (pre-prune) grid — injection target.
-    /// @param d_derivedGrid the barrier-pruned grid that was signed.
-    void injectSignsToOriginal(const GridT* d_origGrid, const GridT* d_derivedGrid);
-
-    /// @brief Sign every barrier voxel (sign == 0) of the original grid, completing the sign field so
-    ///        no sentinel-0 voxel remains. Faithful mirror of OpenVDB MeshToVolume.h
-    ///        ComputeIntersectingVoxelSign: a barrier voxel is exterior (+1) iff some exterior (+1)
-    ///        neighbor's nearest triangle places it on the same side of the surface, else interior (-1).
-    ///        Requires injectSignsToOriginal() first (it reads those signs as the anchor snapshot); the
-    ///        completed signs land in a new buffer exposed via deviceSignedVoxelSign().
-    /// @param d_grid      the original (post-injection) grid being signed.
-    /// @param d_index     nearest-triangle-index sidecar of the original grid (uint32; 0xFFFFFFFF = none).
-    /// @param d_points    device mesh vertices (WORLD space).
-    /// @param d_triangles device triangle vertex-index list.
-    /// @param map         the world<->index transform used to build the grid.
-    void signBarrier(const GridT* d_grid, const uint32_t* d_index,
-                     const nanovdb::Vec3f* d_points, const nanovdb::Vec3i* d_triangles,
-                     const nanovdb::Map& map);
-
-    /// @brief Step 6 (chunk A, leaf level): build the per-leaf invert masks that sign the INACTIVE
-    ///        voxels inside materialized leaves — bit ON => interior (-background), bit OFF =>
-    ///        exterior (+background, the default). Floods interior signs from the interior active
-    ///        band through each leaf's inactive voxels (active voxels are walls). Needs
-    ///        completed signs (from signBarrier(), or supplied via @a d_sign). Coarser levels (lower/upper/
-    ///        root) are later pipeline chunks.
-    /// @param d_grid the original (fully signed) device grid.
-    /// @param d_sign optional per-active-voxel sign array for @a d_grid, overriding the one this
-    ///               object computed. Lets the fill run on a grid it did not sign — a per-component
-    ///               sub-grid, or the original grid after the signs were recomposed.
-    void fillLeafInvertMask(const GridT* d_grid, const int8_t* d_sign = nullptr);
-
-    /// @brief Step 6 (chunk B, lower + upper levels): fill the coarse invert masks that sign the
-    ///        CHILDLESS child slots of lower and upper internal nodes (bit ON => that tile is
-    ///        interior / -background). Bottom-up per plan §7a: leaf faces seed lower/upper tiles ->
-    ///        flood lower -> lower faces seed upper tiles -> flood upper. Root-level tiles and the
-    ///        topology rebuild are chunk C. Requires fillLeafInvertMask() first.
-    /// @param d_grid the original (fully signed) device grid.
-    /// @param d_sign optional per-active-voxel sign array for @a d_grid, overriding the one this
-    ///               object computed. Lets the fill run on a grid it did not sign — a per-component
-    ///               sub-grid, or the original grid after the signs were recomposed.
-    void fillCoarseInvertMasks(const GridT* d_grid, const int8_t* d_sign = nullptr);
-
-    /// @brief Step 6 (chunk C, root level): build the root-interior SIDECAR that signs the deep
-    ///        interior beyond any upper node. A small P×Q×R cell array over the grid's root-tile
-    ///        bounding range (one uint8 per 4096^3 root region): pre-existing root entries are walls,
-    ///        faces from ALL THREE levels seed interior evidence into abutting ABSENT cells, and a
-    ///        multi-seed flood fills enclosed interiors. The GRID IS NOT MUTATED — queries consult the
-    ///        sidecar via sdf_detail::signedSignAt(). Requires fillCoarseInvertMasks() first.
-    /// @param d_grid the original (fully signed) device grid.
-    /// @param d_sign optional per-active-voxel sign array for @a d_grid, overriding the one this
-    ///               object computed. Lets the fill run on a grid it did not sign — a per-component
-    ///               sub-grid, or the original grid after the signs were recomposed.
-    void fillRootInteriorMask(const GridT* d_grid, const int8_t* d_sign = nullptr);
-
-    /// @brief Device pointer to the per-active-voxel sign array (+1 exterior / -1 interior),
-    ///        valid after signNonBarrier(). Length activeVoxelCount+1, indexed by leaf.getValue(n);
-    ///        slot 0 is the background (+1).
-    int8_t* deviceVoxelSign() { return static_cast<int8_t*>(mVoxelSign.deviceData()); }
-
-    /// @brief Representative (slot) of surface 0's exterior component, valid after signNonBarrier().
-    ///        With no surface labels there is a single surface, so this is the global exterior rep.
-    uint64_t exteriorRepresentative() const { return mExteriorRep; }
-
-    /// @brief Device array of per-surface exterior representatives (surfaceCount entries), valid
-    ///        after signNonBarrier(). Entry s is 0xFFFFFFFF if surface s has no non-barrier voxel.
-    const uint32_t* deviceExteriorRepPerSurface() const {
-        return static_cast<const uint32_t*>(mExteriorRepPerSurface.deviceData());
-    }
-
-    /// @brief Device pointer to the per-active-voxel sign array on the ORIGINAL grid, valid after
-    ///        injectSignsToOriginal(). Length origActiveVoxelCount+1, indexed by leaf.getValue(n);
-    ///        slot 0 = background (+1); non-barrier voxels carry +1/-1; barrier voxels carry the
-    ///        sentinel 0 (still unsigned, awaiting step 5).
-    int8_t* deviceOriginalVoxelSign() { return static_cast<int8_t*>(mOriginalVoxelSign.deviceData()); }
-
-    /// @brief Device pointer to the fully-signed per-active-voxel array on the ORIGINAL grid, valid
-    ///        after signBarrier(): every active voxel is +1 (exterior) or -1 (interior), no sentinel-0
-    ///        remains. Length origActiveVoxelCount+1, indexed by leaf.getValue(n); slot 0 = +1.
-    int8_t* deviceSignedVoxelSign() { return static_cast<int8_t*>(mSignedVoxelSign.deviceData()); }
-
-    /// @brief Device pointer to the per-leaf invert masks (nodeCount[0] × Mask<3>), valid after
-    ///        fillLeafInvertMask(). For each materialized leaf, bit n ON means the INACTIVE voxel n
-    ///        is interior (-background); OFF means exterior (+background). Bits of active voxels are
-    ///        always OFF (their sign lives in the sign sidecar).
-    nanovdb::Mask<3>* deviceLeafInvertMask() { return static_cast<nanovdb::Mask<3>*>(mLeafInvertMask.deviceData()); }
-
-    /// @brief Device pointer to the lower-level invert masks (nodeCount[1] × Mask<4>), valid after
-    ///        fillCoarseInvertMasks(). Bit n ON means the CHILDLESS lower slot n (an 8^3-voxel tile)
-    ///        is interior; OFF means exterior. Refined slots (childMask ON) carry no invert bit.
-    nanovdb::Mask<4>* deviceLowerInvertMask() { return static_cast<nanovdb::Mask<4>*>(mLowerInvertMask.deviceData()); }
-
-    /// @brief Device pointer to the upper-level invert masks (nodeCount[2] × Mask<5>), valid after
-    ///        fillCoarseInvertMasks(). Bit n ON means the CHILDLESS upper slot n (a 128^3-voxel tile)
-    ///        is interior; OFF means exterior. Refined slots carry no invert bit.
-    nanovdb::Mask<5>* deviceUpperInvertMask() { return static_cast<nanovdb::Mask<5>*>(mUpperInvertMask.deviceData()); }
-
-    /// @brief Device pointer to the root-interior sidecar (rootTileDims() cells, one uint8 per 4096^3
-    ///        root region; 1 = deep interior), valid after fillRootInteriorMask(). Cell (i,j,k) covers
-    ///        the root region at (rootTileMin()+(i,j,k))*4096. Cells outside the array are exterior.
-    uint8_t* deviceRootInterior() { return static_cast<uint8_t*>(mRootInterior.deviceData()); }
-
-    /// @brief Origin of the root-cell array, in 4096-tile units (valid after fillRootInteriorMask()).
-    nanovdb::Coord rootTileMin() const { return mRootTileMin; }
-
-    /// @brief Dimensions P×Q×R of the root-cell array (valid after fillRootInteriorMask()).
-    nanovdb::Coord rootTileDims() const { return mRootDims; }
-
-private:
-
-    cudaStream_t                 mStream{0};
-    util::cuda::Timer            mTimer;
-    int                          mVerbose{0};
-
-    uint64_t                     mExteriorRep{0};  // surface 0's exterior component (see exteriorRepresentative())
-    nanovdb::cuda::DeviceBuffer  mExteriorRepPerSurface; // surfaceCount × uint32_t: per-surface exterior component
-    nanovdb::cuda::DeviceBuffer  mVoxelSign;       // (derived activeVoxelCount+1) × int8_t: +1 ext / -1 int
-    nanovdb::cuda::DeviceBuffer  mOriginalVoxelSign; // (orig activeVoxelCount+1) × int8_t: +1/-1 non-barrier, 0 barrier
-    nanovdb::cuda::DeviceBuffer  mSignedVoxelSign;   // (orig activeVoxelCount+1) × int8_t: +1/-1 everywhere (barriers signed)
-    nanovdb::cuda::DeviceBuffer  mLeafInvertMask;    // nodeCount[0] × Mask<3>: inactive-voxel interior bits
-    nanovdb::cuda::DeviceBuffer  mLowerInvertMask;   // nodeCount[1] × Mask<4>: childless-lower-tile interior bits
-    nanovdb::cuda::DeviceBuffer  mUpperInvertMask;   // nodeCount[2] × Mask<5>: childless-upper-tile interior bits
-    nanovdb::cuda::DeviceBuffer  mRootInterior;      // P×Q×R × uint8: deep-interior bits of absent root regions
-    nanovdb::Coord               mRootTileMin{0, 0, 0};  // root-cell array origin (4096-tile units)
-    nanovdb::Coord               mRootDims{0, 0, 0};     // root-cell array dims P×Q×R
-
-}; // tools::cuda::MeshToSDF<BuildT>
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -948,8 +984,7 @@ MeshToSDF<BuildT>::computeDerivedTopology(const GridT* d_srcGrid, const float* d
 
     // Barrier threshold √3/2 voxels expressed in the sidecar's WORLD units, squared.
     const float    barrierSqWorld = 0.75f * voxelSize * voxelSize;
-    const uint32_t srcLeafCount =
-        util::cuda::DeviceGridTraits<BuildT>::getTreeData(d_srcGrid).mNodeCount[0];
+    const uint32_t srcLeafCount = leafCountOf(d_srcGrid);
 
     // Leaf-indexed retain mask: one Mask<3> (512 bits) per source leaf (device-only).
     auto  retainMask   = nanovdb::cuda::DeviceBuffer::create(
@@ -967,46 +1002,33 @@ MeshToSDF<BuildT>::computeDerivedTopology(const GridT* d_srcGrid, const float* d
     auto handle = pruner.template getHandle<BufferT>(buffer);
     if (mVerbose==1) mTimer.stop();
     return handle;
-}
+}// MeshToSDF<BuildT>::computeDerivedTopology
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 template <typename BuildT>
-void MeshToSDF<BuildT>::signNonBarrier(const GridT* d_grid, const uint32_t* d_voxelLabel,
-                                       const uint32_t* d_surfaceLabel, uint32_t surfaceCount)
+void MeshToSDF<BuildT>::signNonBarrier(const GridT* d_grid, const uint32_t* d_voxelLabel)
 {
-    const uint32_t leafCount =
-        util::cuda::DeviceGridTraits<BuildT>::getTreeData(d_grid).mNodeCount[0];
+    const uint32_t leafCount = leafCountOf(d_grid);
     mExteriorRep = 0;
     if (leafCount == 0) return;  // every materialized leaf has >=1 component, so leafCount==0 => K==0
 
-    const uint64_t activeCount =
-        util::cuda::DeviceGridTraits<BuildT>::getActiveVoxelCount(d_grid);
-    const uint32_t nSurf = surfaceCount ? surfaceCount : 1u;
+    const uint64_t activeCount = activeCountOf(d_grid);
 
-    // (1) Per surface, the exterior representative = component of that surface's min-x active voxel.
+    // (1) The exterior representative = component of the grid's minimum-x active voxel.
     if (mVerbose==1) mTimer.start("Sign: find exterior component");
-    auto minKeyBuf = nanovdb::cuda::DeviceBuffer::create(nSurf * sizeof(unsigned long long), nullptr, false);
+    auto minKeyBuf = nanovdb::cuda::DeviceBuffer::create(sizeof(unsigned long long), nullptr, false);
     auto* d_minKey = static_cast<unsigned long long*>(minKeyBuf.deviceData());
-    // 0xFF fill => ~0ull per entry; a surface with no non-barrier voxel keeps it and thus never
-    // matches a component label, leaving its (barrier-only) voxels to be signed by signBarrier().
-    cudaCheck(cudaMemsetAsync(d_minKey, 0xFF, nSurf * sizeof(unsigned long long), mStream));
+    cudaCheck(cudaMemsetAsync(d_minKey, 0xFF, sizeof(unsigned long long), mStream));   // ~0ull
     using FindOp = sdf_detail::FindExteriorRepFunctor<BuildT>;
     util::cuda::operatorKernel<FindOp><<<leafCount, FindOp::MaxThreadsPerBlock, 0, mStream>>>(
-        d_grid, d_voxelLabel, d_surfaceLabel, d_minKey);
+        d_grid, d_voxelLabel, d_minKey);
     cudaCheckError();
 
-    // Low 32 bits of each surface's min key = that surface's exterior representative.
-    mExteriorRepPerSurface = nanovdb::cuda::DeviceBuffer::create(nSurf * sizeof(uint32_t), nullptr, false);
-    auto* d_extRep = static_cast<uint32_t*>(mExteriorRepPerSurface.deviceData());
-    util::cuda::lambdaKernel<<<(nSurf + 255) / 256, 256, 0, mStream>>>(
-        nSurf, sdf_detail::ExteriorRepFromKeyFunctor{}, d_minKey, d_extRep);
-    cudaCheckError();
-
-    unsigned long long minKey0 = 0;  // surface 0's key: keeps exteriorRepresentative() meaningful
-    cudaCheck(cudaMemcpyAsync(&minKey0, d_minKey, sizeof(minKey0), cudaMemcpyDeviceToHost, mStream));
+    unsigned long long minKey = 0;   // low 32 bits of the min key = the exterior representative
+    cudaCheck(cudaMemcpyAsync(&minKey, d_minKey, sizeof(minKey), cudaMemcpyDeviceToHost, mStream));
     cudaCheck(cudaStreamSynchronize(mStream));
-    mExteriorRep = uint64_t(uint32_t(minKey0 & 0xFFFFFFFFull));
+    mExteriorRep = uint64_t(uint32_t(minKey & 0xFFFFFFFFull));
     if (mVerbose==1) mTimer.stop();
 
     // (2) Per-voxel sign: +1 exterior / -1 interior (slot 0 = background +1).
@@ -1015,7 +1037,7 @@ void MeshToSDF<BuildT>::signNonBarrier(const GridT* d_grid, const uint32_t* d_vo
     using SignOp = sdf_detail::SignNonBarrierFunctor<BuildT>;
     if (mVerbose==1) mTimer.start("Sign: write per-voxel signs");
     util::cuda::operatorKernel<SignOp><<<leafCount, SignOp::MaxThreadsPerBlock, 0, mStream>>>(
-        d_grid, d_voxelLabel, d_surfaceLabel, d_extRep, deviceVoxelSign());
+        d_grid, d_voxelLabel, uint32_t(mExteriorRep), deviceVoxelSign());
     cudaCheckError();
     if (mVerbose==1) mTimer.stop();
 }// MeshToSDF<BuildT>::signNonBarrier
@@ -1025,10 +1047,8 @@ void MeshToSDF<BuildT>::signNonBarrier(const GridT* d_grid, const uint32_t* d_vo
 template <typename BuildT>
 void MeshToSDF<BuildT>::injectSignsToOriginal(const GridT* d_origGrid, const GridT* d_derivedGrid)
 {
-    const uint64_t origActive =
-        util::cuda::DeviceGridTraits<BuildT>::getActiveVoxelCount(d_origGrid);
-    const uint32_t derivedLeafCount =
-        util::cuda::DeviceGridTraits<BuildT>::getTreeData(d_derivedGrid).mNodeCount[0];
+    const uint64_t origActive = activeCountOf(d_origGrid);
+    const uint32_t derivedLeafCount = leafCountOf(d_derivedGrid);
 
     // Sentinel 0 ("unsigned barrier") everywhere; slot 0 = background (+1). Non-barrier voxels are
     // overwritten by the injection below; barrier voxels (in original but not derived) keep 0.
@@ -1055,10 +1075,8 @@ void MeshToSDF<BuildT>::signBarrier(const GridT* d_grid, const uint32_t* d_index
                                     const nanovdb::Vec3f* d_points, const nanovdb::Vec3i* d_triangles,
                                     const nanovdb::Map& map)
 {
-    const uint64_t activeCount =
-        util::cuda::DeviceGridTraits<BuildT>::getActiveVoxelCount(d_grid);
-    const uint32_t leafCount =
-        util::cuda::DeviceGridTraits<BuildT>::getTreeData(d_grid).mNodeCount[0];
+    const uint64_t activeCount = activeCountOf(d_grid);
+    const uint32_t leafCount = leafCountOf(d_grid);
 
     // Output: every active voxel ends up ±1. Start at 0, set slot 0 (background) = +1; the kernel
     // writes every active voxel (carrying non-barrier signs through, filling barriers).
@@ -1082,8 +1100,7 @@ template <typename BuildT>
 void MeshToSDF<BuildT>::fillLeafInvertMask(const GridT* d_grid, const int8_t* d_sign)
 {
     const int8_t* sign = d_sign ? d_sign : deviceSignedVoxelSign();  // external signs override the member
-    const uint32_t leafCount =
-        util::cuda::DeviceGridTraits<BuildT>::getTreeData(d_grid).mNodeCount[0];
+    const uint32_t leafCount = leafCountOf(d_grid);
     if (leafCount == 0) { mLeafInvertMask = nanovdb::cuda::DeviceBuffer(); return; }
 
     mLeafInvertMask = nanovdb::cuda::DeviceBuffer::create(

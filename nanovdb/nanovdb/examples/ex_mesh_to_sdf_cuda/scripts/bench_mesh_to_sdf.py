@@ -13,18 +13,29 @@ MESHES = os.path.expanduser("~/Desktop/meshes")
 OUT = os.path.expanduser("~/Desktop/Code/NVIDIA/openvdb/nanovdb/nanovdb/examples/"
                          "ex_mesh_to_sdf_cuda/BENCHMARK.md")
 
-# Pipeline step boundaries — the first timer label of each step (positional; some labels repeat
-# across MeshToGrid/PruneGrid so we bucket by order, not by name).
+# Pipeline step boundaries — the first timer label of each step, in EMISSION order (positional; some
+# labels repeat across MeshToGrid/PruneGrid/ConnectedComponents so we bucket by order, not by name).
+# "Allocating per-leaf component counts" therefore appears twice: once for the partition, once for the
+# per-surface labeling.
+#
+# Steps 3-7 are the PER-SURFACE group and repeat once per closed surface. When the matcher sees that
+# group's first marker again it wraps back to its start, so those totals are sums over all surfaces.
 STEP_MARKERS = [
-    (1, "Transforming triangles"),                 # step 1: rasterize UDF + nearest-tri index
-    (2, "Prune root node"),                         # step 2: prune barrier -> derived topology
-    (3, "Allocating per-leaf component counts"),    # step 3: connected components
-    (4, "Sign: find exterior component"),           # step 4: sign non-barrier + inject
-    (5, "Sign: barrier voxels"),                    # step 5: barrier signing
-    (6, "Fill leaf invert mask"),                   # step 6: invert-mask fill (leaf/coarse/root)
+    (1, "Transforming triangles"),                # step 1: rasterize UDF + nearest-tri index
+    (2, "Allocating per-leaf component counts"),  # step 2: partition = CC on the un-pruned band
+    (3, "Prune root node"),                       # step 3: prune barrier -> derived topology
+    (4, "Allocating per-leaf component counts"),  # step 4: connected components (derived grid)
+    (5, "Sign: find exterior component"),         # step 5: sign non-barrier + inject
+    (6, "Sign: barrier voxels"),                  # step 6: barrier signing
+    (7, "Fill leaf invert mask"),                 # step 7: invert-mask fill (leaf/coarse/root)
+    (8, "Inclusion:"),                            # step 8: nesting depth + merge (N>=2 only)
 ]
-STEP_NAME = {1: "1 rasterize (UDF+index)", 2: "2 prune -> derived", 3: "3 connected components",
-             4: "4 sign non-barrier+inject", 5: "5 barrier signing", 6: "6 invert-mask fill"}
+GROUP = (2, 7)   # [start, end) indices into STEP_MARKERS of the repeating per-surface group
+STEP_NAME = {1: "1 rasterize (UDF+index)", 2: "2 partition (un-pruned CC)",
+             3: "3 prune -> derived", 4: "4 connected components",
+             5: "5 sign non-barrier+inject", 6: "6 barrier signing",
+             7: "7 invert-mask fill", 8: "8 inclusion (nesting)"}
+NSTEPS = 8
 TIMER_RE = re.compile(r"^(.*?) \.\.\. completed in ([\d.]+) milliseconds")
 
 
@@ -42,22 +53,36 @@ def run(mesh, vs, timeout=300, skip_validate=False):
     wall = time.time() - t0
     timers = [(m.group(1).strip(), float(m.group(2))) for m in
               (TIMER_RE.match(l) for l in out.splitlines()) if m]
-    steps = {i: 0.0 for i in range(1, 7)}
-    subs = {i: [] for i in range(1, 7)}
-    cur = 1
-    marker_it = iter(STEP_MARKERS); nxt = next(marker_it, None)
+    steps = {i: 0.0 for i in range(1, NSTEPS + 1)}
+    subs = {i: [] for i in range(1, NSTEPS + 1)}
+    cur, mi = 1, 0
     for label, ms in timers:
-        while nxt and label.startswith(nxt[1]):
-            cur = nxt[0]; nxt = next(marker_it, None); break
+        # Scan FORWARD over the remaining markers rather than only testing the next one: a stage can
+        # be absent (step 8 runs only for multi-surface input), and a strict sequential match would
+        # then stall and misattribute every later timer.
+        hit = next((k for k in range(mi, len(STEP_MARKERS)) if label.startswith(STEP_MARKERS[k][1])), None)
+        # Nothing ahead matched, but the per-surface group may have started over on the next surface.
+        if hit is None:
+            hit = next((k for k in range(GROUP[0], min(mi, GROUP[1]))
+                        if label.startswith(STEP_MARKERS[k][1])), None)
+        if hit is not None:
+            cur, mi = STEP_MARKERS[hit][0], hit + 1
         steps[cur] += ms; subs[cur].append((label, ms))
     av = re.search(r"Active voxels\s+\[activeVoxelCount\(\)\]\s*:\s*(\d+)", out)
-    cc = re.search(r"\((\d+) components, (\d+) global labels", out)
+    # Component counts, from the labels the validator prints today:
+    #   "CC voxel-label contract validation: PASS (N active voxels, M components, ...)"  -> pruned grid
+    #   "Closed surfaces (un-pruned components): S"                                      -> closed surfaces
+    cc = re.search(r"contract validation:\s+\w+\s+\(\d+ active voxels, (\d+) components", out)
+    sf = re.search(r"Closed surfaces \(un-pruned components\):\s*(\d+)", out)
+    incl = re.search(r"Inclusion:[^.]*\.\.\. completed in ([\d.]+) milliseconds", out)
     ok = any(l.startswith("Root interior") for l, _ in timers)   # step-6 reached => pipeline completed
     oom = "out of memory" in out.lower()
     return {"status": "OK" if (rc == 0 and ok) else ("OOM" if oom else f"FAIL(rc={rc})"),
             "wall": wall, "pipe_ms": sum(steps.values()), "steps": steps, "subs": subs,
             "voxels": int(av.group(1)) if av else None,
-            "cc": int(cc.group(2)) if cc else None}
+            "cc": int(cc.group(1)) if cc else None,
+            "surfaces": int(sf.group(1)) if sf else None,
+            "incl_ms": float(incl.group(1)) if incl else None}
 
 
 def warmup():
@@ -109,6 +134,16 @@ def main():
         r = run(path, vs, timeout=150, skip_validate=False)
         ccrows.append((name, vs, r))
         write_md(r1, m1, vs1, scal_d, scal_h, ccrows)
+
+    # Exp 4: cost of the inclusion stage. It only runs for multi-surface input, which no real mesh in
+    # the suite is (they are all a single closed surface), so this uses the in-code analytic cases.
+    exp4 = ["--two-spheres", "--multi-spheres", "--nested-spheres", "--triple-nested", "--multi-nested"]
+    inclrows = []
+    for case in exp4:
+        print(f"exp4: {case}")
+        r = run(case, 0.02, timeout=150, skip_validate=True)
+        inclrows.append((case, r))
+        write_md(r1, m1, vs1, scal_d, scal_h, ccrows, inclrows)
     print("wrote", OUT)
 
 
@@ -124,7 +159,7 @@ def _scal_table(L, rows):
         L.append(f"| {vs} | {v} | {pm} | {w} | {st} |")
 
 
-def write_md(r1, m1, vs1, scal_d, scal_h, ccrows):
+def write_md(r1, m1, vs1, scal_d, scal_h, ccrows, inclrows=()):
     import platform
     def sh(cmd):
         try: return subprocess.run(cmd, shell=True, capture_output=True, text=True).stdout.strip()
@@ -156,6 +191,7 @@ def write_md(r1, m1, vs1, scal_d, scal_h, ccrows):
     L.append("|---|---:|---:|")
     tot = r1["pipe_ms"] or 1
     for i, ms in sorted(r1["steps"].items(), key=lambda kv: -kv[1]):
+        if ms <= 0.0: continue   # e.g. 5b is skipped when the mesh is a single closed surface
         L.append(f"| {STEP_NAME[i]} | {ms:.2f} | {100*ms/tot:.1f}% |")
     L.append(f"| **total** | **{tot:.2f}** | 100% |\n")
     L.append("### Top 12 individual sub-steps\n")
@@ -180,35 +216,49 @@ def write_md(r1, m1, vs1, scal_d, scal_h, ccrows):
     L.append("`status`: OK = full pipeline completed; OOM = `cudaError 2: out of memory` at allocation.\n")
 
     # Exp 3
-    L.append("## 3. Connected-component count per mesh\n")
-    L.append("Component count = distinct global CC labels on the barrier-pruned grid (ideal 2 for a "
-             "clean closed surface; extra = trapped pockets in thin/concave regions and/or separate "
-             "objects). Fixed voxelSize across meshes → very different voxel counts (the meshes have "
-             "different world scales).\n")
-    L.append("| mesh | voxelSize | active voxels | components | status |")
-    L.append("|---|---:|---:|---:|---|")
+    L.append("## 3. Component counts per mesh\n")
+    L.append("Two different counts. **Closed surfaces** = components of the UN-pruned band, which is "
+             "what the signing partitions by: one per closed surface. **Pruned components** = "
+             "components after the barrier shell is removed, which splits every surface into an inner "
+             "and an outer shell and additionally strands a component in each thin/concave pocket. "
+             "Fixed voxelSize across meshes → very different voxel counts (the meshes have different "
+             "world scales).\n")
+    L.append("| mesh | voxelSize | active voxels | closed surfaces | pruned components | status |")
+    L.append("|---|---:|---:|---:|---:|---|")
     for name, vs, r in ccrows:
         v = f"{r['voxels']:,}" if r.get("voxels") else "—"
-        cc = r.get("cc") if r.get("cc") is not None else "—"
-        L.append(f"| {name} | {vs} | {v} | {cc} | {r['status']} |")
+        cc = f"{r['cc']:,}" if r.get("cc") is not None else "—"
+        sf = r.get("surfaces") if r.get("surfaces") is not None else "—"
+        L.append(f"| {name} | {vs} | {v} | {sf} | {cc} | {r['status']} |")
     L.append("")
 
+    # Exp 4
+    if inclrows:
+        L.append("## 4. Inclusion-signing cost (multi-surface input)\n")
+        L.append("The nesting stage builds one sign field per closed surface to recover how the "
+                 "surfaces enclose one another, so it costs roughly one extra invert-mask fill per "
+                 "surface. It is skipped entirely for a single closed surface, which is every real "
+                 "mesh in the suite — hence the in-code analytic cases here. `inclusion ms` is the "
+                 "stage's own GPU timer; `pipeline ms` is the whole GPU pipeline.\n")
+        L.append("| case | surfaces | active voxels | inclusion ms | pipeline ms | % |")
+        L.append("|---|---:|---:|---:|---:|---:|")
+        for case, r in inclrows:
+            v  = f"{r['voxels']:,}" if r.get("voxels") else "—"
+            sf = r.get("surfaces") if r.get("surfaces") is not None else "—"
+            im = r.get("incl_ms")
+            pm = r.get("pipe_ms") or 0.0
+            L.append(f"| `{case}` | {sf} | {v} | "
+                     f"{im:.2f} | {pm:.1f} | {100*im/pm:.1f}% |" if im else
+                     f"| `{case}` | {sf} | {v} | — | {pm:.1f} | — |")
+        L.append("")
+
     # Findings
-    L.append("## 4. Findings\n")
-    L.append("- **Rasterization dominates at low–mid resolution.** Step 1 (mesh → UDF + index) is ~96% "
-             "of the pipeline and is triangle-bound (dragon 871 K triangles), so the pipeline time is "
-             "roughly flat (~220–340 ms) up to ~10 M voxels. **Beyond ~10 M it grows ~linearly with "
-             "voxel count** (0.6 s @ 41 M, 3.9 s @ 461 M) as the voxel-bound steps take over.")
-    L.append("- **Signing / CC / fill are cheap.** Steps 2–4 and 6 are each < 0.3%; barrier signing "
-             "(step 5, ~3%) is the only voxel-bound step visible at moderate resolution.")
-    L.append("- **Scalability ceiling (12 GB GPU):** dragon completes to **461 M** active voxels "
-             "(3.9 s pipeline, ~20 s wall) and OOMs at the next step (~1 B); the hairball stress mesh "
-             "completes to **340 M** and OOMs at 0.004 (its huge triangle count raises rasterization "
-             "memory). Validation-free wall at 461 M is ~20 s vs ~156 s with the OpenVDB cross-check on.")
-    L.append("- **Component count is resolution- and mesh-dependent.** Clean objects give ~1–2 "
-             "(armadillo 2, hand 1, cat 2); thin/concave features trap extra pockets (dragon 12 @ 0.003 "
-             "but 40 @ 0.004 — coarser pinches off more). All extras are correctly signed (interior); "
-             "they only inflate the raw count.")
+    L.append("## 5. Findings\n")
+    L.append('- **Rasterization dominates at low-mid resolution.** Step 1 (mesh -> UDF + index) is ~96% of the pipeline and is triangle-bound (dragon 871 K triangles), so the time is roughly flat (~220-370 ms) up to ~10 M voxels. **Beyond ~10 M it grows ~linearly with voxel count** (0.6 s @ 41 M, 4.5 s @ 461 M) as the voxel-bound steps take over.')
+    L.append('- **Everything after rasterization is cheap.** Barrier signing (step 5, ~2.6%) is the only voxel-bound step visible at moderate resolution; the prune, both connected-components passes, the signing and the invert-mask fill are each < 0.5%. Labeling the un-pruned band for the surface partition (step 3a) costs 0.79 ms on 1.1 M voxels — about the same as the pruned-grid pass it sits next to, and 0.3% of the pipeline.')
+    L.append('- **Scalability ceiling (12 GB GPU):** dragon completes to **461 M** active voxels (4.5 s pipeline, 34 s wall) and OOMs at the next step (~1 B); the hairball stress mesh completes to **340 M** and OOMs at 0.004, its huge triangle count raising rasterization memory. Wall times here exclude the CPU and OpenVDB validation, which dominates at these sizes.')
+    L.append('- **Every mesh in the suite is a single closed surface.** That is the count the signing actually partitions by, and it is **1 for all of them** — including the hairball, at both resolutions. The much larger pruned-component counts (dragon 40, hairball 333,703 @ 0.01) are artifacts of removing the barrier shell: each surface splits into an inner and an outer shell, and every thin or concave pocket strands one more. They are all signed correctly; they only inflate the raw count. Multi-object and nested input is what actually produces more than one surface.')
+    L.append('- **Nesting costs about one extra fill per surface, and only when there is more than one.** The inclusion stage builds a sign field per closed surface, so it grows with the surface count (~4 ms at 2 surfaces, ~11-13 ms at 5) and lands at 7-10% of the pipeline on the small analytic cases. On every real mesh it is skipped outright, so single-object input pays nothing for it.')
     L.append("")
     open(OUT, "w").write("\n".join(L) + "\n")
 

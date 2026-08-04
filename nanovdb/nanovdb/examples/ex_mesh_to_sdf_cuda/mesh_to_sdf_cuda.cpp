@@ -9,7 +9,8 @@
 ///        voxelizes it into a ValueOnIndex grid + UDF sidecar. Connected-components
 ///        labeling on top of that grid will be added as a subsequent step.
 ///
-///        See MeshToSDFDevelopmentPlan.md in this directory for the design notes and roadmap.
+///        See PIPELINE.md in this directory for how the pipeline works, and
+///        MeshToSDFDevelopmentPlan.md for the design notes and roadmap.
 
 #include <nanovdb/NanoVDB.h>          // host-usable: Vec3f, Vec3i, Vec3d, Map
 #include <nanovdb/GridHandle.h>       // GridHandle (header-only, host-usable)

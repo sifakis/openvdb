@@ -10,8 +10,9 @@
 ///          validateMeshToSdf()  independent CPU oracles + OpenVDB / analytic cross-checks
 ///          exportMeshToSdf()    dump the Polyscope visualization (.ccvis + .fill)
 ///        The connected-components labeling and the mesh->SDF library live in
-///        nanovdb/tools/cuda/{ConnectedComponents,MeshToSDF}.cuh. See MeshToSDF_PipelinePlan.md
-///        and MeshToSDFDevelopmentPlan.md in this directory for the design notes.
+///        nanovdb/tools/cuda/{ConnectedComponents,MeshToSDF}.cuh. See PIPELINE.md in this
+///        directory for how that pipeline works, and MeshToSDF_PipelinePlan.md /
+///        MeshToSDFDevelopmentPlan.md for the design notes.
 
 #include <nanovdb/NanoVDB.h>
 #include <nanovdb/tools/cuda/MeshToGrid.cuh>

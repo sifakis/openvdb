@@ -227,6 +227,72 @@ static SDFResult runPipeline(const std::string& name,
     return result;
 }
 
+/// @brief Scalability probe: @a n concentric spheres, 10 voxels apart, innermost at radius 10. Every
+///        surface is enclosed by the ones outside it, so the nesting depths run 0,1,..,n-1 and the
+///        signs of every other shell are flipped. Note the voxel count grows as O(n^3) here — the
+///        outer radius has to grow with n to keep the shells apart — so read this table together with
+///        the separated-sphere one, which grows the surface count at O(n) voxels.
+static int runNestedShells(int n, float voxelSize, float bandWidth)
+{
+    std::vector<nanovdb::Vec3f> P; std::vector<nanovdb::Vec3i> T;
+    const float          s = 0.5f * voxelSize;                  // fractional-voxel offset
+    const nanovdb::Vec3f C(s, s, s);
+    std::vector<double>  spheres(4 * std::size_t(n));
+    for (int i = 0; i < n; ++i) {
+        const float R = float(10 * (n - i)) * voxelSize;        // outermost first, 10 voxels apart
+        makeUVSphere(C, R, 128, 256, P, T);
+        spheres[4*i+0] = double(C[0]); spheres[4*i+1] = double(C[1]);
+        spheres[4*i+2] = double(C[2]); spheres[4*i+3] = double(R);
+    }
+    const SDFResult r = runPipeline("NESTED-SHELLS x" + std::to_string(n), P, T,
+                                    voxelSize, bandWidth, spheres.data(), n);
+    int failures = 0;
+    auto check = [&](const char* label, bool ok) {
+        std::cout << "  [" << (ok ? "PASS" : "FAIL") << "] " << label << "\n";
+        if (!ok) ++failures;
+    };
+    std::cout << "  nested-shells assertions:\n";
+    check("closed surfaces == n", r.surfaceComponents == uint64_t(n));
+    check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
+    check("0 barrier-signing mismatches (CPU mirror)", r.barrierMismatches == 0 && r.barrierResidualZeros == 0);
+    check("0 surface-merge mismatches (per-surface signs vs composed)", r.mergeMismatches == 0);
+    return failures;
+}
+
+/// @brief Scalability probe: @a n equal spheres of radius 10 voxels on a cubic lattice, 40 voxels
+///        apart, so none encloses another (all depths 0). The band voxels grow linearly with @a n,
+///        which is what makes this the control for the nested table: anything super-linear here is
+///        the per-surface machinery itself, not the extra geometry.
+static int runManySpheres(int n, float voxelSize, float bandWidth)
+{
+    std::vector<nanovdb::Vec3f> P; std::vector<nanovdb::Vec3i> T;
+    const float         R     = 10.f * voxelSize;
+    const float         pitch = 40.f * voxelSize;
+    const int           side  = int(std::ceil(std::cbrt(double(n))));   // cubic lattice, row-major
+    std::vector<double> spheres(4 * std::size_t(n));
+    for (int i = 0; i < n; ++i) {
+        const nanovdb::Vec3f C(float(i % side) * pitch,
+                               float((i / side) % side) * pitch,
+                               float(i / (side * side)) * pitch);
+        makeUVSphere(C, R, 64, 128, P, T);
+        spheres[4*i+0] = double(C[0]); spheres[4*i+1] = double(C[1]);
+        spheres[4*i+2] = double(C[2]); spheres[4*i+3] = double(R);
+    }
+    const SDFResult r = runPipeline("MANY-SPHERES x" + std::to_string(n), P, T,
+                                    voxelSize, bandWidth, spheres.data(), n);
+    int failures = 0;
+    auto check = [&](const char* label, bool ok) {
+        std::cout << "  [" << (ok ? "PASS" : "FAIL") << "] " << label << "\n";
+        if (!ok) ++failures;
+    };
+    std::cout << "  many-spheres assertions:\n";
+    check("closed surfaces == n", r.surfaceComponents == uint64_t(n));
+    check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
+    check("0 barrier-signing mismatches (CPU mirror)", r.barrierMismatches == 0 && r.barrierResidualZeros == 0);
+    check("0 surface-merge mismatches (per-surface signs vs composed)", r.mergeMismatches == 0);
+    return failures;
+}
+
 /// @brief Run the in-code analytic self-tests (cube + sphere). Returns the number of failed checks.
 static int runSelfTests(const std::string& which, float voxelSize, float bandWidth)
 {
@@ -458,9 +524,24 @@ int main(int argc, char* argv[])
             throw std::runtime_error("usage: " + std::string(argv[0]) +
                                      " <input.obj | --cube | --sphere | --big-sphere | --selftest |"
                                      " --two-spheres | --multi-spheres | --nested-spheres |"
-                                     " --triple-nested | --multi-nested> [voxelSize] [bandWidth]");
+                                     " --triple-nested | --multi-nested> [voxelSize] [bandWidth]\n"
+                                     "   or: " + std::string(argv[0]) +
+                                     " <--nested-shells | --many-spheres> <n> [voxelSize] [bandWidth]");
 
         const std::string arg1 = argv[1];
+
+        // Scalability probes: surface count is a parameter, so n comes before the voxel size.
+        if (arg1 == "--nested-shells" || arg1 == "--many-spheres") {
+            if (argc < 3) throw std::runtime_error(arg1 + " needs a surface count");
+            const int   n  = std::stoi(argv[2]);
+            const float vs = (argc > 3) ? std::stof(argv[3]) : 0.02f;
+            const float bw = (argc > 4) ? std::stof(argv[4]) : 3.0f;
+            const int failures = (arg1 == "--nested-shells") ? runNestedShells(n, vs, bw)
+                                                             : runManySpheres(n, vs, bw);
+            std::cout << "\nSelf-tests: " << (failures == 0 ? "ALL PASS" : "FAILED")
+                      << " (" << failures << " failed checks)\n";
+            return failures == 0 ? 0 : 1;
+        }
 
         // In-code analytic self-tests / probes (no .obj). Default voxelSize 0.02.
         if (arg1 == "--cube" || arg1 == "--sphere" || arg1 == "--big-sphere" ||

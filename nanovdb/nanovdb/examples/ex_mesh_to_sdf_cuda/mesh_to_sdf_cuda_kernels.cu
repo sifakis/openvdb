@@ -18,6 +18,7 @@
 #include <nanovdb/tools/cuda/MeshToGrid.cuh>
 #include <nanovdb/tools/cuda/ConnectedComponents.cuh>
 #include <nanovdb/tools/cuda/MeshToSDF.cuh>
+#include <nanovdb/tools/cuda/PointsToGrid.cuh>  // voxelsToGrid (synthetic leaves for the SV probe)
 #include <nanovdb/tools/cuda/PruneGrid.cuh>   // per-surface sub-grids for the inclusion test
 #include <nanovdb/util/cuda/DeviceGridTraits.cuh>
 #include <nanovdb/util/cuda/Injection.cuh>   // InjectGridDataFunctor (surface labels: orig -> derived)
@@ -35,8 +36,10 @@
 #include <cstdint>
 #include <cstdlib>    // std::getenv
 #include <fstream>    // std::ofstream (visualization export)
+#include <iomanip>   // std::setw (convergence report)
 #include <iostream>
 #include <memory>     // std::unique_ptr (SdfPipeline)
+#include <random>    // std::mt19937 (convergence probe)
 #include <string>
 #include <tuple>
 #include <utility>
@@ -1489,4 +1492,255 @@ int testRootInteriorFlood()
     std::cout << "Root-interior flood unit test:          " << (mism == 0 ? "PASS" : "FAIL")
               << " (7x5x5 cells, 2 wall planes, 3 regions, " << mism << " mismatches)\n";
     return mism;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// SV CONVERGENCE PROBE : how many Shiloach-Vishkin rounds does the per-leaf labeling actually need?
+//
+// The loop inside ConnectedComponents carries a safety cap (LeafUnionFind::MaxConvergenceIters),
+// meant to catch a non-terminating bug rather than to bound legitimate input. A leaf that reached it
+// would be silently under-labeled, and there is no proof of a tight bound -- so this measures one.
+//
+// Rasterized narrow bands are blobby: their leaves have shallow union-find trees and few local
+// minima, so they exercise neither term of the informal estimate (log2 of the tree depth, plus log2
+// of the number of local minima). The synthetic patterns below drive each term to its extreme
+// instead. The two extremes turn out to be mutually exclusive inside one leaf -- a long induced path
+// has maximal depth but exactly one local minimum, a checkerboard has maximal minima but depth zero
+// -- which is the reason that estimate ADDS the terms rather than multiplying them.
+// ---------------------------------------------------------------------------------------------------
+namespace {
+
+using SvCoord = nanovdb::Coord;
+constexpr int SV_DIM = 8;                                                    // voxels per leaf edge
+constexpr int SV_CAP = nanovdb::tools::cuda::cc_detail::LeafComponentCountFunctor<nanovdb::ValueOnIndex>::MaxConvergenceIters;
+
+struct SvResult {
+    uint64_t              leaves = 0, components = 0;
+    int                   maxRounds = 0;
+    bool                  hitCap = false;
+    std::vector<uint32_t> histogram;
+};
+
+/// @brief Label a grid with the convergence diagnostic on, and read back the per-leaf round counts.
+SvResult svMeasureGrid(const nanovdb::NanoGrid<nanovdb::ValueOnIndex>* d_grid)
+{
+    using BuildT = nanovdb::ValueOnIndex;
+    SvResult r;
+    nanovdb::tools::cuda::ConnectedComponents<BuildT> cc(d_grid);
+    cc.setConvergenceDiagnostics();
+    r.components = cc.getVoxelLabelsAndCount().second;
+    cudaCheck(cudaDeviceSynchronize());
+    r.histogram = cc.convergenceHistogram();
+    for (int i = 0; i <= SV_CAP; ++i)
+        if (r.histogram[i]) { r.leaves += r.histogram[i]; r.maxRounds = i; }
+    r.hitCap = r.histogram[SV_CAP] != 0;
+    return r;
+}
+
+/// @brief Build a grid holding exactly @a coords and measure it.
+SvResult svMeasureVoxels(const std::vector<SvCoord>& coords)
+{
+    using BuildT = nanovdb::ValueOnIndex;
+    if (coords.empty()) return SvResult{};
+    SvCoord* d_coords = nullptr;
+    cudaCheck(cudaMalloc(&d_coords, coords.size() * sizeof(SvCoord)));
+    cudaCheck(cudaMemcpy(d_coords, coords.data(), coords.size() * sizeof(SvCoord), cudaMemcpyHostToDevice));
+    auto handle = nanovdb::tools::cuda::voxelsToGrid<BuildT>(d_coords, coords.size());
+    cudaCheck(cudaFree(d_coords));
+    return svMeasureGrid(handle.template deviceGrid<BuildT>());
+}
+
+// ---- synthetic single-leaf patterns ----------------------------------------------------------
+
+/// @brief The longest induced path that fits in one leaf: 16 lines along x, one at every even (y,z),
+///        joined end to end by a single connector voxel each.
+///
+///        Spacing the lines two apart is what keeps it an INDUCED path. Fill the leaf densely and
+///        the component becomes the whole 8^3 grid graph, whose diameter is only 21; here it is one
+///        chain of 143 voxels, so after the first hooking step the union-find tree is a chain of that
+///        depth and the graph diameter is 142. This drives the depth term, and it is also the shape
+///        that makes "converges in fewer rounds than the graph diameter" useless as a bound: 142 is
+///        far above the cap of 64.
+std::vector<SvCoord> svSerpentine()
+{
+    std::vector<std::pair<int, int>> lines;                     // (y,z) per line, in visiting order
+    for (int z = 0; z < SV_DIM; z += 2)
+        for (int i = 0; i < SV_DIM / 2; ++i) {
+            const int y = ((z / 2) & 1) ? (SV_DIM - 2 - 2 * i) : (2 * i);   // reverse y on alternate layers
+            lines.emplace_back(y, z);
+        }
+    std::vector<SvCoord> v;
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        const int y = lines[i].first, z = lines[i].second;
+        for (int x = 0; x < SV_DIM; ++x) v.emplace_back(x, y, z);
+        if (i + 1 < lines.size()) {                             // connector at the end we exit from
+            const int ny = lines[i + 1].first, nz = lines[i + 1].second;
+            v.emplace_back((i & 1) ? 0 : SV_DIM - 1, (y + ny) / 2, (z + nz) / 2);
+        }
+    }
+    return v;
+}
+
+/// @brief Every voxel of one coordinate parity: 256 voxels, no two of them 6-adjacent. Maximises the
+///        number of local minima -- each voxel is its own component -- at tree depth zero. The
+///        opposite extreme from the serpentine.
+std::vector<SvCoord> svCheckerboard()
+{
+    std::vector<SvCoord> v;
+    for (int x = 0; x < SV_DIM; ++x)
+        for (int y = 0; y < SV_DIM; ++y)
+            for (int z = 0; z < SV_DIM; ++z)
+                if (((x + y + z) & 1) == 0) v.emplace_back(x, y, z);
+    return v;
+}
+
+/// @brief A spine along x with teeth hanging off it in y: one component, but many branch points. An
+///        attempt to pay the depth cost and the merging cost at the same time.
+std::vector<SvCoord> svComb()
+{
+    std::vector<SvCoord> v;
+    for (int x = 0; x < SV_DIM; ++x) v.emplace_back(x, 0, 0);                // spine
+    for (int x = 0; x < SV_DIM; x += 2)                                       // teeth, two apart
+        for (int y = 1; y < SV_DIM; ++y) v.emplace_back(x, y, 0);
+    return v;
+}
+
+/// @brief Concentric one-voxel-thick boxes, two apart: nested components whose labels interleave, so
+///        the smallest label sits on the outermost shell and has the furthest to travel.
+std::vector<SvCoord> svShells()
+{
+    std::vector<SvCoord> v;
+    for (int r = 0; r < SV_DIM / 2; r += 2)
+        for (int x = r; x < SV_DIM - r; ++x)
+            for (int y = r; y < SV_DIM - r; ++y)
+                for (int z = r; z < SV_DIM - r; ++z)
+                    if (x == r || x == SV_DIM - 1 - r || y == r || y == SV_DIM - 1 - r ||
+                        z == r || z == SV_DIM - 1 - r) v.emplace_back(x, y, z);
+    return v;
+}
+
+/// @brief The full leaf. Maximal voxel count, but the 8^3 grid graph has diameter only 21.
+std::vector<SvCoord> svSolid()
+{
+    std::vector<SvCoord> v;
+    for (int x = 0; x < SV_DIM; ++x)
+        for (int y = 0; y < SV_DIM; ++y)
+            for (int z = 0; z < SV_DIM; ++z) v.emplace_back(x, y, z);
+    return v;
+}
+
+/// @brief Each voxel of the leaf kept independently with probability @a density.
+std::vector<SvCoord> svRandomFill(std::mt19937& rng, double density)
+{
+    std::uniform_real_distribution<double> u(0.0, 1.0);
+    std::vector<SvCoord> v;
+    for (int x = 0; x < SV_DIM; ++x)
+        for (int y = 0; y < SV_DIM; ++y)
+            for (int z = 0; z < SV_DIM; ++z)
+                if (u(rng) < density) v.emplace_back(x, y, z);
+    return v;
+}
+
+} // anonymous namespace
+
+/// @brief Run the convergence probe. Reports the synthetic adversarial leaves, a randomized search,
+///        and -- when @a points is non-empty -- the two grid shapes the real pipeline labels: the
+///        rasterized narrow band, and that band with its barrier shell pruned away.
+/// @return 0 if the safety cap was never reached, 1 otherwise.
+int runSvConvergence(int trials,
+                     const std::vector<nanovdb::Vec3f>& points,
+                     const std::vector<nanovdb::Vec3i>& triangles,
+                     float voxelSize, float bandWidth)
+{
+    using BuildT = nanovdb::ValueOnIndex;
+
+    std::cout << "Shiloach-Vishkin rounds to convergence, per leaf.   Safety cap = " << SV_CAP << "\n"
+              << "A leaf reaching the cap would be under-labeled, i.e. a wrong result.\n\n";
+
+    int         worst = 0;
+    std::string worstName;
+    auto note = [&](int rounds, const std::string& name) {
+        if (rounds > worst) { worst = rounds; worstName = name; }
+    };
+
+    std::cout << "Hand-built single-leaf patterns\n";
+    const std::pair<const char*, std::vector<SvCoord> (*)()> patterns[] = {
+        {"serpentine (induced path)", svSerpentine},
+        {"checkerboard (isolated)",   svCheckerboard},
+        {"comb (spine + teeth)",      svComb},
+        {"nested shells",             svShells},
+        {"solid leaf",                svSolid},
+    };
+    for (const auto& p : patterns) {
+        const std::vector<SvCoord> coords = p.second();
+        const SvResult             r      = svMeasureVoxels(coords);
+        std::cout << "  " << std::left << std::setw(28) << p.first << std::right
+                  << std::setw(5) << coords.size() << " voxels"
+                  << std::setw(4) << r.leaves << " leaves"
+                  << std::setw(5) << r.components << " components"
+                  << "    max rounds = " << std::setw(2) << r.maxRounds
+                  << (r.hitCap ? "   *** CAP REACHED ***" : "") << "\n";
+        note(r.maxRounds, p.first);
+    }
+
+    std::cout << "\nRandom single-leaf fills, " << trials << " trials per density\n";
+    std::mt19937 rng(12345);                        // fixed seed, so the sweep is reproducible
+    for (double density : {0.05, 0.15, 0.30, 0.50, 0.70, 0.85, 0.95}) {
+        int      localWorst = 0;
+        double   roundSum   = 0.0;
+        uint64_t leaves     = 0;
+        for (int t = 0; t < trials; ++t) {
+            const std::vector<SvCoord> coords = svRandomFill(rng, density);
+            if (coords.empty()) continue;
+            const SvResult r = svMeasureVoxels(coords);
+            localWorst = std::max(localWorst, r.maxRounds);
+            for (int i = 0; i <= SV_CAP; ++i) { roundSum += double(i) * r.histogram[i]; leaves += r.histogram[i]; }
+        }
+        std::cout << "  density " << std::fixed << std::setprecision(2) << density
+                  << "    max = " << localWorst
+                  << "    mean = " << std::setprecision(2) << (leaves ? roundSum / double(leaves) : 0.0)
+                  << "\n";
+        note(localWorst, "random fill at density " + std::to_string(density));
+    }
+
+    if (!points.empty()) {
+        std::cout << "\nReal narrow band (" << points.size() << " verts, " << triangles.size()
+                  << " tris, voxelSize " << voxelSize << ")\n";
+        nanovdb::Map map;
+        map.set(double(voxelSize), nanovdb::Vec3d(0.0), 1.0);
+
+        thrust::universal_vector<nanovdb::Vec3f> dPoints(points.begin(), points.end());
+        thrust::universal_vector<nanovdb::Vec3i> dTriangles(triangles.begin(), triangles.end());
+        nanovdb::tools::cuda::MeshToGrid<BuildT> converter(
+            dPoints.data().get(), uint32_t(dPoints.size()),
+            dTriangles.data().get(), uint32_t(dTriangles.size()), map);
+        converter.setNarrowBandWidth(bandWidth);
+        auto [bandHandle, udf] = converter.getHandleAndUDF();
+        const auto* d_band = bandHandle.template deviceGrid<BuildT>();
+
+        // (1) the un-pruned band, which is what the surface partition labels
+        const SvResult band = svMeasureGrid(d_band);
+        std::cout << "  " << std::left << std::setw(28) << "band (un-pruned)" << std::right
+                  << std::setw(10) << band.leaves << " leaves"
+                  << std::setw(8) << band.components << " components"
+                  << "    max rounds = " << std::setw(2) << band.maxRounds
+                  << (band.hitCap ? "   *** CAP REACHED ***" : "") << "\n";
+        note(band.maxRounds, "band (un-pruned)");
+
+        // (2) the same band with the barrier shell removed, which is what each surface labels
+        nanovdb::tools::cuda::sdf_detail::SurfaceSigner<BuildT> signer;
+        auto derivedHandle = signer.computeDerivedTopology(
+            d_band, static_cast<const float*>(udf.deviceData()), voxelSize);
+        const SvResult derived = svMeasureGrid(derivedHandle.deviceGrid<BuildT>());
+        std::cout << "  " << std::left << std::setw(28) << "band (barrier pruned)" << std::right
+                  << std::setw(10) << derived.leaves << " leaves"
+                  << std::setw(8) << derived.components << " components"
+                  << "    max rounds = " << std::setw(2) << derived.maxRounds
+                  << (derived.hitCap ? "   *** CAP REACHED ***" : "") << "\n";
+        note(derived.maxRounds, "band (barrier pruned)");
+    }
+
+    std::cout << "\nWorst observed: " << worst << " rounds, from " << worstName
+              << ".   Cap is " << SV_CAP << ".\n";
+    return worst >= SV_CAP ? 1 : 0;
 }

@@ -518,6 +518,13 @@ static int runSelfTests(const std::string& which, float voxelSize, float bandWid
     return failures;
 }
 
+/// @brief Measure how many Shiloach-Vishkin rounds the per-leaf labeling needs: synthetic adversarial
+///        leaves, a randomized search, and -- when a mesh is given -- its real narrow band.
+int runSvConvergence(int trials,
+                     const std::vector<nanovdb::Vec3f>& points,
+                     const std::vector<nanovdb::Vec3i>& triangles,
+                     float voxelSize, float bandWidth);
+
 int main(int argc, char* argv[])
 {
     try {
@@ -527,9 +534,32 @@ int main(int argc, char* argv[])
                                      " --two-spheres | --multi-spheres | --nested-spheres |"
                                      " --triple-nested | --multi-nested> [voxelSize] [bandWidth]\n"
                                      "   or: " + std::string(argv[0]) +
-                                     " <--nested-shells | --many-spheres> <n> [voxelSize] [bandWidth]");
+                                     " <--nested-shells | --many-spheres> <n> [voxelSize] [bandWidth]\n"
+                                     "   or: " + std::string(argv[0]) +
+                                     " --sv-convergence [input.obj] [--trials N]"
+                                     " [--voxel-size S] [--band-width W]");
 
         const std::string arg1 = argv[1];
+
+        // Convergence probe for the per-leaf union-find. Synthetic leaves always; an optional .obj
+        // adds the real narrow band it produces.
+        if (arg1 == "--sv-convergence") {
+            std::vector<nanovdb::Vec3f> points;
+            std::vector<nanovdb::Vec3i> triangles;
+            int   trials    = 2000;
+            float voxelSize = 0.01f, bandWidth = 3.0f;
+            for (int i = 2; i < argc; ++i) {
+                const std::string a = argv[i];
+                if (a == "--trials" && i + 1 < argc)          trials    = std::stoi(argv[++i]);
+                else if (a == "--voxel-size" && i + 1 < argc) voxelSize = std::stof(argv[++i]);
+                else if (a == "--band-width" && i + 1 < argc) bandWidth = std::stof(argv[++i]);
+                else {
+                    std::cout << "Reading " << a << "...\n";
+                    readOBJ(a, points, triangles);
+                }
+            }
+            return runSvConvergence(trials, points, triangles, voxelSize, bandWidth);
+        }
 
         // Scalability probes: surface count is a parameter, so n comes before the voxel size.
         if (arg1 == "--nested-shells" || arg1 == "--many-spheres") {

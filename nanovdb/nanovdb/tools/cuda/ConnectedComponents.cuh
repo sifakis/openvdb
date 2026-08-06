@@ -25,6 +25,7 @@
 #include <nanovdb/cuda/TempPool.h>
 #include <nanovdb/util/cuda/DeviceGridTraits.cuh>
 #include <nanovdb/util/cuda/Timer.h>
+#include <vector>
 #include <nanovdb/util/cuda/Util.h> // for operatorKernel
 
 #include <cub/cub.cuh>
@@ -87,6 +88,17 @@ public:
     /// @param level Verbose level: 0=quiet, 1=timing, 2=benchmarking
     void setVerbose(int level = 1) { mVerbose = level; }
 
+    /// @brief Record how many SV rounds each leaf needed to converge, for the histogram below.
+    ///        Off by default: it costs one atomic per leaf and an extra device allocation.
+    void setConvergenceDiagnostics(bool on = true) { mConvergenceDiagnostics = on; }
+
+    /// @brief Rounds-to-convergence histogram over every leaf, valid after
+    ///        getVoxelLabelsAndCount() when setConvergenceDiagnostics() was on. Bin r counts the
+    ///        leaves whose per-leaf SV loop settled after r rounds; the last bin
+    ///        (LeafComponentCountFunctor::MaxConvergenceIters) counts leaves that ran out of
+    ///        rounds without settling, which would mean their labels are wrong.
+    std::vector<uint32_t> convergenceHistogram() const;
+
     /// @brief Run the connected-components pipeline and return { d_labels, componentCount }:
     ///          - d_labels: a device array of activeVoxelCount+1 uint32_t, indexed by leaf.getValue(n)
     ///            (slot 0 = background, sentinel 0xFFFFFFFF). Each active voxel holds its component's
@@ -132,6 +144,8 @@ private:
     cudaStream_t                 mStream{0};
     util::cuda::Timer            mTimer;
     int                          mVerbose{0};
+    bool                         mConvergenceDiagnostics{false};
+    nanovdb::cuda::DeviceBuffer  mConvergenceHistogram;   // MaxConvergenceIters+1 × uint32
     const GridT                 *mDeviceSrcGrid;
     nanovdb::cuda::TempDevicePool mTempDevicePool;
 
@@ -240,7 +254,11 @@ struct LeafComponentCountFunctor
     // rather than limiting any legitimate input.
     static constexpr int MaxConvergenceIters = 64;
 
-    __device__ void operator()(const NanoGrid<BuildT>* d_grid, uint16_t* d_counts)
+    /// @param d_convergenceHistogram optional, MaxConvergenceIters+1 counters; bin r is incremented
+    ///        by every leaf whose SV loop settled after r rounds. Bin MaxConvergenceIters means the
+    ///        leaf ran out of rounds, i.e. its labels may not have converged. Pass nullptr to skip.
+    __device__ void operator()(const NanoGrid<BuildT>* d_grid, uint16_t* d_counts,
+                               uint32_t* d_convergenceHistogram)
     {
         __shared__ int bufA[LEAF_SIZE];
         __shared__ int bufB[LEAF_SIZE];
@@ -265,15 +283,17 @@ struct LeafComponentCountFunctor
         ccCompress(cur, nxt, tID, nullptr);
 
         // Then alternate (hook, compress) until a full iteration changes nothing.
+        int rounds = MaxConvergenceIters;                  // stays at the cap if we never settle
         for (int it = 0; it < MaxConvergenceIters; ++it) {
             if (tID == 0) changed = 0;
             __syncthreads();
             ccHook    (cur, nxt, tID, &changed);
             ccCompress(cur, nxt, tID, &changed);
             __syncthreads();
-            if (changed == 0) break;
+            if (changed == 0) { rounds = it + 1; break; }
             __syncthreads();  // all threads have read `changed`; safe for thread 0 to reset it next iteration
         }
+        if (d_convergenceHistogram && tID == 0) atomicAdd(&d_convergenceHistogram[rounds], 1u);
 
         // Component count = number of surviving roots (cur[tID] == tID; inactive entries are -1).
         if (tID == 0) compCount = 0;
@@ -609,6 +629,19 @@ struct VoxelLabelScatterFunctor
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 template <typename BuildT>
+std::vector<uint32_t> ConnectedComponents<BuildT>::convergenceHistogram() const
+{
+    constexpr int N = cc_detail::LeafComponentCountFunctor<BuildT>::MaxConvergenceIters + 1;
+    std::vector<uint32_t> h(N, 0u);
+    if (mConvergenceHistogram.size())
+        cudaCheck(cudaMemcpy(h.data(), mConvergenceHistogram.deviceData(),
+                             N * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    return h;
+}// ConnectedComponents<BuildT>::convergenceHistogram
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+template <typename BuildT>
 void ConnectedComponents<BuildT>::processLeafConnectedComponents()
 {
     const uint32_t leafCount =
@@ -626,9 +659,17 @@ void ConnectedComponents<BuildT>::processLeafConnectedComponents()
     // One block per leaf, one thread per voxel offset; counts the distinct 6-connected
     // components of each leaf's active voxels (in isolation) into mLeafComponentCounts.
     using Op = cc_detail::LeafComponentCountFunctor<BuildT>;
+    uint32_t* d_hist = nullptr;
+    if (mConvergenceDiagnostics) {
+        mConvergenceHistogram = nanovdb::cuda::DeviceBuffer::create(
+            (Op::MaxConvergenceIters + 1) * sizeof(uint32_t), nullptr, false);
+        d_hist = static_cast<uint32_t*>(mConvergenceHistogram.deviceData());
+        cudaCheck(cudaMemsetAsync(d_hist, 0, (Op::MaxConvergenceIters + 1) * sizeof(uint32_t), mStream));
+    }
     if (mVerbose==1) mTimer.start("Per-leaf connected-component counting");
     util::cuda::operatorKernel<Op>
-        <<<leafCount, Op::MaxThreadsPerBlock, 0, mStream>>>(mDeviceSrcGrid, deviceLeafComponentCounts());
+        <<<leafCount, Op::MaxThreadsPerBlock, 0, mStream>>>(mDeviceSrcGrid, deviceLeafComponentCounts(),
+                                                            d_hist);
     cudaCheckError();
     if (mVerbose==1) mTimer.stop();
 

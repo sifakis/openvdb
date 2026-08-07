@@ -1516,24 +1516,39 @@ constexpr int SV_CAP = nanovdb::tools::cuda::cc_detail::LeafComponentCountFuncto
 
 struct SvResult {
     uint64_t              leaves = 0, components = 0;
+    uint64_t              shortcuts = 0;   ///< total compress steps, the cost the schedules differ in
     int                   maxRounds = 0;
+    float                 ms = 0.f;        ///< wall time of the whole labeling pass
     bool                  hitCap = false;
     std::vector<uint32_t> histogram;
 };
 
 /// @brief Label a grid with the convergence diagnostic on, and read back the per-leaf round counts.
-SvResult svMeasureGrid(const nanovdb::NanoGrid<nanovdb::ValueOnIndex>* d_grid)
+///        @a schedule picks algorithm P (one compress per round) or S (compress until flat).
+SvResult svMeasureGrid(const nanovdb::NanoGrid<nanovdb::ValueOnIndex>* d_grid,
+                       nanovdb::tools::cuda::LeafSchedule schedule
+                           = nanovdb::tools::cuda::LeafSchedule::Parent)
 {
     using BuildT = nanovdb::ValueOnIndex;
     SvResult r;
     nanovdb::tools::cuda::ConnectedComponents<BuildT> cc(d_grid);
     cc.setConvergenceDiagnostics();
+    cc.setLeafSchedule(schedule);
+
+    cudaEvent_t t0, t1;
+    cudaCheck(cudaEventCreate(&t0)); cudaCheck(cudaEventCreate(&t1));
+    cudaCheck(cudaEventRecord(t0));
     r.components = cc.getVoxelLabelsAndCount().second;
-    cudaCheck(cudaDeviceSynchronize());
+    cudaCheck(cudaEventRecord(t1));
+    cudaCheck(cudaEventSynchronize(t1));
+    cudaCheck(cudaEventElapsedTime(&r.ms, t0, t1));
+    cudaCheck(cudaEventDestroy(t0)); cudaCheck(cudaEventDestroy(t1));
+
     r.histogram = cc.convergenceHistogram();
     for (int i = 0; i <= SV_CAP; ++i)
         if (r.histogram[i]) { r.leaves += r.histogram[i]; r.maxRounds = i; }
-    r.hitCap = r.histogram[SV_CAP] != 0;
+    r.shortcuts = r.histogram[SV_CAP + 1];
+    r.hitCap    = r.histogram[SV_CAP] != 0;
     return r;
 }
 
@@ -1629,6 +1644,93 @@ std::vector<SvCoord> svSolid()
     return v;
 }
 
+/// @brief A path whose LABELS zigzag as hard as the leaf allows.
+///
+///        A voxel's label is its offset, 64x + 8y + z, so a step along z moves the label by 1 while a
+///        step along y moves it by 8. Alternating +z and -y therefore walks the label up by one and
+///        back down by eight, making almost every voxel on the path a local minimum -- which is the
+///        term the serpentine deliberately does not stress (it has exactly one). Shape and labels are
+///        not independent here, and this is the arrangement that pushes the second term.
+std::vector<SvCoord> svZigzag()
+{
+    std::vector<SvCoord> v;
+    int y = SV_DIM - 1, z = 0;
+    for (int x = 0; x < SV_DIM; x += 2) {          // independent zigzag ribbons, two apart in x
+        y = SV_DIM - 1; z = 0;
+        v.emplace_back(x, y, z);
+        while (y > 0 && z < SV_DIM - 1) {
+            v.emplace_back(x, y, ++z);             // +1 to the label
+            v.emplace_back(x, --y, z);             // -8 to the label
+        }
+    }
+    return v;
+}
+
+/// @brief A uniformly random self-avoiding walk, i.e. a random induced-ish path. Unlike a random
+///        fill this keeps the component connected and long, so it samples the interaction between a
+///        long structure and an irregular label sequence rather than one or the other.
+std::vector<SvCoord> svRandomWalk(std::mt19937& rng, int maxSteps)
+{
+    std::uniform_int_distribution<int> pick(0, 5);
+    std::uniform_int_distribution<int> start(0, SV_DIM - 1);
+    static const int D[6][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
+
+    bool occupied[SV_DIM][SV_DIM][SV_DIM] = {};
+    int  x = start(rng), y = start(rng), z = start(rng);
+    std::vector<SvCoord> v;
+    occupied[x][y][z] = true; v.emplace_back(x, y, z);
+    for (int step = 0; step < maxSteps; ++step) {
+        int order[6] = {0,1,2,3,4,5};
+        std::shuffle(order, order + 6, rng);
+        bool moved = false;
+        for (int k = 0; k < 6 && !moved; ++k) {
+            const int nx = x + D[order[k]][0], ny = y + D[order[k]][1], nz = z + D[order[k]][2];
+            if (nx < 0 || nx >= SV_DIM || ny < 0 || ny >= SV_DIM || nz < 0 || nz >= SV_DIM) continue;
+            if (occupied[nx][ny][nz]) continue;
+            x = nx; y = ny; z = nz; occupied[x][y][z] = true; v.emplace_back(x, y, z); moved = true;
+        }
+        if (!moved) break;                          // walked into a dead end
+    }
+    return v;
+}
+
+/// @brief Map @a c through one of the cube's 48 symmetries: @a perm picks the axis permutation
+///        (0..5) and the low three bits of @a flip mirror each axis.
+///
+///        The point of doing this is that a symmetry leaves the SHAPE alone -- same adjacency, same
+///        diameter, same component count -- but rewrites every label, since the label is 64x + 8y + z
+///        and the axes carry different weights. Two arrangements that are congruent as graphs can
+///        therefore converge in different numbers of rounds, so measuring one orientation of a
+///        pattern says nothing about the other 47.
+SvCoord svTransform(const SvCoord& c, int perm, int flip)
+{
+    static const int P[6][3] = {{0,1,2},{0,2,1},{1,0,2},{1,2,0},{2,0,1},{2,1,0}};
+    const int in[3] = {c[0], c[1], c[2]};
+    int out[3];
+    for (int a = 0; a < 3; ++a) {
+        const int val = in[P[perm][a]];
+        out[a] = (flip & (1 << a)) ? (SV_DIM - 1 - val) : val;
+    }
+    return SvCoord(out[0], out[1], out[2]);
+}
+
+/// @brief Worst round count for @a coords over all 48 symmetries of the cube, and how far the count
+///        spread across them.
+std::pair<int, int> svWorstOverSymmetries(const std::vector<SvCoord>& coords)
+{
+    int worst = 0, best = SV_CAP + 1;
+    for (int perm = 0; perm < 6; ++perm)
+        for (int flip = 0; flip < 8; ++flip) {
+            std::vector<SvCoord> t;
+            t.reserve(coords.size());
+            for (const SvCoord& c : coords) t.push_back(svTransform(c, perm, flip));
+            const int rounds = svMeasureVoxels(t).maxRounds;
+            worst = std::max(worst, rounds);
+            best  = std::min(best,  rounds);
+        }
+    return {worst, best};
+}
+
 /// @brief Each voxel of the leaf kept independently with probability @a density.
 std::vector<SvCoord> svRandomFill(std::mt19937& rng, double density)
 {
@@ -1663,9 +1765,14 @@ int runSvConvergence(int trials,
         if (rounds > worst) { worst = rounds; worstName = name; }
     };
 
-    std::cout << "Hand-built single-leaf patterns\n";
+    // A pattern's shape is only half the story: the label of a voxel is its offset 64x + 8y + z, so
+    // mirroring or permuting the axes leaves the graph untouched while rewriting every label, and the
+    // hooking rule follows labels. Each pattern is therefore run through all 48 symmetries of the
+    // cube; the spread between the best and worst orientation is how much the labels alone matter.
+    std::cout << "Hand-built single-leaf patterns, over all 48 cube symmetries\n";
     const std::pair<const char*, std::vector<SvCoord> (*)()> patterns[] = {
         {"serpentine (induced path)", svSerpentine},
+        {"zigzag (label sawtooth)",   svZigzag},
         {"checkerboard (isolated)",   svCheckerboard},
         {"comb (spine + teeth)",      svComb},
         {"nested shells",             svShells},
@@ -1673,14 +1780,15 @@ int runSvConvergence(int trials,
     };
     for (const auto& p : patterns) {
         const std::vector<SvCoord> coords = p.second();
-        const SvResult             r      = svMeasureVoxels(coords);
+        const SvResult             base   = svMeasureVoxels(coords);
+        const auto [worstSym, bestSym]     = svWorstOverSymmetries(coords);
         std::cout << "  " << std::left << std::setw(28) << p.first << std::right
                   << std::setw(5) << coords.size() << " voxels"
-                  << std::setw(4) << r.leaves << " leaves"
-                  << std::setw(5) << r.components << " components"
-                  << "    max rounds = " << std::setw(2) << r.maxRounds
-                  << (r.hitCap ? "   *** CAP REACHED ***" : "") << "\n";
-        note(r.maxRounds, p.first);
+                  << std::setw(5) << base.components << " comps"
+                  << "    rounds: as-built " << std::setw(2) << base.maxRounds
+                  << ", over symmetries " << bestSym << "-" << std::setw(2) << worstSym
+                  << (worstSym >= SV_CAP ? "   *** CAP REACHED ***" : "") << "\n";
+        note(worstSym, std::string(p.first) + " (worst symmetry)");
     }
 
     std::cout << "\nRandom single-leaf fills, " << trials << " trials per density\n";
@@ -1703,41 +1811,99 @@ int runSvConvergence(int trials,
         note(localWorst, "random fill at density " + std::to_string(density));
     }
 
+    {
+        std::cout << "\nRandom self-avoiding walks, " << trials << " trials\n";
+        int      localWorst = 0, longest = 0;
+        double   roundSum   = 0.0;
+        uint64_t leaves     = 0;
+        for (int t = 0; t < trials; ++t) {
+            const std::vector<SvCoord> coords = svRandomWalk(rng, SV_DIM * SV_DIM * SV_DIM);
+            if (coords.empty()) continue;
+            const SvResult r = svMeasureVoxels(coords);
+            localWorst = std::max(localWorst, r.maxRounds);
+            longest    = std::max(longest, int(coords.size()));
+            for (int i = 0; i <= SV_CAP; ++i) { roundSum += double(i) * r.histogram[i]; leaves += r.histogram[i]; }
+        }
+        std::cout << "  max = " << localWorst << "    mean = " << std::fixed << std::setprecision(2)
+                  << (leaves ? roundSum / double(leaves) : 0.0)
+                  << "    longest walk = " << longest << " voxels\n";
+        note(localWorst, "random self-avoiding walk");
+    }
+
     if (!points.empty()) {
+        // A voxel's label is its offset 64x + 8y + z, so where the geometry lands on the voxel
+        // lattice decides which voxel gets which label -- and the hooking rule follows labels, not
+        // shape. Re-running the same mesh under axis permutations, mirrors, off-axis rotations and a
+        // sub-voxel shift therefore probes the label arrangement while leaving the surface itself
+        // alone. Two runs here are the same geometry; only the labelling differs.
+        struct Xform { const char* name; float m[9]; float t; };
+        const Xform xforms[] = {
+            {"identity",       { 1, 0, 0,  0, 1, 0,  0, 0, 1}, 0.0f},
+            {"mirror x,y,z",   {-1, 0, 0,  0,-1, 0,  0, 0,-1}, 0.0f},
+            {"rot 45 about z", { 0.70710678f,-0.70710678f, 0,  0.70710678f, 0.70710678f, 0,  0, 0, 1}, 0.0f},
+        };
+
         std::cout << "\nReal narrow band (" << points.size() << " verts, " << triangles.size()
-                  << " tris, voxelSize " << voxelSize << ")\n";
+                  << " tris, voxelSize " << voxelSize << "), under " << std::size(xforms)
+                  << " placements on the voxel lattice\n";
+
         nanovdb::Map map;
         map.set(double(voxelSize), nanovdb::Vec3d(0.0), 1.0);
-
-        thrust::universal_vector<nanovdb::Vec3f> dPoints(points.begin(), points.end());
         thrust::universal_vector<nanovdb::Vec3i> dTriangles(triangles.begin(), triangles.end());
-        nanovdb::tools::cuda::MeshToGrid<BuildT> converter(
-            dPoints.data().get(), uint32_t(dPoints.size()),
-            dTriangles.data().get(), uint32_t(dTriangles.size()), map);
-        converter.setNarrowBandWidth(bandWidth);
-        auto [bandHandle, udf] = converter.getHandleAndUDF();
-        const auto* d_band = bandHandle.template deviceGrid<BuildT>();
 
-        // (1) the un-pruned band, which is what the surface partition labels
-        const SvResult band = svMeasureGrid(d_band);
-        std::cout << "  " << std::left << std::setw(28) << "band (un-pruned)" << std::right
-                  << std::setw(10) << band.leaves << " leaves"
-                  << std::setw(8) << band.components << " components"
-                  << "    max rounds = " << std::setw(2) << band.maxRounds
-                  << (band.hitCap ? "   *** CAP REACHED ***" : "") << "\n";
-        note(band.maxRounds, "band (un-pruned)");
+        int   meshWorst = 0;
+        float sumP = 0.f, sumS = 0.f;
+        for (const Xform& xf : xforms) {
+            std::vector<nanovdb::Vec3f> moved(points.size());
+            const float shift = xf.t * voxelSize;
+            for (std::size_t i = 0; i < points.size(); ++i) {
+                const nanovdb::Vec3f& p = points[i];
+                moved[i] = nanovdb::Vec3f(xf.m[0]*p[0] + xf.m[1]*p[1] + xf.m[2]*p[2] + shift,
+                                          xf.m[3]*p[0] + xf.m[4]*p[1] + xf.m[5]*p[2] + shift,
+                                          xf.m[6]*p[0] + xf.m[7]*p[1] + xf.m[8]*p[2] + shift);
+            }
+            thrust::universal_vector<nanovdb::Vec3f> dPoints(moved.begin(), moved.end());
+            nanovdb::tools::cuda::MeshToGrid<BuildT> converter(
+                dPoints.data().get(), uint32_t(dPoints.size()),
+                dTriangles.data().get(), uint32_t(dTriangles.size()), map);
+            converter.setNarrowBandWidth(bandWidth);
+            auto [bandHandle, udf] = converter.getHandleAndUDF();
+            const auto* d_band = bandHandle.template deviceGrid<BuildT>();
 
-        // (2) the same band with the barrier shell removed, which is what each surface labels
-        nanovdb::tools::cuda::sdf_detail::SurfaceSigner<BuildT> signer;
-        auto derivedHandle = signer.computeDerivedTopology(
-            d_band, static_cast<const float*>(udf.deviceData()), voxelSize);
-        const SvResult derived = svMeasureGrid(derivedHandle.deviceGrid<BuildT>());
-        std::cout << "  " << std::left << std::setw(28) << "band (barrier pruned)" << std::right
-                  << std::setw(10) << derived.leaves << " leaves"
-                  << std::setw(8) << derived.components << " components"
-                  << "    max rounds = " << std::setw(2) << derived.maxRounds
-                  << (derived.hitCap ? "   *** CAP REACHED ***" : "") << "\n";
-        note(derived.maxRounds, "band (barrier pruned)");
+            using LS = nanovdb::tools::cuda::LeafSchedule;
+            nanovdb::tools::cuda::sdf_detail::SurfaceSigner<BuildT> signer;
+            auto derivedHandle = signer.computeDerivedTopology(
+                d_band, static_cast<const float*>(udf.deviceData()), voxelSize);
+            const auto* d_derived = derivedHandle.deviceGrid<BuildT>();
+
+            svMeasureGrid(d_band, LS::Parent);                                  // warm the caches
+            const SvResult bandP = svMeasureGrid(d_band,    LS::Parent);
+            const SvResult bandS = svMeasureGrid(d_band,    LS::Flatten);
+            const SvResult derP  = svMeasureGrid(d_derived, LS::Parent);
+            const SvResult derS  = svMeasureGrid(d_derived, LS::Flatten);
+            if (bandP.components != bandS.components || derP.components != derS.components)
+                std::cout << "  !! P and S disagree on the component count\n";
+
+            const int worstHere = std::max({bandP.maxRounds, bandS.maxRounds,
+                                            derP.maxRounds,  derS.maxRounds});
+            meshWorst = std::max(meshWorst, worstHere);
+            const float msP = bandP.ms + derP.ms, msS = bandS.ms + derS.ms;
+            sumP += msP; sumS += msS;
+            std::cout << "  " << std::left << std::setw(18) << xf.name << std::right
+                      << std::setw(9) << bandP.leaves << " leaves"
+                      << "   P: rounds " << std::setw(2) << std::max(bandP.maxRounds, derP.maxRounds)
+                      << " shortcuts " << std::setw(9) << (bandP.shortcuts + derP.shortcuts)
+                      << " " << std::fixed << std::setprecision(2) << std::setw(7) << msP << " ms"
+                      << "   |  S: rounds " << std::setw(2) << std::max(bandS.maxRounds, derS.maxRounds)
+                      << " shortcuts " << std::setw(9) << (bandS.shortcuts + derS.shortcuts)
+                      << " " << std::setw(7) << msS << " ms"
+                      << "   S/P " << std::setprecision(2) << (msP > 0 ? msS / msP : 0.f) << "\n";
+            note(worstHere, std::string("mesh, ") + xf.name);
+        }
+        std::cout << "  worst over placements = " << meshWorst
+                  << "    total  P " << std::fixed << std::setprecision(2) << sumP << " ms"
+                  << "   S " << sumS << " ms"
+                  << "   S/P " << (sumP > 0 ? sumS / sumP : 0.f) << "\n";
     }
 
     std::cout << "\nWorst observed: " << worst << " rounds, from " << worstName

@@ -69,6 +69,19 @@ enum LeafNeighborTap : int {
 ///        face, stored canonically with a < b. uint32_t: K <= 256*leafCount stays well below 2^32.
 struct CrossLeafEdge { uint32_t a, b; };
 
+/// @brief Which schedule the per-leaf union-find follows. Both are from Liu & Tarjan, "Simple
+///        Concurrent Connected Components Algorithms" (ACM TOPC 9(2), 2022), which casts this family
+///        of algorithms as a connect step followed by one or more shortcut steps, repeated until no
+///        parent changes.
+enum class LeafSchedule {
+    Parent,    ///< their algorithm P: one hook, one compress per round. Cheapest per round, but no
+               ///< step bound is known -- section 4.2 states they cannot prove even O(lg^2 n), and an
+               ///< earlier published analysis of it was withdrawn as incorrect.
+    Flatten    ///< their algorithm S: one hook, then compress until the forest is flat. More work per
+               ///< round and no warm-up needed, but a proven O(min{d, lg n} lg n) step bound
+               ///< (theorem 4.1), which is a constant for a fixed 8^3 leaf.
+};
+
 template <typename BuildT>
 class ConnectedComponents
 {
@@ -91,6 +104,16 @@ public:
     /// @brief Record how many SV rounds each leaf needed to converge, for the histogram below.
     ///        Off by default: it costs one atomic per leaf and an extra device allocation.
     void setConvergenceDiagnostics(bool on = true) { mConvergenceDiagnostics = on; }
+
+    /// @brief Pick the per-leaf schedule. Both are from Liu & Tarjan, "Simple Concurrent Connected
+    ///        Components Algorithms" (ACM TOPC 9(2), 2022):
+    ///        - LeafSchedule::Parent  their algorithm P, one hook and one compress per round. Cheaper
+    ///          per round, but no step bound is known -- section 4.2 states they cannot prove even
+    ///          O(lg^2 n), and an earlier published analysis of it was withdrawn as incorrect.
+    ///        - LeafSchedule::Flatten their algorithm S, one hook then compress until the forest is
+    ///          flat. More work per round, needs no warm-up, and has a proven O(min{d, lg n} lg n)
+    ///          bound (theorem 4.1) -- a constant for a fixed 8^3 leaf.
+    void setLeafSchedule(LeafSchedule s) { mLeafSchedule = s; }
 
     /// @brief Rounds-to-convergence histogram over every leaf, valid after
     ///        getVoxelLabelsAndCount() when setConvergenceDiagnostics() was on. Bin r counts the
@@ -145,6 +168,7 @@ private:
     util::cuda::Timer            mTimer;
     int                          mVerbose{0};
     bool                         mConvergenceDiagnostics{false};
+    LeafSchedule                 mLeafSchedule{LeafSchedule::Parent};
     nanovdb::cuda::DeviceBuffer  mConvergenceHistogram;   // MaxConvergenceIters+1 × uint32
     const GridT                 *mDeviceSrcGrid;
     nanovdb::cuda::TempDevicePool mTempDevicePool;
@@ -243,6 +267,53 @@ __device__ inline void ccCompress(int*& cur, int*& nxt, int n, int* changed)
     int* t = cur; cur = nxt; nxt = t;             // swap
 }
 
+// Run one leaf's union-find to convergence under @a schedule.
+//
+// @param rounds     receives the outer iteration the leaf settled on, or MaxIters if it ran out.
+// @param shortcuts  receives how many compress steps were executed, the cost the two schedules
+//                   actually differ in.
+template <int MaxIters>
+__device__ inline void ccSolveLeaf(int*& cur, int*& nxt, int n, LeafSchedule schedule,
+                                   int* changed, int* moved, int& rounds, int& shortcuts)
+{
+    shortcuts = 0;
+    if (schedule == LeafSchedule::Parent) {
+        // Warm-up: one hook plus log2(8) compresses, cheap enough to always be worth it.
+        ccHook    (cur, nxt, n, nullptr);
+        ccCompress(cur, nxt, n, nullptr);
+        ccCompress(cur, nxt, n, nullptr);
+        ccCompress(cur, nxt, n, nullptr);
+        shortcuts = 3;
+    }
+
+    rounds = MaxIters;
+    for (int it = 0; it < MaxIters; ++it) {
+        if (n == 0) *changed = 0;
+        __syncthreads();
+        ccHook(cur, nxt, n, changed);
+
+        if (schedule == LeafSchedule::Parent) {
+            ccCompress(cur, nxt, n, changed);
+            ++shortcuts;
+        } else {
+            for (int j = 0; j < MaxIters; ++j) {          // compress until the forest is flat
+                if (n == 0) *moved = 0;
+                __syncthreads();
+                ccCompress(cur, nxt, n, moved);
+                ++shortcuts;
+                __syncthreads();
+                if (*moved == 0) break;
+                if (n == 0) *changed = 1;
+                __syncthreads();
+            }
+        }
+
+        __syncthreads();
+        if (*changed == 0) { rounds = it + 1; break; }
+        __syncthreads();   // all threads have read *changed before thread 0 resets it
+    }
+}
+
 template <typename BuildT>
 struct LeafComponentCountFunctor
 {
@@ -257,12 +328,15 @@ struct LeafComponentCountFunctor
     /// @param d_convergenceHistogram optional, MaxConvergenceIters+1 counters; bin r is incremented
     ///        by every leaf whose SV loop settled after r rounds. Bin MaxConvergenceIters means the
     ///        leaf ran out of rounds, i.e. its labels may not have converged. Pass nullptr to skip.
+    LeafSchedule mSchedule = LeafSchedule::Parent;
+
     __device__ void operator()(const NanoGrid<BuildT>* d_grid, uint16_t* d_counts,
                                uint32_t* d_convergenceHistogram)
     {
         __shared__ int bufA[LEAF_SIZE];
         __shared__ int bufB[LEAF_SIZE];
         __shared__ int changed;
+        __shared__ int moved;
         __shared__ int compCount;
 
         const int   leafID = blockIdx.x;
@@ -276,24 +350,12 @@ struct LeafComponentCountFunctor
         cur[tID] = leaf.isActive(uint32_t(tID)) ? tID : CC_INACTIVE;
         __syncthreads();
 
-        // Unconditional warm-up: 1 hook + log2(DIM)=3 compresses.
-        ccHook    (cur, nxt, tID, nullptr);
-        ccCompress(cur, nxt, tID, nullptr);
-        ccCompress(cur, nxt, tID, nullptr);
-        ccCompress(cur, nxt, tID, nullptr);
-
-        // Then alternate (hook, compress) until a full iteration changes nothing.
-        int rounds = MaxConvergenceIters;                  // stays at the cap if we never settle
-        for (int it = 0; it < MaxConvergenceIters; ++it) {
-            if (tID == 0) changed = 0;
-            __syncthreads();
-            ccHook    (cur, nxt, tID, &changed);
-            ccCompress(cur, nxt, tID, &changed);
-            __syncthreads();
-            if (changed == 0) { rounds = it + 1; break; }
-            __syncthreads();  // all threads have read `changed`; safe for thread 0 to reset it next iteration
+        int rounds = 0, shortcuts = 0;
+        ccSolveLeaf<MaxConvergenceIters>(cur, nxt, tID, mSchedule, &changed, &moved, rounds, shortcuts);
+        if (d_convergenceHistogram && tID == 0) {
+            atomicAdd(&d_convergenceHistogram[rounds], 1u);
+            atomicAdd(&d_convergenceHistogram[MaxConvergenceIters + 1], uint32_t(shortcuts));
         }
-        if (d_convergenceHistogram && tID == 0) atomicAdd(&d_convergenceHistogram[rounds], 1u);
 
         // Component count = number of surviving roots (cur[tID] == tID; inactive entries are -1).
         if (tID == 0) compCount = 0;
@@ -311,6 +373,8 @@ struct LeafComponentMaskFunctor
     static constexpr int MinBlocksPerMultiprocessor = 1;
     static constexpr int MaxConvergenceIters        = 64;
 
+    LeafSchedule mSchedule = LeafSchedule::Parent;
+
     __device__ void operator()(const NanoGrid<BuildT>* d_grid,
                                 const uint64_t*         d_offsets,
                                 nanovdb::Mask<3>*       d_masks,
@@ -320,6 +384,7 @@ struct LeafComponentMaskFunctor
         __shared__ int   bufB[LEAF_SIZE];
         __shared__ typename cub::BlockReduce<uint32_t, LEAF_SIZE>::TempStorage reduceTmp;
         __shared__ int      changed;
+        __shared__ int      moved;
         __shared__ uint32_t sMinLabel;
         // Ballot words (u32/warp) aliased to the Mask<3> u64 words. NAMED union: an anonymous
         // __shared__ union compiled to per-thread local storage, breaking cross-warp sharing.
@@ -334,24 +399,13 @@ struct LeafComponentMaskFunctor
         int* cur = bufA;
         int* nxt = bufB;
 
-        // Init + SV convergence: identical schedule to LeafComponentCountFunctor.
+        // Init + convergence: identical schedule to LeafComponentCountFunctor, so both passes agree
+        // on every leaf's labels.
         cur[tID] = leaf.isActive(uint32_t(tID)) ? tID : CC_INACTIVE;
         __syncthreads();
 
-        ccHook    (cur, nxt, tID, nullptr);
-        ccCompress(cur, nxt, tID, nullptr);
-        ccCompress(cur, nxt, tID, nullptr);
-        ccCompress(cur, nxt, tID, nullptr);
-
-        for (int it = 0; it < MaxConvergenceIters; ++it) {
-            if (tID == 0) changed = 0;
-            __syncthreads();
-            ccHook    (cur, nxt, tID, &changed);
-            ccCompress(cur, nxt, tID, &changed);
-            __syncthreads();
-            if (changed == 0) break;
-            __syncthreads();
-        }
+        int rounds = 0, shortcuts = 0;
+        ccSolveLeaf<MaxConvergenceIters>(cur, nxt, tID, mSchedule, &changed, &moved, rounds, shortcuts);
 
         // Mask-fill: iterate over leaf-local components in ascending root-label order.
         //
@@ -631,7 +685,8 @@ struct VoxelLabelScatterFunctor
 template <typename BuildT>
 std::vector<uint32_t> ConnectedComponents<BuildT>::convergenceHistogram() const
 {
-    constexpr int N = cc_detail::LeafComponentCountFunctor<BuildT>::MaxConvergenceIters + 1;
+    // One bin per round, plus a final slot holding the total number of compress steps executed.
+    constexpr int N = cc_detail::LeafComponentCountFunctor<BuildT>::MaxConvergenceIters + 2;
     std::vector<uint32_t> h(N, 0u);
     if (mConvergenceHistogram.size())
         cudaCheck(cudaMemcpy(h.data(), mConvergenceHistogram.deviceData(),
@@ -662,14 +717,15 @@ void ConnectedComponents<BuildT>::processLeafConnectedComponents()
     uint32_t* d_hist = nullptr;
     if (mConvergenceDiagnostics) {
         mConvergenceHistogram = nanovdb::cuda::DeviceBuffer::create(
-            (Op::MaxConvergenceIters + 1) * sizeof(uint32_t), nullptr, false);
+            (Op::MaxConvergenceIters + 2) * sizeof(uint32_t), nullptr, false);
         d_hist = static_cast<uint32_t*>(mConvergenceHistogram.deviceData());
-        cudaCheck(cudaMemsetAsync(d_hist, 0, (Op::MaxConvergenceIters + 1) * sizeof(uint32_t), mStream));
+        cudaCheck(cudaMemsetAsync(d_hist, 0, (Op::MaxConvergenceIters + 2) * sizeof(uint32_t), mStream));
     }
     if (mVerbose==1) mTimer.start("Per-leaf connected-component counting");
-    util::cuda::operatorKernel<Op>
-        <<<leafCount, Op::MaxThreadsPerBlock, 0, mStream>>>(mDeviceSrcGrid, deviceLeafComponentCounts(),
-                                                            d_hist);
+    Op countOp; countOp.mSchedule = mLeafSchedule;
+    util::cuda::operatorKernelInstance<Op>
+        <<<leafCount, Op::MaxThreadsPerBlock, 0, mStream>>>(countOp, mDeviceSrcGrid,
+                                                            deviceLeafComponentCounts(), d_hist);
     cudaCheckError();
     if (mVerbose==1) mTimer.stop();
 
@@ -720,9 +776,10 @@ void ConnectedComponents<BuildT>::processLeafConnectedComponents()
     // Re-run SV per leaf and scatter each active voxel's bit into its component's Mask<3>.
     using MaskOp = cc_detail::LeafComponentMaskFunctor<BuildT>;
     if (mVerbose==1) mTimer.start("Per-leaf component mask fill");
-    util::cuda::operatorKernel<MaskOp>
+    MaskOp maskOp; maskOp.mSchedule = mLeafSchedule;
+    util::cuda::operatorKernelInstance<MaskOp>
         <<<leafCount, MaskOp::MaxThreadsPerBlock, 0, mStream>>>(
-            mDeviceSrcGrid, deviceLeafComponentOffsets(),
+            maskOp, mDeviceSrcGrid, deviceLeafComponentOffsets(),
             deviceLeafComponentMasks(), deviceLeafComponentFaceMasks());
     cudaCheckError();
     if (mVerbose==1) mTimer.stop();

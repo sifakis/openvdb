@@ -3662,6 +3662,7 @@ TEST(TestNanoVDBCUDA, NonBlockingStreamDilate_ValueOnIndex)
     cudaCheck(cudaStreamCreateWithFlags(&nb, cudaStreamNonBlocking));
     const auto candidate = dilateOn(nb, /*occupyDefault=*/true);
     cudaCheck(cudaStreamSynchronize(nb));
+    cudaCheck(cudaDeviceSynchronize());// drain the default-stream busy-wait so it can't leak into later tests
     cudaCheck(cudaStreamDestroy(nb));
 
     EXPECT_EQ(reference.first, candidate.first);   // identical active-voxel count
@@ -3773,10 +3774,9 @@ TEST(TestNanoVDBCUDA, DeterministicOutput_CudaPointsToGrid)
     EXPECT_EQ(buildChecksum(), buildChecksum());
 }// DeterministicOutput_CudaPointsToGrid
 
-// Regression test: DeviceBuffer must free its device allocation on the stream it
-// was allocated on, not the default stream. Repeated allocate/use/free on a
-// non-blocking stream must complete without error (compute-sanitizer memcheck on
-// this path is the stronger gate).
+// Smoke test: repeated allocate/use/free on a non-blocking stream must complete without error.
+// Note this is only a smoke test - DeviceBufferMultiStreamFreeOrdering below is what actually
+// discriminates a premature free (compute-sanitizer memcheck on this path is a further gate).
 TEST(TestNanoVDBCUDA, DeviceBufferNonBlockingStreamLifetime)
 {
     cudaStream_t stream = nullptr;

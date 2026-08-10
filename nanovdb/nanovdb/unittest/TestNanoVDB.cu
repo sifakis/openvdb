@@ -13,6 +13,7 @@
 #include <nanovdb/tools/cuda/SignedFloodFill.cuh>
 #include <nanovdb/tools/cuda/PointsToGrid.cuh>
 #include <nanovdb/tools/cuda/IndexToGrid.cuh>
+#include <nanovdb/tools/cuda/ConnectedComponents.cuh>
 #include <nanovdb/tools/cuda/AddBlindData.cuh>
 #include <nanovdb/tools/cuda/GridChecksum.cuh>
 #include <nanovdb/tools/cuda/GridValidator.cuh>
@@ -20,7 +21,6 @@
 #include <nanovdb/tools/cuda/DilateGrid.cuh>
 #include <nanovdb/tools/cuda/MergeGrids.cuh>
 #include <nanovdb/tools/cuda/PruneGrid.cuh>
-#include <nanovdb/tools/cuda/ConnectedComponents.cuh>
 #include <nanovdb/tools/cuda/CoarsenGrid.cuh>
 #include <nanovdb/tools/cuda/RefineGrid.cuh>
 #include <nanovdb/util/cuda/Injection.cuh>
@@ -37,8 +37,6 @@
 #include <cuda_runtime_api.h>
 #include <gtest/gtest.h>
 #include <algorithm>// for std::sort
-#include <random>   // for fixed-seed random CC test masks
-#include <cmath>    // for spherical-shell CC test masks
 #include <unordered_set>
 #include <iomanip> // for std::setw, std::setfill
 #include <thread> // for std::thread
@@ -3982,11 +3980,6 @@ TEST(TestNanoVDBCUDA, MeshToGrid_UnitTetrahedron)
     EXPECT_EQ(grid->mChecksum.full(), topoChecksum);
 }// MeshToGrid_UnitTetrahedron
 
-// Synthetic, fully-procedural validation of the *global* connected-components pipeline
-// (steps 1-6: per-leaf CC -> masks/faces -> cross-leaf edges -> global union-find). Builds a dense
-// box of active voxels with a thin shell carved out at each sphere surface, so the active topology
-// has a known closed-form component count, independent of any mesh or rasterizer. The removed shell
-// half-width t > 1/2 voxel guarantees no interior voxel is 6-adjacent to an exterior voxel.
 TEST(TestNanoVDBCUDA, ConnectedComponentsMultiSphere)
 {
     using BuildT = nanovdb::ValueOnIndex;
@@ -4008,13 +4001,13 @@ TEST(TestNanoVDBCUDA, ConnectedComponentsMultiSphere)
         return n;
     };
 
-    // Reproduce the connected_components pipeline's CC input: the rasterized *narrow band* of a
-    // closed surface with the surface shell removed. computeDerivedTopology prunes voxels whose
-    // unsigned distance to the surface is within sqrt(3)/2 voxels (the barrier), leaving, for a
-    // solid sphere, two disjoint concentric shells (inner + outer) => 2 components. N well-separated
-    // spheres each contribute their own two shells (their narrow bands never touch) => 2N.
+    // Reproduce the connected-components pipeline's CC input: the rasterized *narrow band* of a
+    // closed surface with the surface shell removed. The example prunes voxels whose unsigned
+    // distance to the surface is within sqrt(3)/2 voxels (the barrier), leaving, for a solid sphere,
+    // two disjoint concentric shells (inner + outer) => 2 components. N well-separated spheres each
+    // contribute their own two shells (their narrow bands never touch) => 2N.
     const float band  = 3.0f;        // narrow-band half-width (voxels), matches the default bandWidth
-    const float shell = 0.8660254f;  // sqrt(3)/2: the barrier shell computeDerivedTopology removes
+    const float shell = 0.8660254f;  // sqrt(3)/2: the barrier shell the example removes
 
     auto sphereShells = [&](int N, float R, int spacing) {
         const int margin = int(band) + 2;

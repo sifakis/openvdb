@@ -1512,7 +1512,12 @@ namespace {
 
 using SvCoord = nanovdb::Coord;
 constexpr int SV_DIM = 8;                                                    // voxels per leaf edge
-constexpr int SV_CAP = nanovdb::tools::cuda::cc_detail::LeafComponentCountFunctor<nanovdb::ValueOnIndex>::MaxConvergenceIters;
+constexpr int SV_CAP = nanovdb::tools::cuda::cc_detail::LeafUnionFind::MaxConvergenceIters;
+
+// Leaf schedules compared by --sv-convergence. H is the shipped one and is listed first, so every
+// ratio below is relative to what the pipeline actually runs.
+constexpr int      NUM_ALGOS      = 5;
+static const char* algoNames[NUM_ALGOS] = {"H", "P", "S", "R", "R2"};
 
 struct SvResult {
     uint64_t              leaves = 0, components = 0;
@@ -1529,7 +1534,7 @@ struct SvResult {
 ///        @a schedule picks algorithm P (one compress per round) or S (compress until flat).
 SvResult svMeasureGrid(const nanovdb::NanoGrid<nanovdb::ValueOnIndex>* d_grid,
                        nanovdb::tools::cuda::LeafSchedule schedule
-                           = nanovdb::tools::cuda::LeafSchedule::Parent)
+                           = nanovdb::tools::cuda::LeafSchedule::Hybrid)
 {
     using BuildT = nanovdb::ValueOnIndex;
     SvResult r;
@@ -1856,10 +1861,10 @@ int runSvConvergence(int trials,
         thrust::universal_vector<nanovdb::Vec3i> dTriangles(triangles.begin(), triangles.end());
 
         int      meshWorst = 0;
-        float    sumMs[4]   = {0, 0, 0, 0};
-        float    sumLeaf[4] = {0, 0, 0, 0};
-        float    sumUf[4]   = {0, 0, 0, 0};
-        uint64_t sumSc[4]   = {0, 0, 0, 0};
+        float    sumMs[NUM_ALGOS]   = {};
+        float    sumLeaf[NUM_ALGOS] = {};
+        float    sumUf[NUM_ALGOS]   = {};
+        uint64_t sumSc[NUM_ALGOS]   = {};
         for (const Xform& xf : xforms) {
             std::vector<nanovdb::Vec3f> moved(points.size());
             const float shift = xf.t * voxelSize;
@@ -1884,15 +1889,18 @@ int runSvConvergence(int trials,
             const auto* d_derived = derivedHandle.deviceGrid<BuildT>();
 
             // Each schedule is measured on both grids the pipeline labels, and the pair is summed.
+            // H is what ships: P until LeafUnionFind::SwitchToRootAfter rounds, then R. It is
+            // listed first so every ratio is relative to the shipped schedule.
             const std::pair<const char*, LS> algos[] = {
-                {"P",  LS::Parent}, {"S",  LS::Flatten}, {"R",  LS::Root}, {"R2", LS::Root2},
+                {"H", LS::Hybrid}, {"P",  LS::Parent}, {"S",  LS::Flatten},
+                {"R", LS::Root},   {"R2", LS::Root2},
             };
-            svMeasureGrid(d_band, LS::Parent);                                  // warm the caches
+            svMeasureGrid(d_band, LS::Hybrid);                                  // warm the caches
 
             uint64_t refComponents = 0;
             float    msRef = 0.f;
             std::cout << "  " << std::left << std::setw(16) << xf.name << std::right;
-            for (int a = 0; a < 4; ++a) {
+            for (int a = 0; a < NUM_ALGOS; ++a) {
                 const SvResult band = svMeasureGrid(d_band,    algos[a].second);
                 const SvResult der  = svMeasureGrid(d_derived, algos[a].second);
                 const int      rd     = std::max(band.maxRounds, der.maxRounds);
@@ -1917,10 +1925,9 @@ int runSvConvergence(int trials,
             }
             std::cout << "\n";
         }
-        static const char* names[4] = {"P", "S", "R", "R2"};
         std::cout << "  totals";
-        for (int a = 0; a < 4; ++a)
-            std::cout << "   " << names[a] << " uf " << std::fixed << std::setprecision(2)
+        for (int a = 0; a < NUM_ALGOS; ++a)
+            std::cout << "   " << algoNames[a] << " uf " << std::fixed << std::setprecision(2)
                       << sumUf[a] << " (x" << (sumUf[0] > 0 ? sumUf[a] / sumUf[0] : 0.f)
                       << ")  leaf " << sumLeaf[a] << "  all " << sumMs[a] << " ms";
         std::cout << "\n  worst rounds over placements = " << meshWorst << "\n";

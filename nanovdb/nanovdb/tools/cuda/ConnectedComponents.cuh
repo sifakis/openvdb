@@ -30,6 +30,7 @@
 #include <cub/cub.cuh>
 
 #include <utility>  // std::pair
+#include <cstdio>   // std::fprintf
 
 // Define utility macro used to call cub functions that use dynamic temporary storage
 #ifndef CALL_CUBS
@@ -86,6 +87,18 @@ public:
     /// @param level Verbose level: 0=quiet, 1=timing, 2=benchmarking
     void setVerbose(int level = 1) { mVerbose = level; }
 
+    /// @brief Number of leaves whose per-leaf union-find hit LeafUnionFind::MaxConvergenceIters
+    ///        without converging. Valid after getVoxelLabelsAndCount().
+    ///
+    ///        Must be zero. A non-zero value means those leaves are under-labeled -- components
+    ///        that should be one are reported as several -- and every downstream stage will carry
+    ///        the error silently, since nothing else can tell an over-split leaf from a genuine
+    ///        one. It has never been non-zero in testing: the worst leaf over 68 meshes at three
+    ///        voxel sizes under three lattice placements, and over adversarial synthetic leaves
+    ///        under all 48 symmetries of the cube, needed 6 rounds against a cap of 64. The check
+    ///        exists because that is evidence rather than proof.
+    uint64_t leavesOverIterationCap() const { return mLeavesOverIterationCap; }
+
     /// @brief Run the connected-components pipeline and return { d_labels, componentCount }:
     ///          - d_labels: a device array of activeVoxelCount+1 uint32_t, indexed by leaf.getValue(n)
     ///            (slot 0 = background, sentinel 0xFFFFFFFF). Each active voxel holds its component's
@@ -131,6 +144,7 @@ private:
     cudaStream_t                 mStream{0};
     util::cuda::Timer            mTimer;
     int                          mVerbose{0};
+    uint64_t                     mLeavesOverIterationCap{0};  // see leavesOverIterationCap()
     const GridT                 *mDeviceSrcGrid;
     nanovdb::cuda::TempDevicePool mTempDevicePool;
 
@@ -248,7 +262,11 @@ struct LeafUnionFind
 
     // Run the full schedule to convergence. On return cur[n] holds n's component root, and each
     // component's root is the minimum voxel offset it contains. `changed` points at a shared int.
-    __device__ static void solve(int*& cur, int*& nxt, int n, int* changed)
+    //
+    // Returns false if the loop hit MaxConvergenceIters without settling, which would leave this
+    // leaf under-labeled -- some of its components split into several. Callers must not ignore it:
+    // the labels are wrong, not merely suboptimal, and nothing downstream would notice.
+    __device__ static bool solve(int*& cur, int*& nxt, int n, int* changed)
     {
         // Unconditional warm-up: 1 hook + log2(DIM)=3 compresses, plus one more so the forest is
         // flat rather than merely shallow. Flatness is what makes the parent-root-connect phase
@@ -268,9 +286,10 @@ struct LeafUnionFind
             hook    (cur, nxt, n, changed, it >= SwitchToRootAfter);
             compress(cur, nxt, n, changed);
             __syncthreads();
-            if (*changed == 0) break;
+            if (*changed == 0) return true;
             __syncthreads();  // all threads have read *changed; safe for thread 0 to reset it next iteration
         }
+        return false;   // ran out of rounds; this leaf's labels are incomplete
     }
 }; // LeafUnionFind
 
@@ -280,7 +299,11 @@ struct LeafComponentCountFunctor
     static constexpr int MaxThreadsPerBlock         = LEAF_SIZE;
     static constexpr int MinBlocksPerMultiprocessor = 1;
 
-    __device__ void operator()(const NanoGrid<BuildT>* d_grid, uint16_t* d_counts)
+    /// @param d_capReached single counter; incremented once per leaf whose union-find ran out of
+    ///        rounds. Only this kernel reports it: the mask kernel repeats the same deterministic
+    ///        solve over the same leaves, so it fails on exactly the same ones or on none.
+    __device__ void operator()(const NanoGrid<BuildT>* d_grid, uint16_t* d_counts,
+                               uint32_t* d_capReached)
     {
         __shared__ int bufA[LEAF_SIZE];
         __shared__ int bufB[LEAF_SIZE];
@@ -298,7 +321,8 @@ struct LeafComponentCountFunctor
         cur[tID] = leaf.isActive(uint32_t(tID)) ? tID : LeafUnionFind::INACTIVE;
         __syncthreads();
 
-        LeafUnionFind::solve(cur, nxt, tID, &changed);
+        if (!LeafUnionFind::solve(cur, nxt, tID, &changed) && tID == 0)
+            atomicAdd(d_capReached, 1u);
 
         // Component count = number of surviving roots (cur[tID] == tID; inactive entries are -1).
         if (tID == 0) compCount = 0;
@@ -636,12 +660,32 @@ void ConnectedComponents<BuildT>::processLeafConnectedComponents()
 
     // One block per leaf, one thread per voxel offset; counts the distinct 6-connected
     // components of each leaf's active voxels (in isolation) into mLeafComponentCounts.
+    // A single counter of leaves that ran out of rounds. Read back below: the pipeline already
+    // synchronises to learn the component count, so one more 4-byte copy is free, and an
+    // under-labeled leaf is a wrong answer that nothing downstream could detect on its own.
+    nanovdb::cuda::DeviceBuffer capReached =
+        nanovdb::cuda::DeviceBuffer::create(sizeof(uint32_t), nullptr, false);
+    cudaCheck(cudaMemsetAsync(capReached.deviceData(), 0, sizeof(uint32_t), mStream));
+
     using Op = cc_detail::LeafComponentCountFunctor<BuildT>;
     if (mVerbose==1) mTimer.start("Per-leaf connected-component counting");
     util::cuda::operatorKernel<Op>
-        <<<leafCount, Op::MaxThreadsPerBlock, 0, mStream>>>(mDeviceSrcGrid, deviceLeafComponentCounts());
+        <<<leafCount, Op::MaxThreadsPerBlock, 0, mStream>>>(
+            mDeviceSrcGrid, deviceLeafComponentCounts(),
+            static_cast<uint32_t*>(capReached.deviceData()));
     cudaCheckError();
     if (mVerbose==1) mTimer.stop();
+
+    uint32_t overCap = 0;
+    cudaCheck(cudaMemcpyAsync(&overCap, capReached.deviceData(), sizeof(uint32_t),
+                              cudaMemcpyDeviceToHost, mStream));
+    cudaCheck(cudaStreamSynchronize(mStream));
+    mLeavesOverIterationCap = overCap;
+    if (overCap && mVerbose)
+        std::fprintf(stderr,
+                     "nanovdb::tools::cuda::ConnectedComponents: %u of %u leaves did not converge "
+                     "within %d rounds; their labels are incomplete\n",
+                     overCap, uint32_t(leafCount), cc_detail::LeafUnionFind::MaxConvergenceIters);
 
     // Prefix sum: mLeafComponentOffsets[0]=0, mLeafComponentOffsets[1..leafCount] = inclusive sum
     // of mLeafComponentCounts. mLeafComponentOffsets[leafCount] = K (total leaf-local components).

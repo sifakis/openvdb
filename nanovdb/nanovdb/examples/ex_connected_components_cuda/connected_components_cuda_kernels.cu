@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <functional>
 #include <iostream>
+#include <stdexcept>
 #include <numeric>
 #include <unordered_map>
 #include <vector>
@@ -220,6 +221,13 @@ uint64_t connectedComponentsFromMesh(const std::vector<nanovdb::Vec3f>& points,
     nanovdb::tools::cuda::ConnectedComponents<BuildT> cc(d_cc, stream);
     auto [d_labels, numComponents] = cc.getVoxelLabelsAndCount();
     cudaCheck(cudaStreamSynchronize(stream));
+
+    // A leaf that exhausted the union-find's round cap is under-labeled, and no downstream stage
+    // can tell an over-split leaf from a genuine one, so fail loudly here rather than report a
+    // component count that is quietly too high.
+    if (cc.leavesOverIterationCap() > 0)
+        throw std::runtime_error(std::to_string(cc.leavesOverIterationCap()) +
+                                 " leaves exceeded the union-find iteration cap; labels are incomplete");
 
     // Diagnostics + CPU-oracle self-check (on whichever grid was labeled).
     const GridHandleT& ccHandle = discardSurfaceVoxels ? derivedHandle : origHandle;

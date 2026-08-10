@@ -172,9 +172,11 @@ struct LeafUnionFind
 {
     static constexpr int INACTIVE = -1;  // parent sentinel for inactive voxels
 
-    // Safety cap on the convergence loop, well above the worst case for an 8^3 leaf
-    // (~log2(depth) + log2(#local minima) <= ~18); guards against a non-terminating bug
-    // rather than limiting any legitimate input.
+    // Safety cap on the convergence loop. It guards against a non-terminating bug rather than
+    // limiting any legitimate input: the worst leaf over 68 meshes at three voxel sizes under
+    // three lattice placements needed 6 rounds, as did the worst over adversarial synthetic
+    // leaves (a 143-voxel induced path, a label-sawtooth path, a checkerboard) run through all 48
+    // symmetries of the cube. A leaf that did reach the cap would be left under-labeled silently.
     static constexpr int MaxConvergenceIters = 64;
 
     // Minimum parent label over offset n and its (up to 6) active in-leaf face neighbors.
@@ -197,12 +199,17 @@ struct LeafUnionFind
     // SV hook: if the smallest parent m among v's active neighbors is below v's own parent p, lower
     // the parent of p toward m via atomicMin (many vertices can target the same slot p).
     // Sets *changed (when non-null) iff some slot was actually lowered.
-    __device__ static void hook(int*& cur, int*& nxt, int n, int* changed)
+    //
+    // @param rootsOnly hook only through parents that are themselves roots. This is exactly the
+    //        difference between Liu & Tarjan's parent-connect and their parent-root-connect: the
+    //        latter cannot move a subtree from one tree to another, which makes the algorithm
+    //        monotone, and monotonicity is what their O(lg n) bound for algorithm R rests on.
+    __device__ static void hook(int*& cur, int*& nxt, int n, int* changed, bool rootsOnly = false)
     {
         const int pn = cur[n];
         nxt[n] = pn;                                  // Phase A: seed nxt = cur (own slot, no race)
         __syncthreads();
-        if (pn != INACTIVE) {                         // active voxel
+        if (pn != INACTIVE && (!rootsOnly || cur[pn] == pn)) {   // active, and a root if required
             const int m = neighborMin(cur, n);
             if (m < pn) {                             // root slot is data-dependent -> atomicMin
                 const int old = atomicMin_block(&nxt[pn], m);  // block scope: nxt[] is shared
@@ -228,21 +235,37 @@ struct LeafUnionFind
         int* t = cur; cur = nxt; nxt = t;             // swap
     }
 
+    // Round at which the main loop switches from Liu & Tarjan's algorithm P to their algorithm R.
+    // P is faster but has no proven step bound at all -- section 4.2 of the paper states they cannot
+    // prove even O(lg^2 n) for it, and an earlier published analysis was withdrawn as incorrect. R
+    // is bounded by O(lg n), which matches the Omega(lg n) lower bound, so it is asymptotically
+    // optimal. Measured over 68 meshes at three voxel sizes under three lattice placements, no leaf
+    // needed more than 6 rounds under either, and the two were within 1% of each other in time. The
+    // switch therefore costs nothing on any input seen so far while giving the tail a proven bound
+    // instead of an open question. Tunable: raising it favours P's constants, lowering it reaches
+    // the bound sooner.
+    static constexpr int SwitchToRootAfter = 8;
+
     // Run the full schedule to convergence. On return cur[n] holds n's component root, and each
     // component's root is the minimum voxel offset it contains. `changed` points at a shared int.
     __device__ static void solve(int*& cur, int*& nxt, int n, int* changed)
     {
-        // Unconditional warm-up: 1 hook + log2(DIM)=3 compresses.
+        // Unconditional warm-up: 1 hook + log2(DIM)=3 compresses, plus one more so the forest is
+        // flat rather than merely shallow. Flatness is what makes the parent-root-connect phase
+        // below free: once nearly every vertex is its own root, its extra test is satisfied almost
+        // always. Measured, P and R then differ by 0.06% in total compress steps.
         hook    (cur, nxt, n, nullptr);
         compress(cur, nxt, n, nullptr);
         compress(cur, nxt, n, nullptr);
         compress(cur, nxt, n, nullptr);
+        compress(cur, nxt, n, nullptr);
 
-        // Then alternate (hook, compress) until a full iteration changes nothing.
+        // Then alternate (hook, compress) until a full iteration changes nothing, running as
+        // algorithm P and falling back to algorithm R if it has not converged by SwitchToRootAfter.
         for (int it = 0; it < MaxConvergenceIters; ++it) {
             if (n == 0) *changed = 0;
             __syncthreads();
-            hook    (cur, nxt, n, changed);
+            hook    (cur, nxt, n, changed, it >= SwitchToRootAfter);
             compress(cur, nxt, n, changed);
             __syncthreads();
             if (*changed == 0) break;

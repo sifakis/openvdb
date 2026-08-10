@@ -1518,7 +1518,9 @@ struct SvResult {
     uint64_t              leaves = 0, components = 0;
     uint64_t              shortcuts = 0;   ///< total compress steps, the cost the schedules differ in
     int                   maxRounds = 0;
-    float                 ms = 0.f;        ///< wall time of the whole labeling pass
+    float                 ms = 0.f;        ///< wall time of the whole labeling pipeline
+    float                 ufMs = 0.f;      ///< the leaf-local union-find kernel alone
+    float                 leafMs = 0.f;    ///< that plus the mask-fill kernel
     bool                  hitCap = false;
     std::vector<uint32_t> histogram;
 };
@@ -1544,6 +1546,8 @@ SvResult svMeasureGrid(const nanovdb::NanoGrid<nanovdb::ValueOnIndex>* d_grid,
     cudaCheck(cudaEventElapsedTime(&r.ms, t0, t1));
     cudaCheck(cudaEventDestroy(t0)); cudaCheck(cudaEventDestroy(t1));
 
+    r.ufMs      = cc.unionFindMs();
+    r.leafMs    = r.ufMs + cc.leafMaskMs();
     r.histogram = cc.convergenceHistogram();
     for (int i = 0; i <= SV_CAP; ++i)
         if (r.histogram[i]) { r.leaves += r.histogram[i]; r.maxRounds = i; }
@@ -1851,8 +1855,11 @@ int runSvConvergence(int trials,
         map.set(double(voxelSize), nanovdb::Vec3d(0.0), 1.0);
         thrust::universal_vector<nanovdb::Vec3i> dTriangles(triangles.begin(), triangles.end());
 
-        int   meshWorst = 0;
-        float sumP = 0.f, sumS = 0.f;
+        int      meshWorst = 0;
+        float    sumMs[4]   = {0, 0, 0, 0};
+        float    sumLeaf[4] = {0, 0, 0, 0};
+        float    sumUf[4]   = {0, 0, 0, 0};
+        uint64_t sumSc[4]   = {0, 0, 0, 0};
         for (const Xform& xf : xforms) {
             std::vector<nanovdb::Vec3f> moved(points.size());
             const float shift = xf.t * voxelSize;
@@ -1876,34 +1883,47 @@ int runSvConvergence(int trials,
                 d_band, static_cast<const float*>(udf.deviceData()), voxelSize);
             const auto* d_derived = derivedHandle.deviceGrid<BuildT>();
 
+            // Each schedule is measured on both grids the pipeline labels, and the pair is summed.
+            const std::pair<const char*, LS> algos[] = {
+                {"P",  LS::Parent}, {"S",  LS::Flatten}, {"R",  LS::Root}, {"R2", LS::Root2},
+            };
             svMeasureGrid(d_band, LS::Parent);                                  // warm the caches
-            const SvResult bandP = svMeasureGrid(d_band,    LS::Parent);
-            const SvResult bandS = svMeasureGrid(d_band,    LS::Flatten);
-            const SvResult derP  = svMeasureGrid(d_derived, LS::Parent);
-            const SvResult derS  = svMeasureGrid(d_derived, LS::Flatten);
-            if (bandP.components != bandS.components || derP.components != derS.components)
-                std::cout << "  !! P and S disagree on the component count\n";
 
-            const int worstHere = std::max({bandP.maxRounds, bandS.maxRounds,
-                                            derP.maxRounds,  derS.maxRounds});
-            meshWorst = std::max(meshWorst, worstHere);
-            const float msP = bandP.ms + derP.ms, msS = bandS.ms + derS.ms;
-            sumP += msP; sumS += msS;
-            std::cout << "  " << std::left << std::setw(18) << xf.name << std::right
-                      << std::setw(9) << bandP.leaves << " leaves"
-                      << "   P: rounds " << std::setw(2) << std::max(bandP.maxRounds, derP.maxRounds)
-                      << " shortcuts " << std::setw(9) << (bandP.shortcuts + derP.shortcuts)
-                      << " " << std::fixed << std::setprecision(2) << std::setw(7) << msP << " ms"
-                      << "   |  S: rounds " << std::setw(2) << std::max(bandS.maxRounds, derS.maxRounds)
-                      << " shortcuts " << std::setw(9) << (bandS.shortcuts + derS.shortcuts)
-                      << " " << std::setw(7) << msS << " ms"
-                      << "   S/P " << std::setprecision(2) << (msP > 0 ? msS / msP : 0.f) << "\n";
-            note(worstHere, std::string("mesh, ") + xf.name);
+            uint64_t refComponents = 0;
+            float    msRef = 0.f;
+            std::cout << "  " << std::left << std::setw(16) << xf.name << std::right;
+            for (int a = 0; a < 4; ++a) {
+                const SvResult band = svMeasureGrid(d_band,    algos[a].second);
+                const SvResult der  = svMeasureGrid(d_derived, algos[a].second);
+                const int      rd     = std::max(band.maxRounds, der.maxRounds);
+                const float    ms     = band.ms + der.ms;
+                const float    leafMs = band.leafMs + der.leafMs;
+                const float    ufMs   = band.ufMs   + der.ufMs;
+                if (a == 0) { refComponents = band.components; msRef = ufMs;
+                              std::cout << std::setw(9) << band.leaves << " leaves"; }
+                else if (band.components != refComponents)
+                    std::cout << "\n  !! " << algos[a].first << " disagrees on the component count\n ";
+                meshWorst = std::max(meshWorst, rd);
+                sumMs[a]   += ms;
+                sumLeaf[a] += leafMs;
+                sumUf[a]   += ufMs;
+                sumSc[a]   += band.shortcuts + der.shortcuts;
+                std::cout << "  |  " << algos[a].first << " rd " << std::setw(2) << rd
+                          << " sc " << std::setw(9) << (band.shortcuts + der.shortcuts)
+                          << " uf " << std::fixed << std::setprecision(2) << std::setw(6) << ufMs
+                          << " leaf " << std::setw(6) << leafMs << " all " << std::setw(6) << ms
+                          << " x" << std::setprecision(2) << (msRef > 0 ? ufMs / msRef : 0.f);
+                note(rd, std::string(algos[a].first) + " on mesh, " + xf.name);
+            }
+            std::cout << "\n";
         }
-        std::cout << "  worst over placements = " << meshWorst
-                  << "    total  P " << std::fixed << std::setprecision(2) << sumP << " ms"
-                  << "   S " << sumS << " ms"
-                  << "   S/P " << (sumP > 0 ? sumS / sumP : 0.f) << "\n";
+        static const char* names[4] = {"P", "S", "R", "R2"};
+        std::cout << "  totals";
+        for (int a = 0; a < 4; ++a)
+            std::cout << "   " << names[a] << " uf " << std::fixed << std::setprecision(2)
+                      << sumUf[a] << " (x" << (sumUf[0] > 0 ? sumUf[a] / sumUf[0] : 0.f)
+                      << ")  leaf " << sumLeaf[a] << "  all " << sumMs[a] << " ms";
+        std::cout << "\n  worst rounds over placements = " << meshWorst << "\n";
     }
 
     std::cout << "\nWorst observed: " << worst << " rounds, from " << worstName

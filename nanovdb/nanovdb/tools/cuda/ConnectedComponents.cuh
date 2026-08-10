@@ -74,12 +74,18 @@ struct CrossLeafEdge { uint32_t a, b; };
 ///        of algorithms as a connect step followed by one or more shortcut steps, repeated until no
 ///        parent changes.
 enum class LeafSchedule {
-    Parent,    ///< their algorithm P: one hook, one compress per round. Cheapest per round, but no
-               ///< step bound is known -- section 4.2 states they cannot prove even O(lg^2 n), and an
-               ///< earlier published analysis of it was withdrawn as incorrect.
-    Flatten    ///< their algorithm S: one hook, then compress until the forest is flat. More work per
-               ///< round and no warm-up needed, but a proven O(min{d, lg n} lg n) step bound
+    Parent,    ///< their algorithm P: parent-connect, one compress per round. Cheapest per round, but
+               ///< no step bound is known -- section 4.2 states they cannot prove even O(lg^2 n), and
+               ///< an earlier published analysis of it was withdrawn as incorrect.
+    Flatten,   ///< their algorithm S: parent-connect, then compress until the forest is flat. More
+               ///< work per round and no warm-up needed, but a proven O(min{d, lg n} lg n) bound
                ///< (theorem 4.1), which is a constant for a fixed 8^3 leaf.
+    Root,      ///< their algorithm R: parent-root-connect, one compress per round. A proven O(lg n)
+               ///< bound (theorem 4.19), which matches the Omega(lg n) lower bound every algorithm in
+               ///< the paper is subject to -- so this is the tightest bound available. Section 5 notes
+               ///< R is Shiloach-Vishkin with two steps dropped and writes resolved by minimum.
+    Root2      ///< R with two compresses per round. Section 4.3 closes by noting this variant admits a
+               ///< simpler analysis with better constants, at the cost of more shortcutting.
 };
 
 template <typename BuildT>
@@ -114,6 +120,20 @@ public:
     ///          flat. More work per round, needs no warm-up, and has a proven O(min{d, lg n} lg n)
     ///          bound (theorem 4.1) -- a constant for a fixed 8^3 leaf.
     void setLeafSchedule(LeafSchedule s) { mLeafSchedule = s; }
+
+    /// @brief Device time of the per-leaf component-count kernel, valid after
+    ///        getVoxelLabelsAndCount() when setConvergenceDiagnostics() was on.
+    ///
+    ///        This is the cleanest measure of the leaf-local union-find itself: the kernel does an
+    ///        init, the solve, and a root count, and nothing else. Use it, not the whole pipeline, to
+    ///        compare leaf schedules -- cross-leaf edges, the global union-find and the label scatter
+    ///        are identical whichever schedule is chosen, and including them dilutes the difference.
+    float unionFindMs() const { return mUnionFindMs; }
+
+    /// @brief Device time of the per-leaf mask-fill kernel. It repeats the same union-find and then
+    ///        scatters component masks and face flags, so it moves with the schedule but is not a
+    ///        clean measure of it.
+    float leafMaskMs() const { return mLeafMaskMs; }
 
     /// @brief Rounds-to-convergence histogram over every leaf, valid after
     ///        getVoxelLabelsAndCount() when setConvergenceDiagnostics() was on. Bin r counts the
@@ -169,6 +189,8 @@ private:
     int                          mVerbose{0};
     bool                         mConvergenceDiagnostics{false};
     LeafSchedule                 mLeafSchedule{LeafSchedule::Parent};
+    float                        mUnionFindMs{0.f};      // see unionFindMs()
+    float                        mLeafMaskMs{0.f};       // see leafMaskMs()
     nanovdb::cuda::DeviceBuffer  mConvergenceHistogram;   // MaxConvergenceIters+1 × uint32
     const GridT                 *mDeviceSrcGrid;
     nanovdb::cuda::TempDevicePool mTempDevicePool;
@@ -236,12 +258,16 @@ __device__ inline int ccNeighborMin(const int* parentsPtr, int n, int current)
 // SV root hook: every vertex v whose smallest active neighbor label m is below parent[v]
 // lowers the slot of v's *parent* (its tree root, once flattened) toward m, via atomicMin.
 // Sets *changed (when non-null) iff some root slot was actually lowered.
-__device__ inline void ccHook(int*& cur, int*& nxt, int n, int* changed)
+/// @param rootsOnly restrict the hook to parents that are themselves roots, which turns Liu &
+///        Tarjan's parent-connect into their parent-root-connect. That restriction is what makes the
+///        algorithm monotone -- a connect can no longer move a subtree from one tree to another --
+///        and monotonicity is what their O(lg n) proof for algorithm R rests on.
+__device__ inline void ccHook(int*& cur, int*& nxt, int n, int* changed, bool rootsOnly = false)
 {
     const int pn = cur[n];
     nxt[n] = pn;                                  // Phase A: seed nxt = cur (own slot, no race)
     __syncthreads();
-    if (pn != CC_INACTIVE) {                      // active voxel
+    if (pn != CC_INACTIVE && (!rootsOnly || cur[pn] == pn)) {   // active, and a root if required
         const int m = ccNeighborMin(cur, n, pn);
         if (m < pn) {                             // root slot is data-dependent -> atomicMin
             const int old = atomicMin_block(&nxt[pn], m);  // block scope: nxt[] is shared
@@ -276,25 +302,32 @@ template <int MaxIters>
 __device__ inline void ccSolveLeaf(int*& cur, int*& nxt, int n, LeafSchedule schedule,
                                    int* changed, int* moved, int& rounds, int& shortcuts)
 {
+    const bool rootsOnly = (schedule == LeafSchedule::Root || schedule == LeafSchedule::Root2);
+
     shortcuts = 0;
-    if (schedule == LeafSchedule::Parent) {
-        // Warm-up: one hook plus log2(8) compresses, cheap enough to always be worth it.
-        ccHook    (cur, nxt, n, nullptr);
+    if (schedule != LeafSchedule::Flatten) {
+        // Warm-up: one hook -- the schedule's own hook -- plus four unconditional compresses. A leaf
+        // is 8 voxels across, so four pointer-jumps flatten any tree the first hook can build, and
+        // they are cheap enough to always be worth it. S is excluded because it compresses to
+        // flatness every round anyway, which subsumes a warm-up.
+        ccHook    (cur, nxt, n, nullptr, rootsOnly);
         ccCompress(cur, nxt, n, nullptr);
         ccCompress(cur, nxt, n, nullptr);
         ccCompress(cur, nxt, n, nullptr);
-        shortcuts = 3;
+        ccCompress(cur, nxt, n, nullptr);
+        shortcuts = 4;
     }
 
     rounds = MaxIters;
     for (int it = 0; it < MaxIters; ++it) {
         if (n == 0) *changed = 0;
         __syncthreads();
-        ccHook(cur, nxt, n, changed);
+        ccHook(cur, nxt, n, changed, rootsOnly);
 
-        if (schedule == LeafSchedule::Parent) {
+        if (schedule != LeafSchedule::Flatten) {
             ccCompress(cur, nxt, n, changed);
             ++shortcuts;
+            if (schedule == LeafSchedule::Root2) { ccCompress(cur, nxt, n, changed); ++shortcuts; }
         } else {
             for (int j = 0; j < MaxIters; ++j) {          // compress until the forest is flat
                 if (n == 0) *moved = 0;
@@ -723,10 +756,23 @@ void ConnectedComponents<BuildT>::processLeafConnectedComponents()
     }
     if (mVerbose==1) mTimer.start("Per-leaf connected-component counting");
     Op countOp; countOp.mSchedule = mLeafSchedule;
+    cudaEvent_t k0, k1;
+    if (mConvergenceDiagnostics) {
+        cudaCheck(cudaEventCreate(&k0)); cudaCheck(cudaEventCreate(&k1));
+        cudaCheck(cudaEventRecord(k0, mStream));
+    }
     util::cuda::operatorKernelInstance<Op>
         <<<leafCount, Op::MaxThreadsPerBlock, 0, mStream>>>(countOp, mDeviceSrcGrid,
                                                             deviceLeafComponentCounts(), d_hist);
     cudaCheckError();
+    if (mConvergenceDiagnostics) {
+        float ms = 0.f;
+        cudaCheck(cudaEventRecord(k1, mStream));
+        cudaCheck(cudaEventSynchronize(k1));
+        cudaCheck(cudaEventElapsedTime(&ms, k0, k1));
+        mUnionFindMs = ms;
+        cudaCheck(cudaEventDestroy(k0)); cudaCheck(cudaEventDestroy(k1));
+    }
     if (mVerbose==1) mTimer.stop();
 
     // Prefix sum: mLeafComponentOffsets[0]=0, mLeafComponentOffsets[1..leafCount] = inclusive sum
@@ -777,11 +823,24 @@ void ConnectedComponents<BuildT>::processLeafConnectedComponents()
     using MaskOp = cc_detail::LeafComponentMaskFunctor<BuildT>;
     if (mVerbose==1) mTimer.start("Per-leaf component mask fill");
     MaskOp maskOp; maskOp.mSchedule = mLeafSchedule;
+    cudaEvent_t m0, m1;
+    if (mConvergenceDiagnostics) {
+        cudaCheck(cudaEventCreate(&m0)); cudaCheck(cudaEventCreate(&m1));
+        cudaCheck(cudaEventRecord(m0, mStream));
+    }
     util::cuda::operatorKernelInstance<MaskOp>
         <<<leafCount, MaskOp::MaxThreadsPerBlock, 0, mStream>>>(
             maskOp, mDeviceSrcGrid, deviceLeafComponentOffsets(),
             deviceLeafComponentMasks(), deviceLeafComponentFaceMasks());
     cudaCheckError();
+    if (mConvergenceDiagnostics) {
+        float ms = 0.f;
+        cudaCheck(cudaEventRecord(m1, mStream));
+        cudaCheck(cudaEventSynchronize(m1));
+        cudaCheck(cudaEventElapsedTime(&ms, m0, m1));
+        mLeafMaskMs = ms;
+        cudaCheck(cudaEventDestroy(m0)); cudaCheck(cudaEventDestroy(m1));
+    }
     if (mVerbose==1) mTimer.stop();
 }// ConnectedComponents<BuildT>::processLeafConnectedComponents
 

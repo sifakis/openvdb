@@ -50,9 +50,20 @@ struct Triangle {
     __hostdev__       nanovdb::Vec3f& operator[](int i)       { return v[i]; }
 };
 
-template <typename BuildT>
+/// @brief Pairing of a leaf-node origin with a triangle id. Independent of the
+///        resource the converter allocates from, so it lives outside MeshToGrid
+///        and stays one type across every ResourceT instantiation.
+struct alignas(16) MeshToGridBoxTrianglePair { // sizeof = 16B
+    nanovdb::Coord origin; // 12B
+    uint32_t triangleID;   // 4B
+};
+
+template <typename BuildT, typename ResourceT = nanovdb::cuda::DeviceResource>
 class MeshToGrid
 {
+    static_assert(nanovdb::cuda::is_async_resource<ResourceT>::value,
+                  "MeshToGrid allocates stream-ordered scratch and requires an AsyncResource");
+
     using PointT = nanovdb::Vec3f;
     using TriangleIndexT = nanovdb::Vec3i;
     using TriangleT = Triangle;
@@ -64,10 +75,7 @@ class MeshToGrid
     using LeafT  = NanoLeaf<BuildT>;
 
 public:
-    struct alignas(16) BoxTrianglePair { // sizeof(BoxTrianglePair) = 16B
-        nanovdb::Coord origin; // 12B
-        uint32_t triangleID;   // 4B
-    };
+    using BoxTrianglePair = MeshToGridBoxTrianglePair;
 
     /// @brief Constructor
     /// @param devicePoints Vertex list for input triangle surface
@@ -81,10 +89,11 @@ public:
         const nanovdb::Vec3i *deviceTriangles,
         const uint32_t triangleCount,
         const nanovdb::Map map = nanovdb::Map(),
-        cudaStream_t stream = 0
+        cudaStream_t stream = 0,
+        ResourceT& resource = nanovdb::cuda::default_resource<ResourceT>()
     )
-        : mStream(stream), mTimer(stream), mBuilder(stream), mDevicePoints(devicePoints), mPointCount(pointCount),
-         mDeviceTriangles(deviceTriangles), mTriangleCount(triangleCount), mMap(map)
+        : mStream(stream), mTimer(stream), mBuilder(stream, resource), mDevicePoints(devicePoints), mPointCount(pointCount),
+         mDeviceTriangles(deviceTriangles), mTriangleCount(triangleCount), mMap(map), mTempDevicePool(resource)
     {}
 
     /// @brief Toggle on and off verbose mode
@@ -169,7 +178,7 @@ private:
     static constexpr unsigned int mNumThreads = 128;// for kernels spawned via lambdaKernel (others may specialize)
     static unsigned int numBlocks(unsigned int n) {return (n + mNumThreads - 1) / mNumThreads;}
 
-    TopologyBuilder<BuildT>      mBuilder;
+    TopologyBuilder<BuildT, ResourceT> mBuilder;
     cudaStream_t                 mStream{0};
     std::string                  mGridName;
     util::cuda::Timer            mTimer;
@@ -192,8 +201,8 @@ private:
     auto deviceBoxTrianglePairs()  { return static_cast<BoxTrianglePair*>(mBoxTrianglePairsBuffer.deviceData()); }
     auto deviceUniqueRootOrigins() const { return static_cast<nanovdb::Coord*>(mUniqueRootOriginsBuffer.deviceData()); }
 
-    nanovdb::cuda::TempDevicePool mTempDevicePool;
-}; // tools::cuda::MeshToGrid<BuildT>
+    nanovdb::cuda::TempPool<ResourceT> mTempDevicePool;
+}; // tools::cuda::MeshToGrid<BuildT, ResourceT>
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -214,10 +223,9 @@ private:
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-template<typename BuildT>
+template<typename BuildT, typename ResourceT>
 template<typename BufferT>
-GridHandle<BufferT>
-MeshToGrid<BuildT>::getHandle(const BufferT &buffer)
+GridHandle<BufferT> MeshToGrid<BuildT, ResourceT>::getHandle(const BufferT &buffer)
 {
     cudaStreamSynchronize(mStream);
 
@@ -324,7 +332,7 @@ MeshToGrid<BuildT>::getHandle(const BufferT &buffer)
     }
     if (mVerbose==1) mTimer.stop();
     return handle;
-} // MeshToGrid<BuildT>::getHandle
+} // MeshToGrid<BuildT, ResourceT>::getHandle
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -349,8 +357,8 @@ struct TransformTrianglesFunctor
 
 } // namespace topology::detail
 
-template<typename BuildT>
-void MeshToGrid<BuildT>::transformTriangles()
+template<typename BuildT, typename ResourceT>
+void MeshToGrid<BuildT, ResourceT>::transformTriangles()
 {
     if (mTriangleCount == 0) return;
 
@@ -369,7 +377,7 @@ void MeshToGrid<BuildT>::transformTriangles()
 
     cudaCheckError();
 
-} // MeshToGrid<BuildT>::transformTriangles
+} // MeshToGrid<BuildT, ResourceT>::transformTriangles
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -430,7 +438,7 @@ struct CountRootBoxesFunctor
 template <typename BuildT>
 struct ScatterRootTrianglePairsFunctor
 {
-    using PairT = typename MeshToGrid<BuildT>::BoxTrianglePair;
+    using PairT = MeshToGridBoxTrianglePair;
 
     const Triangle* dXformedTriangles;
     const uint64_t* dOffsets;
@@ -485,8 +493,8 @@ struct ScatterRootTrianglePairsFunctor
 
 } // namespace topology::detail
 
-template<typename BuildT>
-void MeshToGrid<BuildT>::processRootTrianglePairs()
+template<typename BuildT, typename ResourceT>
+void MeshToGrid<BuildT, ResourceT>::processRootTrianglePairs()
 {
     if (mTriangleCount == 0) { mBoxTrianglePairCount = 0; return; }
 
@@ -526,7 +534,7 @@ void MeshToGrid<BuildT>::processRootTrianglePairs()
     // Pass 3: Re-enumerate intersections of (padded) root boxes and triangles, and scatter to allocated list
 
     mBoxTrianglePairsBuffer = nanovdb::cuda::DeviceBuffer::create(
-        mBoxTrianglePairCount * sizeof(typename MeshToGrid<BuildT>::BoxTrianglePair), nullptr, device, mStream);
+        mBoxTrianglePairCount * sizeof(MeshToGridBoxTrianglePair), nullptr, device, mStream);
     if (mBoxTrianglePairsBuffer.deviceData() == nullptr) throw std::runtime_error("Failed to allocate pairs buffer");
 
     util::cuda::lambdaKernel<<<numBlocks(mTriangleCount), mNumThreads, 0, mStream>>>(
@@ -539,7 +547,7 @@ void MeshToGrid<BuildT>::processRootTrianglePairs()
         }
     );
 
-} // MeshToGrid<BuildT>::processRootTrianglePairs
+} // MeshToGrid<BuildT, ResourceT>::processRootTrianglePairs
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -559,7 +567,7 @@ namespace topology::detail {
 template <typename BuildT>
 struct ScatterChildPairsFunctor
 {
-    using PairT = typename MeshToGrid<BuildT>::BoxTrianglePair;
+    using PairT = MeshToGridBoxTrianglePair;
 
     const PairT*            dParents;
     const nanovdb::Mask<3>* dMasks;
@@ -671,7 +679,7 @@ __device__ inline bool testTriangleAABB(
 
 template <typename BuildT, bool OnlyUseAABB>
 __global__ void evaluateAndCountSubBoxesKernel(
-    const typename MeshToGrid<BuildT>::BoxTrianglePair* dParents,
+    const MeshToGridBoxTrianglePair* dParents,
     const Triangle* dXformedTriangles,
     nanovdb::Mask<3>* dMasks,
     uint64_t* dCounts,
@@ -760,7 +768,7 @@ __device__ inline nanovdb::Coord keyToCoord(uint64_t key)
 template <typename BuildT>
 struct EncodeRootOriginsFunctor
 {
-    const typename MeshToGrid<BuildT>::BoxTrianglePair* dPairs;
+    const MeshToGridBoxTrianglePair* dPairs;
     uint64_t*                                           dKeys;
 
     __device__ void operator()(size_t i) const { dKeys[i] = coordToKey(dPairs[i].origin); }
@@ -777,8 +785,8 @@ struct DecodeRootOriginsFunctor
 
 } // namespace topology::detail
 
-template<typename BuildT>
-void MeshToGrid<BuildT>::enumerateRootTiles()
+template<typename BuildT, typename ResourceT>
+void MeshToGrid<BuildT, ResourceT>::enumerateRootTiles()
 {
     if (mBoxTrianglePairCount == 0) return;
 
@@ -830,12 +838,12 @@ void MeshToGrid<BuildT>::enumerateRootTiles()
     );
     cudaCheckError();
 
-} // MeshToGrid<BuildT>::enumerateRootTiles
+} // MeshToGrid<BuildT, ResourceT>::enumerateRootTiles
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-template<typename BuildT>
-void MeshToGrid<BuildT>::buildRasterizedRoot()
+template<typename BuildT, typename ResourceT>
+void MeshToGrid<BuildT, ResourceT>::buildRasterizedRoot()
 {
     int device = 0;
     cudaGetDevice(&device);
@@ -864,12 +872,12 @@ void MeshToGrid<BuildT>::buildRasterizedRoot()
         mBuilder.mProcessedRoot.deviceUpload(device, mStream, false);
         mUniqueRootOriginsBuffer.clear(mStream);
     }
-} // MeshToGrid<BuildT>::buildRasterizedRoot
+} // MeshToGrid<BuildT, ResourceT>::buildRasterizedRoot
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-template<typename BuildT>
-void MeshToGrid<BuildT>::rasterizeInternalNodes()
+template<typename BuildT, typename ResourceT>
+void MeshToGrid<BuildT, ResourceT>::rasterizeInternalNodes()
 {
     if (mBoxTrianglePairCount == 0) return;
 
@@ -884,12 +892,12 @@ void MeshToGrid<BuildT>::rasterizeInternalNodes()
     );
     cudaCheckError();
 
-} // MeshToGrid<BuildT>::rasterizeInternalNodes
+} // MeshToGrid<BuildT, ResourceT>::rasterizeInternalNodes
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-template<typename BuildT>
-void MeshToGrid<BuildT>::processGridTreeRoot()
+template<typename BuildT, typename ResourceT>
+void MeshToGrid<BuildT, ResourceT>::processGridTreeRoot()
 {
     // Initialize grid/tree/root metadata from scratch using the provided map.
     // InitGridTreeRootFunctor sets all GridData fields explicitly (magic, version,
@@ -909,12 +917,12 @@ void MeshToGrid<BuildT>::processGridTreeRoot()
         cudaCheck(cudaMemcpyAsync(dst, mGridName.c_str(), nameSize, cudaMemcpyHostToDevice, mStream));
     }
 
-} // MeshToGrid<BuildT>::processGridTreeRoot
+} // MeshToGrid<BuildT, ResourceT>::processGridTreeRoot
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-template<typename BuildT>
-void MeshToGrid<BuildT>::rasterizeLeafNodes()
+template<typename BuildT, typename ResourceT>
+void MeshToGrid<BuildT, ResourceT>::rasterizeLeafNodes()
 {
     if (mBoxTrianglePairCount == 0) return;
 
@@ -925,12 +933,12 @@ void MeshToGrid<BuildT>::rasterizeLeafNodes()
                       &mBuilder.data()->getGrid(), mBandWidth * mBandWidth });
     cudaCheckError();
 
-} // MeshToGrid<BuildT>::rasterizeLeafNodes
+} // MeshToGrid<BuildT, ResourceT>::rasterizeLeafNodes
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-template<typename BuildT>
-void MeshToGrid<BuildT>::processLeafTrianglePairs()
+template<typename BuildT, typename ResourceT>
+void MeshToGrid<BuildT, ResourceT>::processLeafTrianglePairs()
 {
     if (mBoxTrianglePairCount == 0) return;
 
@@ -1016,7 +1024,7 @@ void MeshToGrid<BuildT>::processLeafTrianglePairs()
         scale /= 8;
     }
 
-} // MeshToGrid<BuildT>::processLeafTrianglePairs
+} // MeshToGrid<BuildT, ResourceT>::processLeafTrianglePairs
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -1082,10 +1090,10 @@ struct SplitPackedSidecarFunctor
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-template<typename BuildT>
+template<typename BuildT, typename ResourceT>
 template<typename GridBufferT, typename SidecarBufferT>
 std::pair<GridHandle<GridBufferT>, SidecarBufferT>
-MeshToGrid<BuildT>::getHandleAndUDF(const GridBufferT& buffer, const SidecarBufferT&)
+MeshToGrid<BuildT, ResourceT>::getHandleAndUDF(const GridBufferT& buffer, const SidecarBufferT&)
 {
     cudaStreamSynchronize(mStream);
 
@@ -1216,7 +1224,7 @@ MeshToGrid<BuildT>::getHandleAndUDF(const GridBufferT& buffer, const SidecarBuff
     cudaStreamSynchronize(mStream);
 
     return { std::move(handle), std::move(sidecarBuffer) };
-} // MeshToGrid<BuildT>::getHandleAndUDF
+} // MeshToGrid<BuildT, ResourceT>::getHandleAndUDF
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 

@@ -35,6 +35,7 @@ an exterior lattice point can be and still escape certification.
 | `minpoly.py` | minimal polynomials of `eps_c` and the plateau endpoints |
 | `core.py`, `s1_sweep.py`, `lib_dist.py`, `ref_main.py` | adversarial search and referee re-implementations |
 | `chk_borg.py`, `chk_borg5.py`, `chk_hht.py`, `chk_shrink.py`, `final.py` | prior-art checks: the Borgefors 1986 identity, the `5x5` non-identity, the Hajdu–Hajdu–Tijdeman extremal pair, the chamfer-shrink reading, and the `M_p` plateau closed form |
+| `figs.py`, `figs_layout.py` | regenerate every figure in `CertificationGap_Note.md`, as SVG, into `../../../figures/`. Run `figs.py` **then** `figs_layout.py` (the second is a layout pass over figures 1 and 5). No plotting library — the SVG is emitted directly. Verified to reproduce the committed figures byte-for-byte. |
 
 ## Two gotchas that cost real time
 

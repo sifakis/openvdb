@@ -1,11 +1,23 @@
 # A new approach to signing the distance field
 
-> Working notes for an ongoing design discussion (branch `new-distancing-approach`). Status:
-> **in progress, mid-thread** — session paused for a machine switch. See "Handoff for a fresh
-> session" at the end of this document for exactly where to pick up and what to do next. The
+> Working notes for an ongoing design discussion (branch `new-distancing-approach`). The
 > construction itself (union-of-balls exterior + exact-distance interior) is proposed and
-> empirically validated (soundness + axis-aligned tightness); the open thread right now is
-> characterizing the *lattice-point-specific* gap `eps*(slope, W)` in 2D via continued fractions.
+> empirically validated (soundness + axis-aligned tightness).
+>
+> **The 2D lattice-gap question posed at the end of this document is now closed.** See
+> **`LatticeCertificationGap.md`** for the result (`eps* = (3-sqrt5-sqrt(2 sqrt5-4))/4 =
+> 0.0192026307637963438...` at `W = 3`, proved, attained, with the exact `W`-plateau and an exact
+> curvature law for non-planar interfaces) and **`LatticeCertificationGap_PriorArt.md`** for the
+> literature review. Scripts: `scripts/distancing_experiments/lattice_gap/`.
+>
+> **Three corrections to this document fall out of that work** and are noted inline below where they
+> apply: (a) the `eps*` figures computed here use the *ball-membership* criterion, which is exactly
+> **2x** the constant for the *pairwise enrichment* rule the pipeline actually implements; (b) the
+> golden-ratio discussion was asking the wrong question — the `W=3` worst case is a
+> Farey-neighbour crossover, not a Diophantine-type question; (c) a straight `Sigma` is **not** the
+> worst case, so the whole "planar interface" framing below is a lower bound, not a bound.
+>
+> The 3D generalization is open and under active investigation.
 
 ## Motivation
 
@@ -679,6 +691,24 @@ top to bottom first (it's self-contained), then `TabletScreenSharing.md` if you 
 fresh photo of any further hand sketches from the user's Supernote Manta tablet (note: sketches
 referenced above are described in text only — the actual image files were never persisted outside
 ephemeral session scratch space, so you cannot re-view earlier ones, only capture new ones).
+
+> **STATUS UPDATE — items 1-3 below are resolved.** See `LatticeCertificationGap.md`.
+> 1. The `~15.9°` worst case is the **Farey-neighbour crossover** of `(1,0)` (short, misaligned) and
+>    `(2,1)` (long, well aligned), at exactly `alpha* = 15.930625116297946...°`, defined by
+>    `cos alpha* + sin alpha* = sqrt5 - 1`. The cost is length-weighted, `g = |w| sin^2(theta/2)`,
+>    which is what makes a longer vector lose despite better alignment.
+> 2. The golden-ratio conjecture fails for a structural reason, not a numerical one: at finite `W`
+>    the good rational approximations are **amputated by the band**. The continued fraction of
+>    `tan alpha*` is `[0; 3, 1, 1, 72, ...]` and its convergents `(3,1)`, `(4,1)`, `(7,2)` cost
+>    `1.5e-3`, `1.1e-3`, `1.2e-7` — all far cheaper than `eps_c`, and all out of band. Diophantine
+>    quality governs the `W -> infinity` limit; the band cutoff governs `W = 3`.
+> 3. `eps*(W)` is mapped exactly, under **both** admissibility rules, with algebraic endpoints. It is
+>    not a pure step function — there are continuous ramps. The `W = 3` plateau is
+>    `[2.2795, 3.1785)` under the rule the pipeline implements.
+>
+> Item 4 (3D) is under active investigation. Item 5 is untouched. Two **new** items were raised by
+> that work: a straight `Sigma` is not the worst case (concave curvature costs `+K/R`), and the
+> strict predicate is unsound in plain double precision at lattice-aligned normals.
 
 **Concrete next actions, in priority order:**
 

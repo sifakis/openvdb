@@ -474,7 +474,40 @@ takes 2,760x as long. Voxel count, leaf count and component count each fail as p
 own; the product of the last two is the smallest quantity that tracks the cost. Step 6's gate should
 therefore be expressed in components x leaves, which is a change to the plan in section 8.
 
-### 10.4 Still open
+### 10.4 Two axes: resolution scales, component count does not
+
+Section 10.3 varies voxel size and component count together, which hides which one the cost follows.
+Holding the component count near-constant and refining a simple closed mesh separates them:
+
+| voxel size | active voxels | components | GPU labeling | OpenVDB | ratio | OpenVDB throughput |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.02 | 59,908 | 10 | 0.29 ms | 6.6 ms | 22.6x | 9.0 M voxel/s |
+| 0.01 | 240,533 | 2 | 0.43 ms | 11.8 ms | 27.5x | 20.4 M voxel/s |
+| 0.005 | 964,846 | 5 | 0.81 ms | 19.0 ms | 23.4x | 50.9 M voxel/s |
+| 0.0025 | 3,864,627 | 4 | 2.30 ms | 42.4 ms | 18.4x | 91.0 M voxel/s |
+
+**On the resolution axis alone, OpenVDB scales well.** 64x the voxels cost 6.4x the time; throughput
+rises rather than falls, as fixed setup is amortized. The ratio to the GPU stays near 20x across the
+whole range, both implementations amortizing their own overhead in the same way.
+
+That 20x is the honest CPU-versus-GPU gap for this operation. The 2,760x seen in section 10.3 is not
+that gap: it is the grouping stage of section 5.3 collapsing, and it appears only when the component
+count is large.
+
+**The two axes are coupled in practice, though.** Refining a geometrically complex mesh splits thin
+features apart, so components multiply faster than voxels do:
+
+| voxel size | active voxels | components |
+| ---: | ---: | ---: |
+| coarse | 6,874,318 | 12,279 |
+| medium | 18,538,056 (2.7x) | 14,550 (1.2x) |
+| fine | 79,734,227 (4.3x) | 333,703 (**23x**) |
+
+So "does it scale with resolution" has no answer independent of the input. A simple closed surface
+keeps its component count and stays linear; a mesh with thin structure moves onto the quadratic axis
+as it is refined, which is why the finest case above does not finish.
+
+### 10.5 Still open
 
 - The **tile rejection path of section 7.2 is untested**. `countActiveTiles` returns zero on every
   input this example can build, because the grids come from a leaf-only rasterization and prune, so

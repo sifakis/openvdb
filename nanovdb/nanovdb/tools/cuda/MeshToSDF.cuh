@@ -112,7 +112,7 @@ public:
 
     /// @brief Run the whole pipeline. Afterwards the accessors below describe a complete sign field
     ///        over the rasterized band, extended off it by the invert masks.
-    void build();
+    void build();//TODO: change the function name to more intuitive one buildSDF?.
 
     /// @brief The rasterized narrow band (all surfaces together), valid after build().
     const GridT* deviceGrid() const { return mGridHandle.template deviceGrid<BuildT>(); }
@@ -155,11 +155,11 @@ public:
     /// @brief Surface @a i's barrier-pruned grid (the connected-components input).
     const Handle& derivedGridHandle(uint32_t i) const { return mSurfaces[i].derived; }
     /// @brief Surface @a i's per-active-voxel component labels, on its derived grid.
-    const uint32_t* deviceComponentLabels(uint32_t i) const { return mSurfaces[i].ccLabels.first; }
+    const uint32_t* deviceComponentLabels(uint32_t i) const { return mSurfaces[i].ccLabels.first; } //todo: since this is i'th surface data we want to consider it as deviceSurfaceComponentsLabel or something like that
     /// @brief How many components surface @a i's derived grid was labeled into.
-    uint64_t componentCount(uint32_t i) const { return mSurfaces[i].ccLabels.second; }
+    uint64_t componentCount(uint32_t i) const { return mSurfaces[i].ccLabels.second; }//todo: surfaceComponentCount or something else
     /// @brief Surface @a i's nearest-triangle index sidecar, re-indexed onto its carved band.
-    const uint32_t* surfaceIndex(uint32_t i) const;
+    const uint32_t* surfaceIndex(uint32_t i) const; //todo: more specifically surfaceNearestTriangleIndex
 
 private:
 
@@ -167,7 +167,7 @@ private:
     ///        stand-alone grid, plus the complete sign field it would have if it were the only object
     ///        in the scene. Nothing here knows that other surfaces exist, which is exactly what makes
     ///        a single global exterior seed valid again.
-    struct SurfaceField {
+    struct SurfaceField { //todo: The name SurfaceField is somewhat unclear, let's come up with other name?
         Handle  subGrid;   // this surface's band, carved out of the rasterized one. EMPTY when the
                            // mesh has a single closed surface — that band is then used as-is.
         Buffer  subUdf;    // udf / nearest-triangle index re-indexed onto subGrid (carving renumbers
@@ -179,10 +179,10 @@ private:
     };
 
     void rasterize();                    // step 1
-    void partition();                    // step 2
+    void partition();                    // step 2, run connected component on un-pruned grid for seperating each surfaces.
     void signSurface(uint32_t surface);  // step 3, once per closed surface
     void composeByInclusion();           // step 4
-    void fillOnOriginal();               // step 5
+    void fillOnOriginal();               // step 5 TODO: let's rename it to more specific name?
 
     // Surface i's grid / sidecars: its own carved band, or the rasterized band when uncarved.
     const GridT*    surfaceGrid(uint32_t i) const;
@@ -196,23 +196,26 @@ private:
     cudaStream_t          mStream{0};
     int                   mVerbose{0};
     float                 mBandWidth{3.f};
-
+    // Sizes below use A = the rasterized band's active voxel count and N = the closed-surface count.
+    // Every per-voxel sidecar is A+1 long and indexed by leaf.getValue(n), so slot 0 is the background.
     Handle mGridHandle;   // step 1: the rasterized narrow band, all surfaces together
-    Buffer mUDF, mIndex;  // its per-active-voxel unsigned distance and nearest-triangle index
+    Buffer mUDF, mIndex;  // (A+1) x float / (A+1) x uint32: unsigned distance, nearest-triangle index
 
     std::unique_ptr<ConnectedComponents<BuildT>> mSurfaceCC;                   // step 2
-    std::pair<uint32_t*, uint64_t>               mSurfaceLabels{nullptr, 0};
+    std::pair<uint32_t*, uint64_t>               mSurfaceLabels{nullptr, 0};   // { (A+1) x uint32 surface
+                                                                               // id, N }; owned by mSurfaceCC
+    std::vector<SurfaceField> mSurfaces;   // step 3: N entries, one per closed surface — the count
+                                           // itself is surfaceCount(), not a separate member
 
-    std::vector<SurfaceField> mSurfaces;   // step 3, one per closed surface
-
-    std::vector<uint8_t> mParity;          // step 4: per surface, 1 iff its nesting depth is odd
-    Buffer               mComposedSign;    // gathered signs on the rasterized band. EMPTY when a lone
-                                           // uncarved surface's own array is used instead — which is
-                                           // also how fillOnOriginal knows its fill is already done.
-    int8_t*              mSign{nullptr};   // the signs every later stage reads
+    std::vector<uint8_t> mParity;          // step 4: N x uint8, 1 iff that surface's nesting depth is odd
+    Buffer               mComposedSign;    // (A+1) x int8_t: gathered signs on the rasterized band. EMPTY
+                                           // when a lone uncarved surface's own array is used instead —
+                                           // which is also how fillOnOriginal knows its fill is already done.
+    int8_t*              mSign{nullptr};   // (A+1) x int8_t, NOT owned: the signs every later stage reads.
+                                           // Points into mComposedSign, or into surface 0's signer.
 
     std::unique_ptr<Signer> mOrigSigner;   // step 5; empty when surfaces[0]'s fill is adopted
-    Signer*                 mFinalSigner{nullptr};
+    Signer*                 mFinalSigner{nullptr};  // NOT owned: mOrigSigner, or surface 0's signer
 
 }; // tools::cuda::MeshToSDF<BuildT>
 
@@ -262,7 +265,7 @@ public:
     /// @param d_grid        the CC-labeled (derived) device grid
     /// @param d_voxelLabel  per-active-voxel component-label sidecar for @a d_grid (from
     ///                      ConnectedComponents::getVoxelLabelsAndCount()), indexed by leaf.getValue(n).
-    void signNonBarrier(const GridT* d_grid, const uint32_t* d_voxelLabel);
+    void signNonBarrier(const GridT* d_grid, const uint32_t* d_voxelLabel); // todo: signNonBarrierVoxels
 
     /// @brief Carry the derived-grid signs (from signNonBarrier) back onto the original grid. The
     ///        derived grid is the barrier-pruned subset of the original, so the injection covers all
@@ -270,7 +273,7 @@ public:
     ///        ("unsigned barrier") for step 5 to fill. Requires signNonBarrier() first.
     /// @param d_origGrid    the original (pre-prune) grid — injection target.
     /// @param d_derivedGrid the barrier-pruned grid that was signed.
-    void injectSignsToOriginal(const GridT* d_origGrid, const GridT* d_derivedGrid);
+    void injectSignsToOriginal(const GridT* d_origGrid, const GridT* d_derivedGrid); //TODO: injectSignsToOriginalGrid
 
     /// @brief Sign every barrier voxel (sign == 0) of the original grid, completing the sign field so
     ///        no sentinel-0 voxel remains. Faithful mirror of OpenVDB MeshToVolume.h
@@ -285,7 +288,7 @@ public:
     /// @param map         the world<->index transform used to build the grid.
     void signBarrier(const GridT* d_grid, const uint32_t* d_index,
                      const nanovdb::Vec3f* d_points, const nanovdb::Vec3i* d_triangles,
-                     const nanovdb::Map& map);
+                     const nanovdb::Map& map); //TODO: SignBarrierVoxels
 
     /// @brief Step 6 (chunk A, leaf level): build the per-leaf invert masks that sign the INACTIVE
     ///        voxels inside materialized leaves — bit ON => interior (-background), bit OFF =>
@@ -1138,7 +1141,7 @@ signedSignAt(const NanoGrid<BuildT>& grid, const nanovdb::Coord& ijk,
 // Retain mask selecting one surface's voxels out of the original grid: one block per leaf, one thread
 // per voxel offset, bit ON iff the voxel carries the target surface label.
 template <typename BuildT>
-struct SurfaceMaskFunctor
+struct SurfaceMaskFunctor // TODO: How about changing it to RetainMaskFunctor or something like that?
 {
     static constexpr int MaxThreadsPerBlock         = 512;
     static constexpr int MinBlocksPerMultiprocessor = 1;
@@ -1517,11 +1520,12 @@ void SurfaceSigner<BuildT>::fillRootInteriorMask(const GridT* d_grid, const int8
 template <typename BuildT>
 void MeshToSDF<BuildT>::build()
 {
-    this->rasterize();
-    this->partition();
-    for (uint32_t i = 0; i < uint32_t(mSurfaces.size()); ++i) this->signSurface(i);
-    this->composeByInclusion();
-    this->fillOnOriginal();
+    this->rasterize();          // mesh -> narrow band, with the UDF and nearest-triangle sidecars
+    this->partition();          // components of the UN-pruned band = one per closed surface
+    for (uint32_t i = 0; i < uint32_t(mSurfaces.size()); ++i)
+        this->signSurface(i);   // carve surface i out, prune its barrier shell, label, and sign it alone
+    this->composeByInclusion(); // nesting parity per surface, then merge the signs onto the band
+    this->fillOnOriginal();     // extend those signs off the band as invert masks
 }// MeshToSDF<BuildT>::build
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -1606,6 +1610,7 @@ void MeshToSDF<BuildT>::signSurface(uint32_t surface)
     }
 
     const auto* d_grid = this->surfaceGrid(surface);
+    // TODO: Seems signer does many things. it not only signs the narrow band, it fills the inside. In that sense, we may have to reconsider the class name
     sf.signer = std::make_unique<Signer>(mStream);
     sf.signer->setVerbose(mVerbose);
 
@@ -1643,13 +1648,13 @@ void MeshToSDF<BuildT>::composeByInclusion()
 {
     using Traits = util::cuda::DeviceGridTraits<BuildT>;
 
-    const uint32_t N = uint32_t(mSurfaces.size());
-    if (N == 0) return;
+    const uint32_t numSurfaces = uint32_t(mSurfaces.size());
+    if (numSurfaces == 0) return;
 
     // Nothing encloses a lone surface, and an uncarved one already carries its signs on the rasterized
     // band — so there is no depth to recover and nothing to gather. Aliasing here is what keeps the
     // single-surface case free of the extra full-length sign array a merge would allocate.
-    if (N == 1 && !mSurfaces[0].subGrid.bufferSize()) {
+    if (numSurfaces == 1 && !mSurfaces[0].subGrid.bufferSize()) {
         mParity.assign(1, 0);
         mSign = mSurfaces[0].signer->deviceSignedVoxelSign();
         return;
@@ -1664,64 +1669,68 @@ void MeshToSDF<BuildT>::composeByInclusion()
 
     // (1) One representative voxel per surface. Any voxel of a surface's band serves: the band hugs
     //     its own surface, so it lies wholly inside, or wholly outside, every other surface.
-    auto  repBuf   = Buffer::create(N * sizeof(unsigned long long), nullptr, false);
+    auto  repBuf   = Buffer::create(numSurfaces * sizeof(unsigned long long), nullptr, false);
     auto* d_repKey = static_cast<unsigned long long*>(repBuf.deviceData());
-    cudaCheck(cudaMemsetAsync(d_repKey, 0xFF, N * sizeof(unsigned long long), mStream));
+    cudaCheck(cudaMemsetAsync(d_repKey, 0xFF, numSurfaces * sizeof(unsigned long long), mStream));
     {
         using RepOp = sdf_detail::SurfaceRepFunctor<BuildT>;
         util::cuda::operatorKernel<RepOp><<<origLeaves, RepOp::MaxThreadsPerBlock, 0, mStream>>>(
-            d_orig, mSurfaceLabels.first, N, d_repKey);
+            d_orig, mSurfaceLabels.first, numSurfaces, d_repKey);
         cudaCheckError();
     }
 
     // (2) Ask each surface's own field about every surface's representative. Each was completed
     //     through the invert-mask fill, so it answers off its band too — including at the other bands.
-    auto  incBuf = Buffer::create(std::size_t(N) * N * sizeof(int8_t), nullptr, false);
-    auto* d_inc  = static_cast<int8_t*>(incBuf.deviceData());  // d_inc[i*N+j] = field i's sign at surface j
-    for (uint32_t i = 0; i < N; ++i) {
+    // TODO: The variable name incBuf is a bit unclear, let's consider it from inc to inclusion for clarity.
+    auto  incBuf = Buffer::create(std::size_t(numSurfaces) * numSurfaces * sizeof(int8_t), nullptr, false);
+    auto* d_inc  = static_cast<int8_t*>(incBuf.deviceData());  // d_inc[i*numSurfaces+j] = field i's sign at surface j
+    for (uint32_t i = 0; i < numSurfaces; ++i) {
         auto&       phi   = *mSurfaces[i].signer;
         const auto* d_sub = this->surfaceGrid(i);
         using ProbeOp = sdf_detail::InclusionProbeFunctor<BuildT>;
-        util::cuda::lambdaKernel<<<1, N, 0, mStream>>>(
-            N, ProbeOp{}, d_sub, d_repKey, phi.deviceSignedVoxelSign(),
+        util::cuda::lambdaKernel<<<1, numSurfaces, 0, mStream>>>(
+            numSurfaces, ProbeOp{}, d_sub, d_repKey, phi.deviceSignedVoxelSign(),
             phi.deviceLeafInvertMask(), phi.deviceLowerInvertMask(), phi.deviceUpperInvertMask(),
-            phi.deviceRootInterior(), phi.rootTileMin(), phi.rootTileDims(), d_inc + std::size_t(i) * N);
+            phi.deviceRootInterior(), phi.rootTileMin(), phi.rootTileDims(), d_inc + std::size_t(i) * numSurfaces);
         cudaCheckError();
     }
 
-    // (3) Nesting depth = how many other surfaces report this one as inside them. The inclusion forest
-    //     itself is not needed for the signs — only the parity of the depth is.
-    std::vector<int8_t> inc(std::size_t(N) * N);
+    // (3) Nesting depth = how many other surfaces report this one as inside them. Counting a column is
+    //     enough: enclosure is transitive between non-intersecting surfaces, so a surface nested d deep
+    //     is reported inside by exactly d others — the inclusion forest never has to be built.
+    std::vector<int8_t> inc(std::size_t(numSurfaces) * numSurfaces);
     cudaCheck(cudaMemcpyAsync(inc.data(), d_inc, inc.size() * sizeof(int8_t), cudaMemcpyDeviceToHost, mStream));
     cudaCheck(cudaStreamSynchronize(mStream));
 
-    std::vector<uint32_t> depth(N, 0);
-    mParity.assign(N, 0);
-    for (uint32_t j = 0; j < N; ++j) {
-        for (uint32_t i = 0; i < N; ++i)
-            if (i != j && inc[std::size_t(i) * N + j] < 0) ++depth[j];   // field i says surface j is inside
+    std::vector<uint32_t> depth(numSurfaces, 0);
+    mParity.assign(numSurfaces, 0);
+    for (uint32_t j = 0; j < numSurfaces; ++j) {
+        for (uint32_t i = 0; i < numSurfaces; ++i)
+            if (i != j && inc[std::size_t(i) * numSurfaces + j] < 0) ++depth[j];   // field i says surface j is inside
+        // Each enclosing surface flips this one's signs once, and flipping twice is the identity, so
+        // only the low bit of the depth survives — that single bit is all step (4) needs.
         mParity[j] = uint8_t(depth[j] & 1u);
     }
 
     // (4) Merge. Gather every surface's signs back onto the rasterized band — the surfaces partition
-    //     its active voxels, so the N injections write disjoint slots and together cover all of them —
+    //     its active voxels, so the per-surface injections write disjoint slots and together cover all —
     //     then negate the odd-depth ones in place.
     mComposedSign = Buffer::create((origActive + 1) * sizeof(int8_t), nullptr, false);
     mSign = static_cast<int8_t*>(mComposedSign.deviceData());
     cudaCheck(cudaMemsetAsync(mSign, 1, (origActive + 1) * sizeof(int8_t), mStream));  // slot 0 = background +1
     using InjectOp = util::cuda::InjectGridDataFunctor<BuildT, int8_t>;
-    for (uint32_t i = 0; i < N; ++i) {
+    for (uint32_t i = 0; i < numSurfaces; ++i) {
         const auto*    d_sub     = this->surfaceGrid(i);
         const uint32_t subLeaves = Traits::getTreeData(d_sub).mNodeCount[0];
         util::cuda::operatorKernel<InjectOp><<<subLeaves, InjectOp::MaxThreadsPerBlock, 0, mStream>>>(
             d_sub, d_orig, mSurfaces[i].signer->deviceSignedVoxelSign(), mSign);
         cudaCheckError();
     }
-    auto  flipBuf = Buffer::create(N * sizeof(uint8_t), nullptr, false);
+    auto  flipBuf = Buffer::create(numSurfaces * sizeof(uint8_t), nullptr, false);
     auto* d_flip  = static_cast<uint8_t*>(flipBuf.deviceData());
-    cudaCheck(cudaMemcpyAsync(d_flip, mParity.data(), N * sizeof(uint8_t), cudaMemcpyHostToDevice, mStream));
+    cudaCheck(cudaMemcpyAsync(d_flip, mParity.data(), numSurfaces * sizeof(uint8_t), cudaMemcpyHostToDevice, mStream));
     util::cuda::lambdaKernel<<<(unsigned int)((origActive + 256) / 256), 256, 0, mStream>>>(
-        origActive + 1, sdf_detail::FlipSignByDepthFunctor{}, mSurfaceLabels.first, d_flip, N, mSign);
+        origActive + 1, sdf_detail::FlipSignByDepthFunctor{}, mSurfaceLabels.first, d_flip, numSurfaces, mSign);
     cudaCheckError();
     cudaCheck(cudaStreamSynchronize(mStream));
     if (mVerbose==1) timer.stop();

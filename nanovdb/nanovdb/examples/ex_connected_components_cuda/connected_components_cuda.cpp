@@ -33,12 +33,15 @@
 // voxels of the surface) is pruned first, splitting each closed surface's band into disjoint
 // inner/outer shells; otherwise labeling runs on the full narrow band (one component per closed
 // surface). Prints topology diagnostics, the component count, and a CPU-oracle PASS/FAIL, and
-// returns the number of connected components.
+// returns the number of connected components. With @a openvdbOracle, OpenVDB's own CPU segmentation
+// is additionally run on the same topology and its segment count and cost reported; that requires a
+// build with -DNANOVDB_USE_OPENVDB=ON and is otherwise reported as unavailable.
 uint64_t connectedComponentsFromMesh(const std::vector<nanovdb::Vec3f>& points,
                                      const std::vector<nanovdb::Vec3i>& triangles,
                                      const nanovdb::Map&                map,
                                      float                              bandWidth,
-                                     bool                               discardSurfaceVoxels);
+                                     bool                               discardSurfaceVoxels,
+                                     bool                               openvdbOracle);
 
 /// @brief Minimal Wavefront .obj reader (vertices + faces) using NanoVDB types.
 ///
@@ -96,6 +99,7 @@ int main(int argc, char* argv[])
         float voxelSize            = 0.01f;
         float bandWidth            = 3.0f;
         bool  discardSurfaceVoxels = false;
+        bool  openvdbOracle        = false;
 
         auto nextValue = [&](int& i, const char* opt) -> const char* {
             if (i + 1 >= argc) throw std::runtime_error(std::string("missing value for ") + opt);
@@ -104,6 +108,7 @@ int main(int argc, char* argv[])
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
             if      (a == "--discard-surface-voxels") discardSurfaceVoxels = true;
+            else if (a == "--openvdb-oracle")         openvdbOracle = true;
             else if (a == "--voxel-size")  voxelSize = std::stof(nextValue(i, "--voxel-size"));
             else if (a == "--band-width")  bandWidth = std::stof(nextValue(i, "--band-width"));
             else if (a.rfind("--", 0) == 0) throw std::runtime_error("unknown option: " + a);
@@ -112,7 +117,8 @@ int main(int argc, char* argv[])
         if (objFiles.empty())
             throw std::runtime_error(
                 "usage: " + std::string(argv[0]) +
-                " <input.obj> [more.obj ...] [--voxel-size S] [--band-width W] [--discard-surface-voxels]");
+                " <input.obj> [more.obj ...] [--voxel-size S] [--band-width W]"
+                " [--discard-surface-voxels] [--openvdb-oracle]");
 
         // Read and merge all input meshes into one vertex/triangle list. Merging simply concatenates
         // the meshes in their own coordinates (no repositioning), offsetting each mesh's triangle
@@ -142,7 +148,8 @@ int main(int argc, char* argv[])
                   << (discardSurfaceVoxels ? "discarded (barrier shell pruned)"
                                            : "kept (full narrow band)") << "\n";
         const uint64_t numComponents =
-            connectedComponentsFromMesh(points, triangles, map, bandWidth, discardSurfaceVoxels);
+            connectedComponentsFromMesh(points, triangles, map, bandWidth, discardSurfaceVoxels,
+                                        openvdbOracle);
         std::cout << "Connected components: " << numComponents << "\n";
 
         return 0;

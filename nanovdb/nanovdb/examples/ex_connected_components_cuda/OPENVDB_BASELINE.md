@@ -1,6 +1,8 @@
 # An OpenVDB baseline for the CUDA connected-components labeling
 
-Status: design note. Nothing in this document is implemented yet.
+Status: steps 1-5 of section 8 are implemented and behind `--openvdb-oracle`. Steps 6-7, the sweep
+and its write-up, are not. Measured results so far are in section 10, which also records where the
+implementation departed from this plan.
 
 ## 1. Purpose
 
@@ -401,13 +403,84 @@ Ordered so that each step is independently verifiable.
   procedure should be written down: check the cap warning first (section 5.5), then whether the
   input has tiles, then reduce to a minimal failing leaf pair.
 
-- **Word-level mask copy is unverified.** Section 6.2 notes both libraries use
-  `offset = x*64 + y*8 + z`, which suggests a direct word copy works. This must be confirmed
-  against both implementations, not assumed; a bit-by-bit copy is the safe fallback and the
-  conversion is not on any hot path.
+- ~~**Word-level mask copy is unverified.**~~ Resolved by placing voxels by coordinate instead;
+  see section 10.2. Note that the bit-by-bit fallback proposed in section 6.2 would not have
+  resolved it: writing bit `n` of the destination assumes the same offset convention that a word
+  copy does.
 
 - **`openvdb::initialize()` placement.** Needs to happen once, before any OpenVDB call, and
   should not be paid when the flag is off.
+
+---
+
+## 10. Measured results
+
+Steps 1-5 are implemented. The numbers below are single runs on one machine, taken to answer two
+questions early: does the baseline agree, and can it be afforded. They are not the sweep of step 6.
+
+### 10.1 Agreement
+
+Every case ran the full partition comparison of section 7.4, not merely a count comparison.
+
+| case | active voxels | leaves | components | violations | unassigned |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| one mesh, full band | 338,725 | 1,732 | 1 | 0 | 0 |
+| one mesh, barrier-pruned | 240,533 | 1,732 | 2 | 0 | 0 |
+| three meshes merged, pruned | 834,972 | 5,871 | 50 | 0 | 0 |
+| dense mesh, coarse, pruned | 6,874,318 | 29,603 | 12,279 | 0 | 0 |
+| dense mesh, medium, pruned | 18,538,056 | 89,738 | 14,550 | 0 | 0 |
+
+The check was also confirmed to fail when it should, which a check that has only ever passed does
+not establish. Relabeling a single voxel into another component produced exactly one partition
+violation; withholding one segment when painting the slot array produced the expected count of
+unassigned voxels and dropped the distinct-label count. Both were injected temporarily and removed.
+
+### 10.2 Departure from section 6.2: place voxels by coordinate
+
+Section 6.2 proposed copying leaf masks word by word, with a bit-by-bit copy as the safe fallback,
+and section 9 flagged the word copy as resting on an unverified assumption. **Neither form removes
+that assumption**: both write destination offset `n` for source offset `n`, so both are correct only
+if the two libraries agree on what `n` means.
+
+The implementation converts through coordinates instead -- NanoVDB's `OffsetToLocalCoord` out,
+OpenVDB's `LeafNode::coordToOffset` in -- so each library applies its own convention and the copy is
+correct whether or not they agree. Cost is negligible: the conversion is under 0.2 s at 18.5 M
+voxels, against tens of seconds for the segmentation it feeds.
+
+### 10.3 Cost
+
+| case | GPU labeling | union-find oracle | conversion | OpenVDB segmentation |
+| --- | ---: | ---: | ---: | ---: |
+| one mesh, pruned | 0.48 ms | 58 ms | 2.5 ms | 12.6 ms |
+| three meshes merged, pruned | 0.94 ms | 217 ms | 8.0 ms | 27.8 ms |
+| dense mesh, coarse, pruned | 4.8 ms | 1.88 s | 58 ms | 7.53 s |
+| dense mesh, medium, pruned | 12.6 ms | 5.91 s | 163 ms | 34.8 s |
+| dense mesh, fine, pruned | -- | -- | -- | **> 30 min, killed** |
+
+The finest case has 79,734,227 active voxels in 525,245 leaves and 333,703 components. Without
+`--openvdb-oracle` the same run completes, so the OpenVDB stage is what does not finish, not the
+labeling or the union-find oracle.
+
+Two things follow.
+
+**The prediction of section 5.3 holds.** Between the coarse and medium cases the component count
+grows only 1.19x while the segmentation cost grows 4.6x. Components x leaves grows 3.6x over the
+same pair, so that product tracks the cost far better than any single quantity does, though it still
+under-predicts -- treat it as a lower bound on growth rather than a law. Extrapolating it to the
+finest case gives 134x the medium case, i.e. over an hour, consistent with what was observed.
+
+**A gate on size would not work.** The medium case has 77x the voxels of the single-mesh case and
+takes 2,760x as long. Voxel count, leaf count and component count each fail as predictors on their
+own; the product of the last two is the smallest quantity that tracks the cost. Step 6's gate should
+therefore be expressed in components x leaves, which is a change to the plan in section 8.
+
+### 10.4 Still open
+
+- The **tile rejection path of section 7.2 is untested**. `countActiveTiles` returns zero on every
+  input this example can build, because the grids come from a leaf-only rasterization and prune, so
+  the reporting branch has never been taken.
+- The baseline **downloads the label array a second time**, duplicating the download the union-find
+  oracle already performs. Section 7.4's suggestion of sharing one traversal is not implemented.
 
 ---
 

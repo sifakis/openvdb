@@ -1228,10 +1228,10 @@ MeshToGrid<BuildT, ResourceT>::getHandleAndUDF(const GridBufferT& buffer, const 
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-template<typename BuildT>
+template<typename BuildT, typename ResourceT>
 template<typename GridBufferT, typename SidecarBufferT>
 std::tuple<GridHandle<GridBufferT>, SidecarBufferT, SidecarBufferT>
-MeshToGrid<BuildT>::getHandleAndUDFAndIndex(const GridBufferT& buffer, const SidecarBufferT&)
+MeshToGrid<BuildT, ResourceT>::getHandleAndUDFAndIndex(const GridBufferT& buffer, const SidecarBufferT&)
 {
     cudaStreamSynchronize(mStream);
 
@@ -1382,7 +1382,12 @@ MeshToGrid<BuildT>::getHandleAndUDFAndIndex(const GridBufferT& buffer, const Sid
     cudaStreamSynchronize(mStream);
 
     return { std::move(handle), std::move(udfBuffer), std::move(indexBuffer) };
-} // MeshToGrid<BuildT>::getHandleAndUDFAndIndex
+} // MeshToGrid<BuildT, ResourceT>::getHandleAndUDFAndIndex
+
+// Undefine utility macro for cub functions
+#ifdef CALL_CUBS
+#undef CALL_CUBS
+#endif
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 

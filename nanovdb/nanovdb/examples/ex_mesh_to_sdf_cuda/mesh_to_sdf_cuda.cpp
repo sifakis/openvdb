@@ -88,7 +88,8 @@ SDFResult validateMeshToSdf(const SdfPipeline*                 pipeline,
                             const double*                      analyticSpheres = nullptr,
                             int                                numAnalyticSpheres = 0,
                             const double*                      analyticBoxes = nullptr,
-                            int                                numAnalyticBoxes = 0);
+                            int                                numAnalyticBoxes = 0,
+                            bool                               analyticUnion = false);
 
 /// @brief Dump the Polyscope visualization of a built pipeline to `<path>` (+ `<path>.fill`).
 void exportMeshToSdf(const SdfPipeline* pipeline, const std::string& path);
@@ -212,7 +213,8 @@ static SDFResult runPipeline(const std::string& name,
                             const std::vector<nanovdb::Vec3i>& triangles,
                             float voxelSize, float bandWidth,
                             const double* analyticSpheres, int numAnalyticSpheres,
-                            const double* analyticBoxes = nullptr, int numAnalyticBoxes = 0)
+                            const double* analyticBoxes = nullptr, int numAnalyticBoxes = 0,
+                            bool analyticUnion = false)
 {
     std::cout << "\n================ " << name << " : " << points.size() << " verts, "
               << triangles.size() << " tris (voxelSize=" << voxelSize
@@ -223,7 +225,8 @@ static SDFResult runPipeline(const std::string& name,
     SdfPipeline* pipeline = buildMeshToSdf(points, triangles, map, bandWidth);
     if (const char* visPath = std::getenv("CC_EXPORT_VIS")) exportMeshToSdf(pipeline, visPath);
     SDFResult result = validateMeshToSdf(pipeline, points, triangles,
-                                         analyticSpheres, numAnalyticSpheres, analyticBoxes, numAnalyticBoxes);
+                                         analyticSpheres, numAnalyticSpheres, analyticBoxes, numAnalyticBoxes,
+                                         analyticUnion);
     freeSdfPipeline(pipeline);
     return result;
 }
@@ -394,6 +397,38 @@ static int runSelfTests(const std::string& which, float voxelSize, float bandWid
         check("0 full-domain sign query mismatches", r.fullDomainMismatches == 0);
     }
 
+    // Two spheres whose surfaces INTERSECT: the case Ken raised in the 2026-08-18 weekly. Everything
+    // is one connected band, so connectivity alone cannot tell the union's boundary from the two caps
+    // buried inside it, and OpenVDB spends a whole pass (ValidateIntersectingVoxels +
+    // RemoveSelfIntersectingSurface) deleting exactly those. REPORT ONLY: the analytic oracle here is
+    // even-odd, so it calls the lens-shaped intersection EXTERIOR, whereas the union solid calls it
+    // interior -- the two ground truths genuinely disagree on this input, which is half the point of
+    // running it. Read the numbers, do not assert on them.
+    if (which == "--overlapping-spheres") {
+        std::vector<nanovdb::Vec3f> P; std::vector<nanovdb::Vec3i> T;
+        const float s  = 0.5f * voxelSize;
+        const float R1 = 20.0f * voxelSize, R2 = 15.0f * voxelSize;
+        const float d  = 25.0f * voxelSize;            // |R1-R2| < d < R1+R2  =>  surfaces cross
+        const nanovdb::Vec3f C1(s, s, s);
+        const nanovdb::Vec3f C2(s + d, s, s);
+        makeUVSphere(C1, R1, 128, 256, P, T);
+        makeUVSphere(C2, R2, 128, 256, P, T);
+        const double spheres[8] = { double(C1[0]), double(C1[1]), double(C1[2]), double(R1),
+                                    double(C2[0]), double(C2[1]), double(C2[2]), double(R2) };
+        const SDFResult r = runPipeline("OVERLAPPING-SPHERES", P, T, voxelSize, bandWidth, spheres, 2,
+                                        nullptr, 0, /*analyticUnion=*/true);
+
+        std::cout << "  overlapping-spheres observations (REPORT ONLY, nothing asserted):\n";
+        std::cout << "    closed surfaces (un-pruned components) : " << r.surfaceComponents << "\n";
+        std::cout << "    CC global components                   : " << r.globalComponents << "\n";
+        std::cout << "    analytic (even-odd) sign mismatches     : " << r.analyticConfidentMismatches
+                  << "   <- expected non-zero: even-odd calls the lens exterior\n";
+        std::cout << "    OpenVDB sign mismatches                 : " << r.confidentSignMismatches
+                  << "   <- OpenVDB deletes the buried caps; we keep them\n";
+        std::cout << "    barrier-signing mismatches (CPU mirror) : " << r.barrierMismatches << "\n";
+        std::cout << "    surface-merge mismatches                : " << r.mergeMismatches << "\n";
+    }
+
     // Five separated spheres of different radii, scattered over all three axes rather than strung
     // along one. Only one of them owns the global min-x voxel, so every other sphere's outer shell is
     // signed correctly only if each surface really gets its own exterior seed.
@@ -531,7 +566,7 @@ int main(int argc, char* argv[])
         if (argc < 2)
             throw std::runtime_error("usage: " + std::string(argv[0]) +
                                      " <input.obj | --cube | --sphere | --big-sphere | --selftest |"
-                                     " --two-spheres | --multi-spheres | --nested-spheres |"
+                                     " --two-spheres | --overlapping-spheres | --multi-spheres | --nested-spheres |"
                                      " --triple-nested | --multi-nested> [voxelSize] [bandWidth]\n"
                                      "   or: " + std::string(argv[0]) +
                                      " <--nested-shells | --many-spheres> <n> [voxelSize] [bandWidth]\n"
@@ -576,7 +611,8 @@ int main(int argc, char* argv[])
 
         // In-code analytic self-tests / probes (no .obj). Default voxelSize 0.02.
         if (arg1 == "--cube" || arg1 == "--sphere" || arg1 == "--big-sphere" ||
-            arg1 == "--selftest" || arg1 == "--two-spheres" || arg1 == "--multi-spheres" ||
+            arg1 == "--selftest" || arg1 == "--two-spheres" || arg1 == "--overlapping-spheres" ||
+            arg1 == "--multi-spheres" ||
             arg1 == "--nested-spheres" || arg1 == "--triple-nested" ||
             arg1 == "--multi-nested") {
             const float vs = (argc > 2) ? std::stof(argv[2]) : 0.02f;

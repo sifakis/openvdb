@@ -706,7 +706,8 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
                const double*                      analyticSpheres,   // numSpheres × {Cx,Cy,Cz,R} world, or nullptr
                int                                numAnalyticSpheres,
                const double*                      analyticBoxes,     // numBoxes × {Cx,Cy,Cz,halfExtent} world, or nullptr
-               int                                numAnalyticBoxes)
+               int                                numAnalyticBoxes,
+               bool                               analyticUnion)     // true: union semantics, false: even-odd
 {
     SDFResult result;
     using BuildT = nanovdb::ValueOnIndex;
@@ -1201,25 +1202,37 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
     const bool haveAnalytic = (analyticSpheres && numAnalyticSpheres > 0) ||
                               (analyticBoxes   && numAnalyticBoxes   > 0);
     const double vsWorld = map.getVoxelSize()[0];
+    // Ground truth for a set of primitives, under one of two conventions -- which one is right depends
+    // on the input, and they disagree exactly where primitives overlap:
+    //
+    //   even-odd (default)  a point inside an even number of primitives is EXTERIOR. This is what the
+    //                       pipeline computes for nested shells, so it is the right truth whenever the
+    //                       primitives are disjoint or strictly nested.
+    //   union               a point inside ANY primitive is INTERIOR, with the conventional min of the
+    //                       signed distances. Correct when primitives INTERSECT, where even-odd would
+    //                       call the overlap region exterior.
     auto analyticDist = [&](double px, double py, double pz) -> double {
-        double mag = HUGE_VAL;   // distance to the nearest primitive surface
+        double mag = HUGE_VAL;   // distance to the nearest primitive surface (even-odd magnitude)
+        double sdf = HUGE_VAL;   // min of the signed distances (union)
         int    inside = 0;       // how many primitives contain the point
+        auto accumulate = [&](double di) {
+            if (di < 0.0) ++inside;
+            if (std::fabs(di) < mag) mag = std::fabs(di);
+            if (di < sdf) sdf = di;
+        };
         for (int s = 0; s < numAnalyticSpheres; ++s) {
             const double Cx = analyticSpheres[4*s+0], Cy = analyticSpheres[4*s+1],
                          Cz = analyticSpheres[4*s+2], R  = analyticSpheres[4*s+3];
-            const double di = std::sqrt((px-Cx)*(px-Cx) + (py-Cy)*(py-Cy) + (pz-Cz)*(pz-Cz)) - R;
-            if (di < 0.0) ++inside;
-            if (std::fabs(di) < mag) mag = std::fabs(di);
+            accumulate(std::sqrt((px-Cx)*(px-Cx) + (py-Cy)*(py-Cy) + (pz-Cz)*(pz-Cz)) - R);
         }
         for (int b = 0; b < numAnalyticBoxes; ++b) {
             const double ax = std::fabs(px - analyticBoxes[4*b+0]),
                          ay = std::fabs(py - analyticBoxes[4*b+1]),
                          az = std::fabs(pz - analyticBoxes[4*b+2]);
-            const double di = std::max(ax, std::max(ay, az)) - analyticBoxes[4*b+3];
-            if (di < 0.0) ++inside;
-            if (std::fabs(di) < mag) mag = std::fabs(di);
+            accumulate(std::max(ax, std::max(ay, az)) - analyticBoxes[4*b+3]);
         }
-        return (inside & 1) ? -mag : mag;   // even-odd
+        if (analyticUnion) return sdf;
+        return (inside & 1) ? -mag : mag;
     };
 
     if (haveAnalytic) {
@@ -1247,7 +1260,9 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
         result.analyticChecked             = true;
         result.analyticConfidentMismatches = aMis;
         result.analyticInShellTies         = aTie;
-        std::cout << "Analytic even-odd sign check:           " << (aMis == 0 ? "PASS" : "FAIL")
+        std::cout << (analyticUnion ? "Analytic union sign check:              "
+                                    : "Analytic even-odd sign check:           ")
+                  << (aMis == 0 ? "PASS" : "FAIL")
                   << " (" << origActive << " orig voxels, " << aMis << " mismatches beyond shell";
         if (aMis) std::cout << " (max " << maxAVox << " vox)";
         std::cout << ", " << aTie << " in-shell ties)\n";

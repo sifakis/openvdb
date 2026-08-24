@@ -37,6 +37,7 @@
 #include <cstdlib>    // std::getenv
 #include <fstream>    // std::ofstream (visualization export)
 #include <iomanip>   // std::setw (convergence report)
+#include <chrono>
 #include <iostream>
 #include <memory>     // std::unique_ptr (SdfPipeline)
 #include <random>    // std::mt19937 (convergence probe)
@@ -1100,8 +1101,12 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
 
         // Match our band width (exterior + interior); the signed flood fill makes signs valid everywhere.
         const float halfWidth = std::max(bandWidth, 3.0f);
+        const auto ovT0 = std::chrono::steady_clock::now();
         openvdb::FloatGrid::Ptr ls =
             openvdb::tools::meshToLevelSet<openvdb::FloatGrid>(*xform, ovPoints, ovTris, halfWidth);
+        const auto ovT1 = std::chrono::steady_clock::now();
+        std::cout << "OpenVDB meshToLevelSet: "
+                  << std::chrono::duration<double, std::milli>(ovT1 - ovT0).count() << " ms\n";
         auto ovAcc = ls->getConstAccessor();
 
         // Sign is inherently method-dependent within the barrier shell (|distance| < √3/2 voxel — the

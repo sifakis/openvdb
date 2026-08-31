@@ -683,6 +683,11 @@ SdfPipeline* buildMeshToSdf(const std::vector<nanovdb::Vec3f>& points,
     p->sdf->setNarrowBandWidth(bandWidth);
     // CC_BARRIER=ball selects ball-intersection certification for the barrier voxels instead of the
     // closest-point heuristic. Both are timed under the same label so the two runs are comparable.
+    // CC_OFFSET=<world units> dilates the surface before signing, i.e. the pipeline solves for the
+    // signed distance to { x : udf(x) == offset }. This is the operation a shrink-wrap / dilation
+    // pipeline asks for, and it is exact on a sphere, which is what the analytic check below uses.
+    if (const char* o = std::getenv("CC_OFFSET")) p->sdf->setOffset(std::stof(o));
+
     if (const char* m = std::getenv("CC_BARRIER"))
         if (std::string(m) == "ball")
             p->sdf->setBarrierSigning(MeshToSDFT::BarrierSigning::Ball);
@@ -844,6 +849,7 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
 {
     SDFResult result;
     using BuildT = nanovdb::ValueOnIndex;
+    const float analyticOffset = std::getenv("CC_OFFSET") ? std::stof(std::getenv("CC_OFFSET")) : 0.f;
     using Traits = nanovdb::util::cuda::DeviceGridTraits<BuildT>;
 
     const auto&                  origHandle   = p->sdf->gridHandle();
@@ -1474,7 +1480,7 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
     // exact for a box (it underestimates the Euclidean distance outside near corners, which only widens
     // the tie band — the safe direction). Signs are compared in the confident region (|d| >= √3/2
     // voxel); the shell is method-dependent and only reported.
-    const bool haveAnalytic = (analyticSpheres && numAnalyticSpheres > 0) ||
+    bool haveAnalytic = (analyticSpheres && numAnalyticSpheres > 0) ||
                               (analyticBoxes   && numAnalyticBoxes   > 0);
     const double vsWorld = map.getVoxelSize()[0];
     // Ground truth for a set of primitives, under one of two conventions -- which one is right depends
@@ -1509,6 +1515,23 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
         if (analyticUnion) return sdf;
         return (inside & 1) ? -mag : mag;
     };
+
+    // Dilating a sphere of radius R by t gives exactly a sphere of radius R+t, so inflating the
+    // oracle's radii turns the existing analytic check into a correctness proof for the offset.
+    // A dilated BOX is not a bigger box -- its edges become rounded -- so the L-infinity box oracle
+    // would report false mismatches, and the check is skipped rather than trusted.
+    std::vector<double> offsetSpheres;
+    if (haveAnalytic && analyticOffset != 0.f) {
+        if (numAnalyticBoxes > 0) {
+            std::cout << "Analytic check skipped: an offset box has rounded edges, which the "
+                         "box oracle does not model.\n";
+            haveAnalytic = false;
+        } else {
+            offsetSpheres.assign(analyticSpheres, analyticSpheres + 4 * numAnalyticSpheres);
+            for (int i = 0; i < numAnalyticSpheres; ++i) offsetSpheres[4*i+3] += double(analyticOffset);
+            analyticSpheres = offsetSpheres.data();
+        }
+    }
 
     if (haveAnalytic) {
         const double vs         = vsWorld;

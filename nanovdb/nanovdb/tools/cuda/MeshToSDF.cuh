@@ -63,6 +63,7 @@
 #include <nanovdb/util/cuda/Timer.h>
 #include <nanovdb/util/cuda/Util.h>                    // operatorKernel, cudaCheck
 
+#include <chrono>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -109,6 +110,22 @@ public:
     /// @brief Set desired width of the narrow band
     /// @param bandWidth Narrow band width in cell units
     void setNarrowBandWidth(float bandWidth = 3.f) { mBandWidth = bandWidth; }
+
+    /// @brief How the barrier voxels -- the ones the surface passes through, which the connected
+    ///        components stage has to remove and therefore leaves unsigned -- get their sign.
+    enum class BarrierSigning {
+        Heuristic,  ///< mirror of OpenVDB's ComputeIntersectingVoxelSign: find an exterior neighbour
+                    ///< and test whether this voxel lies in the same half space about that
+                    ///< neighbour's closest surface point. One-sided and approximate near curvature.
+        Ball        ///< certify by ball intersection: the ball of radius udf(V) about a voxel cannot
+                    ///< meet the surface, so two overlapping such balls prove their centres share a
+                    ///< side. Two-sided and exact, but leaves a few percent of voxels unproven right
+                    ///< at the surface, which then default to interior.
+    };
+
+    /// @brief Choose the barrier signing method (default Heuristic).
+    void setBarrierSigning(BarrierSigning m) { mBarrierSigning = m; }
+
 
     /// @brief Run the whole pipeline. Afterwards the accessors below describe a complete sign field
     ///        over the rasterized band, extended off it by the invert masks.
@@ -160,6 +177,15 @@ public:
     uint64_t componentCount(uint32_t i) const { return mSurfaces[i].ccLabels.second; }//todo: surfaceComponentCount or something else
     /// @brief Surface @a i's nearest-triangle index sidecar, re-indexed onto its carved band.
     const uint32_t* surfaceIndex(uint32_t i) const; //todo: more specifically surfaceNearestTriangleIndex
+    /// @brief Surface @a i's unsigned-distance sidecar (WORLD units), re-indexed onto its carved band.
+    const float*    surfaceUdf(uint32_t i) const;
+
+    /// @brief Wall-clock milliseconds spent in each of build()'s five phases, indexed by the step
+    ///        numbers in the private section below (0 = rasterize ... 4 = fillOnOriginal). Valid after build(). Each phase
+    ///        is bracketed by a stream sync, so the numbers add up to build()'s own wall time and
+    ///        include host-side work, not just kernel time. Useful for separating the cost of
+    ///        rasterization -- normally the bulk of the pipeline -- from everything downstream.
+    const float* phaseMs() const { return mPhaseMs; }
 
 private:
 
@@ -184,9 +210,8 @@ private:
     void composeByInclusion();           // step 4
     void fillOnOriginal();               // step 5 TODO: let's rename it to more specific name?
 
-    // Surface i's grid / sidecars: its own carved band, or the rasterized band when uncarved.
+    // Surface i's grid: its own carved band, or the rasterized band when uncarved.
     const GridT*    surfaceGrid(uint32_t i) const;
-    const float*    surfaceUdf(uint32_t i) const;
 
     const nanovdb::Vec3f* mPoints{nullptr};
     uint32_t              mPointCount{0};
@@ -196,6 +221,8 @@ private:
     cudaStream_t          mStream{0};
     int                   mVerbose{0};
     float                 mBandWidth{3.f};
+    BarrierSigning        mBarrierSigning{BarrierSigning::Heuristic};
+    float                 mPhaseMs[5]{};   // per-phase wall time from the last build(), see phaseMs()
     // Sizes below use A = the rasterized band's active voxel count and N = the closed-surface count.
     // Every per-voxel sidecar is A+1 long and indexed by leaf.getValue(n), so slot 0 is the background.
     Handle mGridHandle;   // step 1: the rasterized narrow band, all surfaces together
@@ -289,6 +316,25 @@ public:
     void signBarrier(const GridT* d_grid, const uint32_t* d_index,
                      const nanovdb::Vec3f* d_points, const nanovdb::Vec3i* d_triangles,
                      const nanovdb::Map& map); //TODO: SignBarrierVoxels
+
+    /// @brief EXPERIMENTAL alternative to signBarrier: decide the barrier voxels by ball-intersection
+    ///        certification instead of the closest-point heuristic. Runs to a fixed point from both
+    ///        the exterior and the interior seeds and leaves anything it cannot prove at 0, so the
+    ///        two can be compared voxel by voxel. Does not touch deviceSignedVoxelSign().
+    /// @param d_grid    the grid whose barrier voxels are to be decided
+    /// @param d_udf     unsigned distance sidecar for @a d_grid, WORLD units
+    /// @param voxelSize world-space voxel size
+    /// @param maxRounds cap on Jacobi rounds; measured worst case is 6
+    void signBarrierByBalls(const GridT* d_grid, const float* d_udf, float voxelSize,
+                            int maxRounds = 32);
+
+    /// @brief Result of signBarrierByBalls(): +1 ext / -1 int / 0 = not proven either way.
+    int8_t* deviceBallVoxelSign() { return static_cast<int8_t*>(mBallVoxelSign.deviceData()); }
+    /// @brief Voxels signBarrierByBalls() could prove nothing about, and voxels it proved both ways
+    ///        (which the lemma forbids, so a non-zero count means the surface is not closed there).
+    uint32_t ballUndecided() const { return mBallUndecided; }
+    uint32_t ballContradictions() const { return mBallContradictions; }
+    uint32_t ballRounds() const { return mBallRounds; }
 
     /// @brief Step 6 (chunk A, leaf level): build the per-leaf invert masks that sign the INACTIVE
     ///        voxels inside materialized leaves — bit ON => interior (-background), bit OFF =>
@@ -389,6 +435,8 @@ private:
     nanovdb::cuda::DeviceBuffer  mVoxelSign;       // (derived activeVoxelCount+1) × int8_t: +1 ext / -1 int
     nanovdb::cuda::DeviceBuffer  mOriginalVoxelSign; // (orig activeVoxelCount+1) × int8_t: +1/-1 non-barrier, 0 barrier
     nanovdb::cuda::DeviceBuffer  mSignedVoxelSign;   // (orig activeVoxelCount+1) × int8_t: +1/-1 everywhere (barriers signed)
+    nanovdb::cuda::DeviceBuffer  mBallVoxelSign;     // (orig activeVoxelCount+1) × int8_t: experimental ball result
+    uint32_t                     mBallUndecided{0}, mBallContradictions{0}, mBallRounds{0};
     nanovdb::cuda::DeviceBuffer  mLeafInvertMask;    // nodeCount[0] × Mask<3>: inactive-voxel interior bits
     nanovdb::cuda::DeviceBuffer  mLowerInvertMask;   // nodeCount[1] × Mask<4>: childless-lower-tile interior bits
     nanovdb::cuda::DeviceBuffer  mUpperInvertMask;   // nodeCount[2] × Mask<5>: childless-upper-tile interior bits
@@ -540,6 +588,121 @@ barrierExteriorProof(uint64_t nv, const nanovdb::Coord& nijk, const nanovdb::Vec
     nanovdb::Vec3d dq = q_xyz - cp; dq.normalize();   // surface -> q
     return dn.dot(dq) > 0.0;                           // same side => q is exterior
 }
+
+
+/// @brief One Jacobi round of ball-intersection certification (EXPERIMENTAL, runs beside
+///        SignBarrierFunctor rather than replacing it).
+///
+/// The lemma: the open ball of radius udf(V) about a voxel centre cannot meet the surface, since
+/// every point of it is strictly nearer to V than V is to the surface. Two such balls that overlap
+/// form a connected surface-free set, so their centres lie on the same side of it. Overlap is
+/// exactly |V1 - V0| < d0 + d1, so a voxel of unknown sign may take the sign of any already-certain
+/// neighbour satisfying that. Unlike the closest-point heuristic this is a proof rather than a test,
+/// it touches no triangle geometry, and it works from interior seeds as readily as exterior ones.
+///
+/// Tangency must be excluded. Balls that touch without overlapping say nothing, and on axis-aligned
+/// input exact tangency is common enough that float rounding would decide it arbitrarily -- and
+/// differently on the two sides, which shows up as a voxel certified both ways. Hence the tolerance.
+///
+/// Jacobi: reads @a d_labelIn, writes @a d_labelOut, so the result does not depend on execution
+/// order. A voxel certified from both sides contradicts the lemma and is left undecided and counted;
+/// it can only happen where the surface is not closed.
+template <typename BuildT>
+struct BallCertifyFunctor
+{
+    static constexpr int MaxThreadsPerBlock         = LEAF_SIZE;
+    static constexpr int MinBlocksPerMultiprocessor = 1;
+
+    __device__ void operator()(
+        const NanoGrid<BuildT>* d_grid,
+        const int8_t*           d_labelIn,   // +1 ext / -1 int / 0 undecided
+        int8_t*                 d_labelOut,
+        const float*            d_udf,       // unsigned distance sidecar, WORLD units
+        float                   voxelSize,
+        uint32_t*               d_changed,       // incremented once per newly decided voxel
+        uint32_t*               d_contradictions)
+    {
+        const int leafID = blockIdx.x, n = threadIdx.x;
+        const auto& leaf = d_grid->tree().template getFirstNode<0>()[leafID];
+        if (!leaf.isActive(uint32_t(n))) return;
+
+        const uint64_t qv = leaf.getValue(uint32_t(n));
+        const int8_t   ql = d_labelIn[qv];
+        if (ql != int8_t(0)) { d_labelOut[qv] = ql; return; }   // already certain: carry through
+
+        const nanovdb::Coord local  = nanovdb::NanoLeaf<BuildT>::OffsetToLocalCoord(uint32_t(n));
+        const int            lx = local[0], ly = local[1], lz = local[2];
+        const nanovdb::Coord origin = leaf.origin();
+        const float          dq  = d_udf[qv];
+        const float          eps = 1e-5f * voxelSize;
+
+        bool ext = false, inr = false;
+
+        // The ball test needs only the neighbour's distance and its label, so both passes reduce to
+        // two loads and a comparison against the offset length -- one of three constants.
+        auto consider = [&] __device__ (uint64_t nv, int dx, int dy, int dz) {
+            const int8_t ln = d_labelIn[nv];
+            if (ln == int8_t(0)) return;                                   // neighbour not certain yet
+            const float len = sqrtf(float(dx*dx + dy*dy + dz*dz)) * voxelSize;
+            if (d_udf[nv] + dq <= len + eps) return;                       // balls do not overlap
+            if (ln > 0) ext = true; else inr = true;
+        };
+
+        // Pass 1: neighbours inside this leaf, straight off the leaf buffer.
+        for (int dx = -1; dx <= 1; ++dx) {
+            const int nx = lx + dx; if (nx < 0 || nx > 7) continue;
+            for (int dy = -1; dy <= 1; ++dy) {
+                const int ny = ly + dy; if (ny < 0 || ny > 7) continue;
+                for (int dz = -1; dz <= 1; ++dz) {
+                    const int nz = lz + dz; if (nz < 0 || nz > 7) continue;
+                    if (!dx && !dy && !dz) continue;
+                    const uint32_t nOff = (uint32_t(nx) << 6) | (uint32_t(ny) << 3) | uint32_t(nz);
+                    if (leaf.isActive(nOff)) consider(leaf.getValue(nOff), dx, dy, dz);
+                }
+            }
+        }
+
+        // Pass 2: the rest of the 3x3x3, which crosses the leaf boundary. One reused accessor.
+        if (lx == 0 || lx == 7 || ly == 0 || ly == 7 || lz == 0 || lz == 7) {
+            auto acc = d_grid->getAccessor();
+            for (int dx = -1; dx <= 1; ++dx) {
+                const int nx = lx + dx;
+                for (int dy = -1; dy <= 1; ++dy) {
+                    const int ny = ly + dy;
+                    for (int dz = -1; dz <= 1; ++dz) {
+                        const int nz = lz + dz;
+                        if (!dx && !dy && !dz) continue;
+                        if (nx >= 0 && nx <= 7 && ny >= 0 && ny <= 7 && nz >= 0 && nz <= 7) continue;
+                        const nanovdb::Coord nijk(origin[0] + nx, origin[1] + ny, origin[2] + nz);
+                        if (acc.isActive(nijk)) consider(acc.getValue(nijk), dx, dy, dz);
+                    }
+                }
+            }
+        }
+
+        if (ext && inr) { atomicAdd(d_contradictions, 1u); d_labelOut[qv] = int8_t(0); return; }
+        if (!ext && !inr) { d_labelOut[qv] = int8_t(0); return; }
+        d_labelOut[qv] = ext ? int8_t(1) : int8_t(-1);
+        atomicAdd(d_changed, 1u);
+    }
+};
+
+/// @brief Turn ball-certification labels into a complete sign field. Anything the certification
+///        could not prove is called interior, matching the heuristic's own fallback; the count is
+///        reported so a caller can see how much of the field rests on that default rather than on a
+///        proof.
+struct BallFinalizeFunctor
+{
+    __device__ void operator()(size_t v, const int8_t* d_ball, int8_t* d_signOut,
+                               uint32_t* d_undecided) const
+    {
+        if (v == 0) { d_signOut[0] = int8_t(1); return; }   // slot 0 = background = exterior
+        const int8_t l = d_ball[v];
+        if (l != int8_t(0)) { d_signOut[v] = l; return; }
+        d_signOut[v] = int8_t(-1);
+        atomicAdd(d_undecided, 1u);
+    }
+};
 
 /// @brief Sign every barrier voxel (sign == 0) in place, as a faithful mirror of OpenVDB's
 ///        ComputeIntersectingVoxelSign. One block per leaf, one thread per voxel:
@@ -1343,6 +1506,71 @@ void SurfaceSigner<BuildT>::signBarrier(const GridT* d_grid, const uint32_t* d_i
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
+/// Ball-intersection certification of the barrier voxels. Seeds are the non-barrier signs already in
+/// deviceOriginalVoxelSign(); each Jacobi round lets an undecided voxel take the sign of any certain
+/// neighbour whose ball overlaps its own. Ping-pongs two label buffers so no round reads what it
+/// writes, and stops when a round decides nothing.
+template <typename BuildT>
+void SurfaceSigner<BuildT>::signBarrierByBalls(const GridT* d_grid, const float* d_udf,
+                                               float voxelSize, int maxRounds)
+{
+    const uint64_t activeCount = activeCountOf(d_grid);
+    const uint32_t leafCount   = leafCountOf(d_grid);
+    const std::size_t bytes    = std::size_t(activeCount + 1) * sizeof(int8_t);
+
+    mBallVoxelSign = nanovdb::cuda::DeviceBuffer::create(bytes, nullptr, false);
+    mBallUndecided = mBallContradictions = mBallRounds = 0;
+    if (leafCount == 0) return;
+
+    // Seed both buffers from the non-barrier signs; barrier voxels start at 0.
+    auto scratch = nanovdb::cuda::DeviceBuffer::create(bytes, nullptr, false);
+    cudaCheck(cudaMemcpyAsync(mBallVoxelSign.deviceData(), deviceOriginalVoxelSign(), bytes,
+                              cudaMemcpyDeviceToDevice, mStream));
+    cudaCheck(cudaMemcpyAsync(scratch.deviceData(), deviceOriginalVoxelSign(), bytes,
+                              cudaMemcpyDeviceToDevice, mStream));
+
+    auto  counters = nanovdb::cuda::DeviceBuffer::create(2 * sizeof(uint32_t), nullptr, false);
+    auto* d_counters = static_cast<uint32_t*>(counters.deviceData());
+
+    int8_t* labelIn  = static_cast<int8_t*>(mBallVoxelSign.deviceData());
+    int8_t* labelOut = static_cast<int8_t*>(scratch.deviceData());
+
+    using Op = BallCertifyFunctor<BuildT>;
+    if (mVerbose==1) mTimer.start("Sign: barrier voxels (ball certification)");
+    uint32_t host[2] = {0, 0};
+    for (int r = 0; r < maxRounds; ++r) {
+        cudaCheck(cudaMemsetAsync(d_counters, 0, 2 * sizeof(uint32_t), mStream));
+        util::cuda::operatorKernel<Op><<<leafCount, Op::MaxThreadsPerBlock, 0, mStream>>>(
+            d_grid, labelIn, labelOut, d_udf, voxelSize, d_counters, d_counters + 1);
+        cudaCheckError();
+        cudaCheck(cudaMemcpyAsync(host, d_counters, 2 * sizeof(uint32_t), cudaMemcpyDeviceToHost, mStream));
+        cudaCheck(cudaStreamSynchronize(mStream));
+        std::swap(labelIn, labelOut);
+        mBallContradictions = host[1];              // recomputed every round, so the last one stands
+        if (host[0] == 0) { mBallRounds = uint32_t(r); break; }
+        mBallRounds = uint32_t(r + 1);
+    }
+    if (mVerbose==1) mTimer.stop();
+
+    // labelIn holds the newest labels; make sure that is the buffer we hand back.
+    if (labelIn != mBallVoxelSign.deviceData())
+        cudaCheck(cudaMemcpyAsync(mBallVoxelSign.deviceData(), labelIn, bytes,
+                                  cudaMemcpyDeviceToDevice, mStream));
+
+    // Complete the field: unproven voxels default to interior, and are counted.
+    mSignedVoxelSign = nanovdb::cuda::DeviceBuffer::create(bytes, nullptr, false);
+    cudaCheck(cudaMemsetAsync(d_counters, 0, sizeof(uint32_t), mStream));
+    util::cuda::lambdaKernel<<<(unsigned int)((activeCount + 256) / 256), 256, 0, mStream>>>(
+        activeCount + 1, BallFinalizeFunctor{}, deviceBallVoxelSign(), deviceSignedVoxelSign(),
+        d_counters);
+    cudaCheckError();
+    cudaCheck(cudaMemcpyAsync(&mBallUndecided, d_counters, sizeof(uint32_t),
+                              cudaMemcpyDeviceToHost, mStream));
+    cudaCheck(cudaStreamSynchronize(mStream));
+}// SurfaceSigner<BuildT>::signBarrierByBalls
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
 template <typename BuildT>
 void SurfaceSigner<BuildT>::fillLeafInvertMask(const GridT* d_grid, const int8_t* d_sign)
 {
@@ -1520,12 +1748,30 @@ void SurfaceSigner<BuildT>::fillRootInteriorMask(const GridT* d_grid, const int8
 template <typename BuildT>
 void MeshToSDF<BuildT>::build()
 {
+    // Time each phase into mPhaseMs (see phaseMs()). The stream sync before every mark makes the
+    // marks true phase boundaries rather than kernel-launch boundaries, so the five numbers sum to
+    // build()'s wall time; the syncs themselves cost five per build and are not measurable here.
+    int  phase = 0;
+    auto mark  = [&, prev = std::chrono::steady_clock::time_point{}]() mutable {
+        cudaCheck(cudaStreamSynchronize(mStream));
+        const auto now = std::chrono::steady_clock::now();
+        if (phase) mPhaseMs[phase - 1] = std::chrono::duration<float, std::milli>(now - prev).count();
+        prev = now;
+        ++phase;
+    };
+
+    mark();
     this->rasterize();          // mesh -> narrow band, with the UDF and nearest-triangle sidecars
+    mark();
     this->partition();          // components of the UN-pruned band = one per closed surface
+    mark();
     for (uint32_t i = 0; i < uint32_t(mSurfaces.size()); ++i)
         this->signSurface(i);   // carve surface i out, prune its barrier shell, label, and sign it alone
+    mark();
     this->composeByInclusion(); // nesting parity per surface, then merge the signs onto the band
+    mark();
     this->fillOnOriginal();     // extend those signs off the band as invert masks
+    mark();
 }// MeshToSDF<BuildT>::build
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -1628,7 +1874,10 @@ void MeshToSDF<BuildT>::signSurface(uint32_t surface)
     //     barrier shell that (b) set aside.
     sf.signer->signNonBarrier(d_derived, sf.ccLabels.first);
     sf.signer->injectSignsToOriginal(d_grid, d_derived);
-    sf.signer->signBarrier(d_grid, this->surfaceIndex(surface), mPoints, mTriangles, mMap);
+    if (mBarrierSigning == BarrierSigning::Ball)
+        sf.signer->signBarrierByBalls(d_grid, this->surfaceUdf(surface), float(voxelSize));
+    else
+        sf.signer->signBarrier(d_grid, this->surfaceIndex(surface), mPoints, mTriangles, mMap);
 
     // (d) Extend the sign off the band. That is what lets the inclusion test query this field at
     //     another surface's band — and, for a single-surface mesh, it is already the finished result.

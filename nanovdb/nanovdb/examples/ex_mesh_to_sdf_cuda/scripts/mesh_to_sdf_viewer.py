@@ -23,17 +23,22 @@ Structures (each an on/off toggle in the Polyscope panel):
   barrier voxels          the surface shell (grey; 'sign' / 'udf' available)
   interior voxels (...)   step-6 deep interior, one box per tree level (leaf 1³ / lower 8³ / ...)
 
-If a '<dump>.ovdb' companion is present (written when the example is built with OpenVDB), each band /
-barrier voxel also gets an OpenVDB comparison:
-  * openvdb sign   - OpenVDB meshToLevelSet's sign at that voxel (same color scheme as 'sign').
-  * ovdb mismatch  - where our sign disagrees with OpenVDB: RED beyond the √3/2 shell (a real
-                     disagreement), soft YELLOW within the shell (expected/method-dependent), neutral
-                     grey where they agree.
-  * openvdb value  - OpenVDB's raw signed level-set value (sequential scalar).
+If a '<dump>.ovdb' companion is present, each band / barrier voxel also gets a second opinion to
+compare our sign against. The companion says which one it holds, and the quantities are named after
+it -- 'openvdb ...' or 'ball ...':
+  * <other> sign     - the other method's sign at that voxel (same color scheme as 'sign'; a mid grey
+                       means it did not decide).
+  * <other> mismatch - RED a real disagreement, soft YELLOW an expected/undecided one, neutral grey
+                       where the two agree. Which is which depends on the comparison:
+                         ours vs OpenVDB (written when the example is built with OpenVDB) - red is a
+                           differing sign beyond the √3/2 shell, yellow a tie inside it
+                         ball vs shipped (written with CC_VIS_BALL=1) - red is a sign the ball
+                           certification proves and the shipped one contradicts, yellow its residue
+  * <other> value    - OpenVDB's raw signed level-set value, or the UDF, as a sequential scalar.
 
 Options:
   --sign            start with the unified interior/exterior sign coloring on every structure
-  --mismatch        start with the 'ovdb mismatch' coloring on (needs the '<dump>.ovdb' companion)
+  --mismatch        start with the mismatch coloring on (needs the '<dump>.ovdb' companion)
   --alpha A         start every structure at transparency A (0..1); tune per structure in the UI
   --no-barrier      hide barrier voxels (cc == -1)
   --no-fill         skip the step-6 interior-fill boxes (the '<dump>.fill' companion)
@@ -79,23 +84,28 @@ FILL_LEVELS = [
 # all fill levels). Interior = warm, exterior = cool.
 INTERIOR_RGB = (1.00, 0.55, 0.10)   # sign -1
 EXTERIOR_RGB = (0.15, 0.45, 1.00)   # sign +1
+UNDECIDED_RGB = (0.45, 0.45, 0.48)  # sign 0 — undecided (a certification companion only)
 
 
 def sign_to_rgb(sign):
     rgb = np.empty((sign.shape[0], 3), dtype=np.float32)
     rgb[sign < 0] = INTERIOR_RGB
-    rgb[sign >= 0] = EXTERIOR_RGB
+    rgb[sign > 0] = EXTERIOR_RGB
+    rgb[sign == 0] = UNDECIDED_RGB   # only a certification companion produces these; ours are always +/-1
     return rgb
 
 
-# OpenVDB comparison (from the '<dump>.ovdb' companion): per-voxel disagreement class -> RGB. The
-# beyond-shell mismatch is the one to spot — our sign genuinely differs from OpenVDB where OpenVDB is
-# confident. In-shell disagreement is expected (method-dependent within the √3/2-voxel shell), so it
-# gets a separate, calmer color.
+# Comparison companion ('<dump>.ovdb'): per-voxel class -> RGB. Class 1 is always the one to spot and
+# class 2 the expected/benign one, but what they mean depends on which comparison the file holds (its
+# magic, see load_ovdb):
+#   CCOVDB01, ours vs OpenVDB   1 = our sign differs where OpenVDB is confident (beyond the √3/2
+#                                   shell); 2 = differs inside the shell, where a tie is expected
+#   CCBALL01, ball vs shipped   1 = the ball certification proves a sign the shipped one contradicts;
+#                                   2 = the certification proved nothing there (residue)
 MISMATCH_RGB = {
-    0: (0.22, 0.22, 0.25),   # agree                                   — neutral dark grey
-    1: (1.00, 0.10, 0.10),   # our sign != OpenVDB, BEYOND the shell   — real disagreement (red)
-    2: (0.95, 0.85, 0.20),   # disagree WITHIN the √3/2 shell          — expected tie (soft yellow)
+    0: (0.22, 0.22, 0.25),   # agree / consistent      — neutral dark grey
+    1: (1.00, 0.10, 0.10),   # real disagreement       — red
+    2: (0.95, 0.85, 0.20),   # expected / undecided    — soft yellow
 }
 
 
@@ -144,11 +154,11 @@ def load_ovdb(path, expect_n):
     array, or None (with a warning) if its count disagrees with the .ccvis dump."""
     import os
     if not os.path.exists(path):
-        return None
+        return None, None
     with open(path, "rb") as f:
         magic = f.read(8)
-        if magic != b"CCOVDB01":
-            sys.exit(f"bad magic {magic!r} in {path} (not a CCOVDB01 dump)")
+        if magic not in (b"CCOVDB01", b"CCBALL01"):
+            sys.exit(f"bad magic {magic!r} in {path} (not a CCOVDB01/CCBALL01 dump)")
         (m,) = struct.unpack("<Q", f.read(8))
         (_vs,) = struct.unpack("<d", f.read(8))
         rec = np.fromfile(f, dtype=REC_OVDB, count=m)
@@ -156,9 +166,9 @@ def load_ovdb(path, expect_n):
         sys.exit(f"truncated ovdb: header says {m}, read {rec.shape[0]}")
     if m != expect_n:
         print(f"WARNING: {path} has {m} records but the .ccvis dump has {expect_n}; skipping the "
-              f"OpenVDB comparison (regenerate both from the same run).")
-        return None
-    return rec
+              f"comparison (regenerate both from the same run).")
+        return None, None
+    return rec, magic
 
 
 def rank_components(cc, sign):
@@ -199,8 +209,8 @@ def main():
     ap.add_argument("--no-side-by-side", dest="side_by_side", action="store_false",
                     help="force a single overlaid panel even when the '.ovdb' companion is present")
     ap.add_argument("--mismatch", action="store_true",
-                    help="start with the OpenVDB 'ovdb mismatch' coloring enabled (red = our sign "
-                         "disagrees with OpenVDB beyond the √3/2 shell; needs the '<dump>.ovdb' companion)")
+                    help="start with the companion's 'mismatch' coloring enabled (red = real "
+                         "disagreement, yellow = expected/undecided; needs the '<dump>.ovdb' companion)")
     ap.add_argument("--sign", action="store_true",
                     help="start with the unified sign coloring (interior/exterior) enabled on EVERY "
                          "structure — active voxels and all fill levels — to verify signs across levels")
@@ -216,15 +226,26 @@ def main():
     udf = rec["udf"].astype(np.float32)
 
     # Optional OpenVDB comparison companion — positionally aligned with `rec` (before any filtering).
-    ovdb = None if args.no_ovdb else load_ovdb(args.dump + ".ovdb", rec.shape[0])
+    ovdb, ov_magic = (None, None) if args.no_ovdb else load_ovdb(args.dump + ".ovdb", rec.shape[0])
+    # The companion holds one of two comparisons (see the magic). Everything below is identical for
+    # both -- only the wording on the structures/quantities changes, so the panel never mislabels
+    # which pair of signs the red voxels come from.
+    ball = ov_magic == b"CCBALL01"
+    other = "ball" if ball else "openvdb"          # whose sign the right-hand panel shows
+    Q_SIGN, Q_MM, Q_VAL = f"{other} sign", f"{other} mismatch", f"{other} value"
     ov_sign = ov_mm = ov_val = None
     if ovdb is not None:
         ov_sign = ovdb["sign"].astype(np.int32)
         ov_mm = ovdb["mismatch"].astype(np.int32)
         ov_val = ovdb["value"].astype(np.float32)
-        beyond, inshell = int((ov_mm == 1).sum()), int((ov_mm == 2).sum())
-        print(f"OpenVDB comparison ('.ovdb'): {beyond} beyond-shell sign mismatches (RED), "
-              f"{inshell} in-shell ties (yellow), {rec.shape[0] - beyond - inshell} agree.")
+        c1, c2 = int((ov_mm == 1).sum()), int((ov_mm == 2).sum())
+        if ball:
+            print(f"Ball comparison ('.ovdb'): {c1} voxels where the ball certification disagrees "
+                  f"with the shipped sign (RED), {c2} the certification left unproven (yellow), "
+                  f"{rec.shape[0] - c1 - c2} agree.")
+        else:
+            print(f"OpenVDB comparison ('.ovdb'): {c1} beyond-shell sign mismatches (RED), "
+                  f"{c2} in-shell ties (yellow), {rec.shape[0] - c1 - c2} agree.")
 
     def _filter_ovdb(keep):
         nonlocal ov_sign, ov_mm, ov_val
@@ -292,10 +313,10 @@ def main():
     def add_ovdb_quantities(g, mask):
         if ovdb is None:
             return
-        g.add_color_quantity("openvdb sign", sign_to_rgb(ov_sign[mask]), defined_on="cells", enabled=False)
-        g.add_color_quantity("ovdb mismatch", mismatch_to_rgb(ov_mm[mask]), defined_on="cells",
+        g.add_color_quantity(Q_SIGN, sign_to_rgb(ov_sign[mask]), defined_on="cells", enabled=False)
+        g.add_color_quantity(Q_MM, mismatch_to_rgb(ov_mm[mask]), defined_on="cells",
                              enabled=args.mismatch)
-        g.add_scalar_quantity("openvdb value", ov_val[mask], defined_on="cells", cmap="coolwarm",
+        g.add_scalar_quantity(Q_VAL, ov_val[mask], defined_on="cells", cmap="coolwarm",
                               enabled=False)
 
     # The right-hand "openvdb: ..." panel — same cells, shifted origin, colored by OpenVDB's sign (its
@@ -306,9 +327,9 @@ def main():
             go.set_color((0.65, 0.65, 0.68))
         go.add_color_quantity("sign", sign_to_rgb(ov_sign[mask]), defined_on="cells",
                               enabled=not args.mismatch)
-        go.add_scalar_quantity("openvdb value", ov_val[mask], defined_on="cells", cmap="coolwarm",
+        go.add_scalar_quantity(Q_VAL, ov_val[mask], defined_on="cells", cmap="coolwarm",
                                enabled=False)
-        go.add_color_quantity("ovdb mismatch", mismatch_to_rgb(ov_mm[mask]), defined_on="cells",
+        go.add_color_quantity(Q_MM, mismatch_to_rgb(ov_mm[mask]), defined_on="cells",
                               enabled=args.mismatch)
         if args.alpha is not None:
             go.set_transparency(args.alpha)
@@ -324,7 +345,7 @@ def main():
         if args.alpha is not None:
             g.set_transparency(args.alpha)
         if side_by_side:
-            register_ovdb_panel("openvdb: band voxels", band, grey=False)
+            register_ovdb_panel(f"{other}: band voxels", band, grey=False)
 
     if barrier.any():
         g = ps.register_sparse_volume_grid(prefix + "barrier voxels", origin, cw, ijk[barrier],
@@ -337,7 +358,7 @@ def main():
         if args.alpha is not None:
             g.set_transparency(args.alpha)
         if side_by_side:
-            register_ovdb_panel("openvdb: barrier voxels", barrier, grey=True)
+            register_ovdb_panel(f"{other}: barrier voxels", barrier, grey=True)
 
     # --split-cc: one structure per component (subset of the signed band), disabled by default, so you
     # can isolate a single component. Disable "active · signed band" and enable the one you want.
@@ -378,13 +399,15 @@ def main():
               f"boxes (all interior, sign -).")
 
     print("\nPolyscope structures (toggle each in the left panel):")
-    band_quants = "'cc' / 'sign' / 'udf'" + (" / 'openvdb sign' / 'ovdb mismatch'" if ovdb is not None else "")
+    band_quants = "'cc' / 'sign' / 'udf'" + (f" / '{Q_SIGN}' / '{Q_MM}'" if ovdb is not None else "")
+    rhs = "the ball certification" if ball else "OpenVDB meshToLevelSet"
     if side_by_side:
-        print("  == two panels, side by side (left = ours, right = OpenVDB, shifted +X) ==")
+        print(f"  == two panels, side by side (left = ours, right = {other}, shifted +X) ==")
         print(f"  ours: band voxels        our result — color by {band_quants}")
         print("  ours: barrier voxels     our surface shell (grey; 'sign'/'udf')")
-        print("  openvdb: band voxels     OpenVDB meshToLevelSet — color by 'sign' / 'openvdb value'")
-        print("  openvdb: barrier voxels  OpenVDB surface shell")
+        # pad to the same column as the "ours: ..." rows above, whatever the other method is called
+        print(f"  {other + ': band voxels':<24} {rhs} — color by 'sign' / '{Q_VAL}'")
+        print(f"  {other + ': barrier voxels':<24} {rhs}, surface shell")
     else:
         print(f"  band voxels              non-barrier voxels — color by {band_quants}")
         print("  barrier voxels           the surface shell (grey; 'sign'/'udf' available)")
@@ -394,10 +417,14 @@ def main():
         print(f"  {prefix}cc NN ...                one component at a time (disabled by default)")
     print("  tip: run with --sign to color everything by interior/exterior at once.")
     if ovdb is not None:
-        print("  tip: run with --mismatch to highlight where our sign disagrees with OpenVDB "
-              "(red = beyond the shell).")
+        if ball:
+            print("  tip: run with --mismatch to highlight the certification (red = it proves a sign "
+                  "the shipped one contradicts, yellow = it proved nothing there).")
+        else:
+            print("  tip: run with --mismatch to highlight where our sign disagrees with OpenVDB "
+                  "(red = beyond the shell).")
         if not side_by_side:
-            print("  tip: run with --side-by-side for a 1:1 ours-vs-OpenVDB comparison (two panels).")
+            print(f"  tip: run with --side-by-side for a 1:1 ours-vs-{other} comparison (two panels).")
     elif not args.no_ovdb:
         print("  (no '.ovdb' companion found — build with OpenVDB and rerun to get the sign comparison.)")
 

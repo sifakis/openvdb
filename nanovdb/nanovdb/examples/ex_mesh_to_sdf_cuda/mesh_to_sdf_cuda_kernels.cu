@@ -681,7 +681,23 @@ SdfPipeline* buildMeshToSdf(const std::vector<nanovdb::Vec3f>& points,
                                           map);
     p->sdf->setVerbose(1);
     p->sdf->setNarrowBandWidth(bandWidth);
+    // CC_BARRIER=ball selects ball-intersection certification for the barrier voxels instead of the
+    // closest-point heuristic. Both are timed under the same label so the two runs are comparable.
+    if (const char* m = std::getenv("CC_BARRIER"))
+        if (std::string(m) == "ball")
+            p->sdf->setBarrierSigning(MeshToSDFT::BarrierSigning::Ball);
     p->sdf->build();
+
+    // Per-phase wall time. Rasterization normally dominates the total, so it is reported separately
+    // from the four phases downstream of it -- a change to any one of those is invisible in the
+    // total but plainly visible in the "steps 2-5" subtotal.
+    {
+        const float* ph = p->sdf->phaseMs();
+        const float  post = ph[1] + ph[2] + ph[3] + ph[4];
+        std::cout << "Pipeline phases (ms): rasterize=" << ph[0] << " partition=" << ph[1]
+                  << " signSurface=" << ph[2] << " compose=" << ph[3] << " fill=" << ph[4]
+                  << " | steps2-5=" << post << " total=" << (ph[0] + post) << "\n";
+    }
 
     printGridDiagnostics(p->sdf->gridHandle(), "Rasterized UDF grid");
     std::cout << "Closed surfaces (un-pruned components): " << p->sdf->surfaceCount() << "\n";
@@ -699,6 +715,123 @@ void freeSdfPipeline(SdfPipeline* p) { delete p; }
 // ---------------------------------------------------------------------------------------------------
 // VALIDATE : independent CPU oracles + OpenVDB / analytic cross-checks over a built pipeline. Reads the
 // live device arrays through the pipeline (read-only) and returns the metrics summary.
+
+// ---------------------------------------------------------------------------------------------------
+// DIAGNOSTIC (measures only, changes nothing): would the ball-intersection test decide the barrier
+// voxels, and would it agree with what the pipeline shipped?
+//
+// The lemma: the open ball of radius udf(V) around a voxel centre cannot meet the surface, since any
+// point inside it is strictly closer to V than V is to the surface. Two such balls that overlap form
+// a connected surface-free set, so their centres lie on the same side. Overlap is exactly
+//
+//     |V1 - V0| < d0 + d1
+//
+// so a voxel of unknown sign inherits the sign of any already-certain neighbour satisfying it. Unlike
+// the closest-point heuristic this is a proof, it needs no triangle geometry, and it is symmetric --
+// interior seeds certify interior voxels just as exterior seeds certify exterior ones.
+//
+// Everything is in voxel units, so the offset lengths are constants and the comparison is one add.
+// Seeds are the non-barrier voxels (signIn != 0); barrier voxels start undecided and are frozen once
+// decided. Jacobi, so the result does not depend on visit order.
+struct BallCertifyStats {
+    std::size_t barrier = 0, certExt = 0, certInt = 0, contradictions = 0, disagree = 0, rounds = 0;
+    double residueMaxUdf = 0.0, residueSumUdf = 0.0;   // voxel units, over undecided barrier voxels
+    std::size_t residue = 0;
+    // Where the proof and the shipped sign differ, how far from the surface was it? Disagreement
+    // hugging the surface is the ambiguous zone; disagreement far from it would be alarming.
+    double disagreeMaxUdf = 0.0, disagreeSumUdf = 0.0;
+    std::vector<std::tuple<double, uint64_t, int8_t>> worst;   // (udf, slot, ball verdict)
+};
+
+template <typename GridT>
+void cpuBallCertify(const GridT* g,
+                    const std::vector<int8_t>& signIn,     // seeds: +-1 non-barrier, 0 barrier
+                    const std::vector<int8_t>& gpuSigned,  // what the pipeline shipped
+                    const std::vector<float>&  udfWorld,   // distance sidecar, WORLD units
+                    double voxelSize, int radius, BallCertifyStats& st)
+{
+    const auto&    tree      = g->tree();
+    const uint32_t leafCount = tree.nodeCount(0);
+    const auto*    leaves    = tree.getFirstLeaf();
+    auto           acc       = g->getAccessor();
+
+    // Offsets and their lengths, in voxel units.
+    struct Off { int dx, dy, dz; double len; };
+    std::vector<Off> offs;
+    for (int dx = -radius; dx <= radius; ++dx)
+        for (int dy = -radius; dy <= radius; ++dy)
+            for (int dz = -radius; dz <= radius; ++dz) {
+                if (!dx && !dy && !dz) continue;
+                offs.push_back({dx, dy, dz, std::sqrt(double(dx*dx + dy*dy + dz*dz))});
+            }
+
+    std::vector<int8_t> label(signIn.begin(), signIn.end());   // frozen once non-zero
+    std::vector<float>  udf(udfWorld.size());
+    for (std::size_t i = 0; i < udfWorld.size(); ++i) udf[i] = float(udfWorld[i] / voxelSize);
+
+    // Gather the undecided voxels once; the set only shrinks.
+    std::vector<std::pair<nanovdb::Coord, uint64_t>> pending;
+    for (uint32_t li = 0; li < leafCount; ++li) {
+        const auto& leaf = leaves[li];
+        const nanovdb::Coord o = leaf.origin();
+        for (int n = 0; n < 512; ++n) {
+            if (!leaf.isActive(uint32_t(n))) continue;
+            const uint64_t v = leaf.getValue(uint32_t(n));
+            if (signIn[v] != int8_t(0)) continue;
+            pending.emplace_back(o + nanovdb::Coord(n >> 6, (n >> 3) & 7, n & 7), v);
+        }
+    }
+    st.barrier += pending.size();
+
+    std::vector<std::pair<uint64_t, int8_t>> decided;   // Jacobi: applied after each round
+    while (!pending.empty()) {
+        decided.clear();
+        for (const auto& [ijk, qv] : pending) {
+            const double dq = udf[qv];
+            bool ext = false, inr = false;
+            for (const Off& e : offs) {
+                const nanovdb::Coord nijk(ijk[0] + e.dx, ijk[1] + e.dy, ijk[2] + e.dz);
+                if (!acc.isActive(nijk)) continue;
+                const uint64_t nv = acc.getValue(nijk);
+                const int8_t   ln = label[nv];
+                if (ln == int8_t(0)) continue;                  // neighbour not certain yet
+                // Strict, with a tolerance. Tangent balls touch without overlapping, so the lemma
+                // says nothing about them; on axis-aligned input exact tangency is common and float
+                // rounding would otherwise decide it arbitrarily -- and inconsistently on the two
+                // sides, which shows up as a contradiction.
+                if (double(udf[nv]) + dq <= e.len + 1e-5) continue;
+                if (ln > 0) ext = true; else inr = true;
+            }
+            if (ext && inr) { ++st.contradictions; continue; }   // the lemma forbids this
+            if (ext || inr) decided.emplace_back(qv, ext ? int8_t(1) : int8_t(-1));
+        }
+        if (decided.empty()) break;
+        for (const auto& [v, l] : decided) {
+            label[v] = l;
+            if (l > 0) ++st.certExt; else ++st.certInt;
+            if (gpuSigned[v] != l) {
+                ++st.disagree;
+                const double d = udf[v];
+                st.disagreeSumUdf += d;
+                if (d > st.disagreeMaxUdf) st.disagreeMaxUdf = d;
+                st.worst.emplace_back(d, v, l);
+            }
+        }
+        ++st.rounds;
+        std::vector<std::pair<nanovdb::Coord, uint64_t>> next;
+        next.reserve(pending.size());
+        for (const auto& pr : pending) if (label[pr.second] == int8_t(0)) next.push_back(pr);
+        pending.swap(next);
+    }
+
+    for (const auto& [ijk, qv] : pending) {
+        (void)ijk;
+        const double d = udf[qv];
+        ++st.residue; st.residueSumUdf += d;
+        if (d > st.residueMaxUdf) st.residueMaxUdf = d;
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------
 SDFResult validateMeshToSdf(const SdfPipeline* p,
                const std::vector<nanovdb::Vec3f>& points,
@@ -745,6 +878,13 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
     uint64_t    totalComponents = 0, derActiveTotal = 0;
     std::size_t adjViolations = 0, signMismatch = 0, injMismatch = 0, barrierMism = 0;
     std::size_t barrierCount = 0, residualZeros = 0, ambiguous = 0;
+    BallCertifyStats ballStats[2];   // [0] = 26-neighbourhood, [1] = 5x5x5
+    double      ballGpuMs = 0.0;
+    std::size_t ballGpuDecided = 0, ballGpuUndec = 0, ballGpuDiff = 0, ballGpuContra = 0;
+    uint32_t    ballGpuRounds = 0;
+    std::vector<int8_t> ballForVis;         // ball labels on the original grid, single-surface only
+    std::size_t ballGpuResExt = 0;          // residue the heuristic had called exterior
+    double      ballGpuResExtSum = 0.0, ballGpuResExtMax = 0.0;   // their distance, voxel units
     uint64_t    nInterior = 0, nExterior = 0, nSigned = 0, nBarrier = 0;
     bool        repPass = true;
 
@@ -880,6 +1020,59 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
         barrierCount  += bCount;
         residualZeros += bZeros;
         ambiguous     += bAmbig;
+
+        // ---- DIAGNOSTIC: the same certification on the GPU, compared against the CPU run above
+        //      and against the heuristic the pipeline shipped ----
+        if (std::getenv("CC_BALL_GPU")) {
+            std::vector<float> hSurfUdfForResidue(surfActive + 1);
+            cudaCheck(cudaMemcpy(hSurfUdfForResidue.data(), p->sdf->surfaceUdf(si),
+                                 std::size_t(surfActive + 1) * sizeof(float), cudaMemcpyDeviceToHost));
+            auto&      signer2 = p->sdf->surfaceSigner(si);
+            const auto t0 = std::chrono::steady_clock::now();
+            signer2.signBarrierByBalls(d_surf, p->sdf->surfaceUdf(si), float(map.getVoxelSize()[0]));
+            const auto t1 = std::chrono::steady_clock::now();
+            std::vector<int8_t> ball(surfActive + 1);
+            cudaCheck(cudaMemcpy(ball.data(), signer2.deviceBallVoxelSign(),
+                                 std::size_t(surfActive + 1) * sizeof(int8_t), cudaMemcpyDeviceToHost));
+            // Split the residue by what the heuristic said about it. Defaulting the residue to
+            // interior only changes the voxels the heuristic had called exterior, so that count --
+            // and how far from the surface those voxels sit -- is the whole cost of the policy.
+            std::size_t decided = 0, undec = 0, diff = 0;
+            for (std::size_t v = 1; v <= surfActive; ++v) {
+                if (gpuSurfSign[v] != int8_t(0)) continue;          // non-barrier
+                if (ball[v] == int8_t(0)) {
+                    ++undec;
+                    if (gpuSurfSigned[v] == int8_t(1)) {
+                        ++ballGpuResExt;
+                        const double d = double(hSurfUdfForResidue[v]) / map.getVoxelSize()[0];
+                        ballGpuResExtSum += d;
+                        if (d > ballGpuResExtMax) ballGpuResExtMax = d;
+                    }
+                    continue;
+                }
+                ++decided;
+                if (ball[v] != gpuSurfSigned[v]) ++diff;
+            }
+            ballGpuMs      += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            ballGpuDecided += decided;
+            ballGpuUndec   += undec;
+            ballGpuDiff    += diff;
+            ballGpuContra  += signer2.ballContradictions();
+            ballGpuRounds   = std::max(ballGpuRounds, signer2.ballRounds());
+
+            // With a single closed surface the carve is skipped, so this surface's slots ARE the
+            // original grid's slots and the labels can be reused for the Polyscope companion.
+            if (p->sdf->surfaceCount() == 1) ballForVis = ball;
+        }
+
+        if (!std::getenv("CC_SKIP_BALL")) {
+            std::vector<float> hSurfUdf(surfActive + 1);
+            cudaCheck(cudaMemcpy(hSurfUdf.data(), p->sdf->surfaceUdf(si),
+                                 std::size_t(surfActive + 1) * sizeof(float), cudaMemcpyDeviceToHost));
+            for (int r = 1; r <= 2; ++r)
+                cpuBallCertify(h_surf, gpuSurfSign, gpuSurfSigned, hSurfUdf,
+                               map.getVoxelSize()[0], r, ballStats[r-1]);
+        }
         if (gpuSurfSigned[0] != int8_t(1)) ++residualZeros;
 
         // ---- Contribution to the merge oracle: this surface's signs, negated iff its depth is odd ----
@@ -917,6 +1110,58 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
     std::cout << "CC barrier sign validation:             " << (barrierPass ? "PASS" : "FAIL") << " ("
               << barrierCount << " barrier voxels, " << barrierMism << " mismatches, "
               << ambiguous << " surface-tangent ties, " << residualZeros << " residual zeros)\n";
+
+    // ---- DIAGNOSTIC report: the GPU ball certification ----
+    if (std::getenv("CC_BALL_GPU")) {
+        const std::size_t barrier = ballGpuDecided + ballGpuUndec;
+        std::cout << "Ball certification (GPU, 26-nbr):    " << ballGpuDecided << "/" << barrier
+                  << " barrier voxels ("
+                  << (barrier ? 100.0 * double(ballGpuDecided) / double(barrier) : 0.0) << "%)"
+                  << ", " << ballGpuDiff << " disagree with shipped"
+                  << ", " << ballGpuContra << " contradictions"
+                  << ", " << ballGpuRounds << " rounds"
+                  << ", " << ballGpuMs << " ms\n";
+        std::cout << "    residue " << ballGpuUndec << ", of which " << ballGpuResExt
+                  << " the heuristic called exterior";
+        if (ballGpuResExt)
+            std::cout << " (udf max " << ballGpuResExtMax << " mean "
+                      << (ballGpuResExtSum / double(ballGpuResExt)) << " vox)";
+        std::cout << "\n";
+    }
+
+    // ---- DIAGNOSTIC report: ball-intersection certification vs the shipped signs ----
+    if (!std::getenv("CC_SKIP_BALL") && ballStats[0].barrier > 0) {
+        for (int r = 0; r < 2; ++r) {
+            const BallCertifyStats& b = ballStats[r];
+            const std::size_t cert = b.certExt + b.certInt;
+            const double pct = b.barrier ? 100.0 * double(cert) / double(b.barrier) : 0.0;
+            std::cout << "Ball certification (" << (r ? "5x5x5" : "26-nbr") << "):"
+                      << (r ? "          " : "         ")
+                      << cert << "/" << b.barrier << " barrier voxels (" << pct << "%)"
+                      << ", ext=" << b.certExt << " int=" << b.certInt
+                      << ", " << b.disagree << " disagree with shipped"
+                      << ", " << b.contradictions << " contradictions"
+                      << ", " << b.rounds << " rounds";
+            if (b.residue)
+                std::cout << ", residue " << b.residue << " (udf max " << b.residueMaxUdf
+                          << " mean " << (b.residueSumUdf / double(b.residue)) << " vox)";
+            if (b.disagree)
+                std::cout << ", disagreement udf max " << b.disagreeMaxUdf
+                          << " mean " << (b.disagreeSumUdf / double(b.disagree)) << " vox";
+            std::cout << "\n";
+            if (r == 0 && !b.worst.empty() && std::getenv("CC_BALL_WORST")) {
+                auto w = b.worst;
+                std::sort(w.begin(), w.end(), [](auto& a, auto& c){ return std::get<0>(a) > std::get<0>(c); });
+                std::size_t nHigh = 0;
+                for (auto& e : w) if (std::get<0>(e) > 0.5) ++nHigh;
+                std::cout << "    worst disagreements (" << nHigh << " of " << b.disagree
+                          << " beyond 0.5 vox):\n";
+                for (std::size_t i = 0; i < std::min<std::size_t>(8, w.size()); ++i)
+                    std::cout << "      udf=" << std::get<0>(w[i]) << " vox  slot=" << std::get<1>(w[i])
+                              << "  ball=" << int(std::get<2>(w[i])) << " shipped=" << -int(std::get<2>(w[i])) << "\n";
+            }
+        }
+    }
 
     // ---- Validate the merge (per-surface fields -> one sign array on the original grid) ----
     // The surfaces partition the original grid's active voxels, so gathering their signs must cover
@@ -1125,6 +1370,13 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
         // highlight exactly the disagreements this validator reports. Additive: no OpenVDB, no file.
         struct OvdbRec { float value; int32_t sign; int32_t mismatch; };  // mismatch: 0 agree, 1 beyond-shell, 2 in-shell
         const char*          ovdbVisPath = std::getenv("CC_EXPORT_VIS");
+        const bool           ballVis     = std::getenv("CC_VIS_BALL") && !ballForVis.empty();
+        std::vector<float>   udfForVis;
+        if (ballVis) {
+            udfForVis.resize(origActive + 1);
+            cudaCheck(cudaMemcpy(udfForVis.data(), p->sdf->deviceUDF(),
+                                 std::size_t(origActive + 1) * sizeof(float), cudaMemcpyDeviceToHost));
+        }
         std::vector<OvdbRec> ovdbRecs;
         if (ovdbVisPath) ovdbRecs.reserve(origActive);
 
@@ -1156,7 +1408,19 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
                                       << " val=" << val << " (" << v << " vox)\n";
                     }
                 }
-                if (ovdbVisPath) ovdbRecs.push_back({ val, int32_t(ovSign), mismatch });
+                if (ovdbVisPath) {
+                    // CC_VIS_BALL repurposes the companion to show ball-vs-heuristic instead of
+                    // ours-vs-OpenVDB. The viewer's mismatch palette then reads: grey they agree,
+                    // red the proof and the heuristic differ, yellow the proof decided nothing.
+                    if (ballVis) {
+                        const uint64_t slot = oleaf.getValue(n);
+                        const int8_t   b    = ballForVis[slot];
+                        const int32_t  cls  = (b == int8_t(0)) ? 2 : (b != ourSign ? 1 : 0);
+                        ovdbRecs.push_back({ udfForVis[slot], int32_t(b), cls });
+                    } else {
+                        ovdbRecs.push_back({ val, int32_t(ovSign), mismatch });
+                    }
+                }
             }
         }
         std::cout << "OpenVDB sign cross-check:               " << (realMismatch == 0 ? "PASS" : "FAIL")
@@ -1174,15 +1438,26 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
             std::ofstream oout(ovdbPath, std::ios::binary);
             if (!oout) { std::cerr << "CC_EXPORT_VIS: cannot open " << ovdbPath << " for writing\n"; }
             else {
-                // Layout: char magic[8]="CCOVDB01"; uint64 N; double voxelSize; N×{float value,int32 sign,int32 mismatch}.
+                // Layout: char magic[8]; uint64 N; double voxelSize; N×{float value,int32 sign,int32 mismatch}.
+                // The magic says which comparison the records hold, so the viewer can label them:
+                // "CCOVDB01" = ours vs OpenVDB, "CCBALL01" = ball certification vs the shipped sign.
                 const uint64_t M = ovdbRecs.size();
-                oout.write("CCOVDB01", 8);
+                oout.write(ballVis ? "CCBALL01" : "CCOVDB01", 8);
                 oout.write(reinterpret_cast<const char*>(&M), sizeof(M));
                 oout.write(reinterpret_cast<const char*>(&voxelSize), sizeof(double));
                 oout.write(reinterpret_cast<const char*>(ovdbRecs.data()), ovdbRecs.size() * sizeof(OvdbRec));
-                std::cout << "CC_EXPORT_VIS: wrote " << M << " OpenVDB-comparison records to " << ovdbPath
-                          << " (" << realMismatch << " beyond-shell mismatches, " << shellTie
-                          << " in-shell ties)\n";
+                std::cout << "CC_EXPORT_VIS: wrote " << M
+                          << (ballVis ? " ball-comparison records to " : " OpenVDB-comparison records to ")
+                          << ovdbPath;
+                if (ballVis) {
+                    std::size_t disagree = 0, residue = 0;
+                    for (const auto& r : ovdbRecs) { if (r.mismatch == 1) ++disagree; else if (r.mismatch == 2) ++residue; }
+                    std::cout << " (" << disagree << " disagree with the shipped sign, " << residue
+                              << " left unproven)\n";
+                } else {
+                    std::cout << " (" << realMismatch << " beyond-shell mismatches, " << shellTie
+                              << " in-shell ties)\n";
+                }
             }
         }
     }

@@ -433,7 +433,17 @@ int main(int argc, char* argv[])
         // ---- SW_FULL=1: the whole shrink wrap, once per offset stage ----
         if (std::getenv("SW_FULL")) {
             const float maxLength = wrap.getBBox(vtx).extents()[wrap.getBBox(vtx).maxExtent()];
-            const float maxVoxel  = maxLength / 2.0f;
+            float maxVoxel  = maxLength / 2.0f;
+
+            // The offset stage rasterizes the WHOLE soup at every rung, and its working set grows
+            // with the voxel size, because a band a fixed number of voxels wide covers more world
+            // space the coarser the grid is. On a soup of millions of triangles the coarsest rungs
+            // can therefore exceed device memory. SW_MAX_VOXEL stops the ladder short of them; it
+            // applies to BOTH offset stages, so the comparison stays like for like.
+            if (const char* mv = std::getenv("SW_MAX_VOXEL")) {
+                maxVoxel = std::min(maxVoxel, float(std::atof(mv)));
+                std::cout << "SW_MAX_VOXEL: ladder capped at dx=" << maxVoxel << "\n";
+            }
             const openvdb::tools::ShrinkWrapLimit D;
 
             std::cout << "\n---- full shrink wrap, dx " << voxelSize << " -> " << maxVoxel << " ----\n";

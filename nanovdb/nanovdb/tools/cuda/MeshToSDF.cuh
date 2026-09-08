@@ -70,6 +70,7 @@
 #include <nanovdb/util/cuda/DeviceGridTraits.cuh>
 #include <nanovdb/util/cuda/Timer.h>
 #include <nanovdb/util/cuda/Util.h>                    // operatorKernel, cudaCheck
+#include <nanovdb/tools/cuda/AddBlindData.cuh>
 
 #include <chrono>
 #include <memory>
@@ -184,9 +185,27 @@ public:
     ///          isoValue of the mesh stays materialized and the cost grows accordingly.
     void setIsoValue(float isoValue = 0.f) { mIsoValue = isoValue; }
 
-    /// @brief Run the whole pipeline. Afterwards the accessors below describe a complete sign field
-    ///        over the rasterized band, extended off it by the invert masks.
-    void build();//TODO: change the function name to more intuitive one buildSDF?.
+    /// @brief Run the whole pipeline and return the result as ONE self-contained grid.
+    ///
+    /// Every sidecar the field needs is appended to the returned grid's buffer as blind data, so the
+    /// handle can be passed, stored or written to a file on its own. The channels, in order:
+    ///
+    ///   0 "sdf"           float  per active voxel   sign * distance to the signed surface
+    ///   1 "leaf_invert"   uint64 per leaf x 8       sign of that leaf's INACTIVE voxels
+    ///   2 "lower_invert"  uint64 per lower x 64     sign of that node's childless tiles
+    ///   3 "upper_invert"  uint64 per upper x 512    sign of that node's childless tiles
+    ///   4 "root_interior" uint8  per root cell      sign of regions with no node at all
+    ///   5 "root_extent"   int32  x 6                origin and dims of that cell array
+    ///
+    /// Channel 0 is a narrow-band level set on its own and carries the standard LevelSet semantic.
+    /// Channels 1-5 sign everything the band does not reach, which an index grid cannot store in its
+    /// tiles the way a value grid does; their layout is this pipeline's own and is described above
+    /// rather than by a NanoVDB semantic.
+    ///
+    /// @note The accessors below keep working and keep pointing at the pipeline's own buffers, so the
+    ///       sidecars exist twice until one side is released. Ignore the return value to pay nothing
+    ///       but the bake itself.
+    GridHandle<Buffer> build();//TODO: change the function name to more intuitive one buildSDF?.
 
     /// @brief The rasterized narrow band (all surfaces together), valid after build().
     const GridT* deviceGrid() const { return mGridHandle.template deviceGrid<BuildT>(); }
@@ -268,6 +287,7 @@ private:
     void signSurface(uint32_t surface);  // step 3, once per closed surface
     void composeByInclusion();           // step 4
     void postProcess();                  // step 4b, everything the finished field needs
+    GridHandle<Buffer> bakeBlindData();  // step 6, fold every sidecar into the grid buffer
     void fillOnOriginal();               // step 5 TODO: let's rename it to more specific name?
 
     // Surface i's grid: its own carved band, or the rasterized band when uncarved.
@@ -549,6 +569,18 @@ static constexpr int LEAF_SIZE = 512;  // 8^3 voxels per leaf
 ///        consistent with one, and a contouring pass would put the surface back roughly where the
 ///        isovalue moved it from. Non-barrier interior voxels are already beyond this threshold by the
 ///        barrier test itself, so the clamp only ever bites on barrier voxels signed interior.
+/// @brief CUDA functor: sign * magnitude into a contiguous array, one thread per sidecar slot.
+///        The pipeline keeps the two apart because the stages that decide a sign and the stages that
+///        measure a distance are separate; a consumer wants the product.
+struct SignedDistanceFunctor
+{
+    __device__ void operator()(const uint64_t slot, const float* d_udf, const int8_t* d_sign,
+                               float* d_out) const
+    {
+        d_out[slot] = float(d_sign[slot]) * d_udf[slot];
+    }
+};// sdf_detail::SignedDistanceFunctor
+
 template <typename BuildT>
 struct IsoMagnitudeFunctor
 {
@@ -1982,7 +2014,7 @@ void SurfaceSigner<BuildT>::fillRootInteriorMask(const GridT* d_grid, const int8
 //-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 template <typename BuildT>
-void MeshToSDF<BuildT>::
+typename MeshToSDF<BuildT>::Handle MeshToSDF<BuildT>::
     build()
 {
     // Time each phase into mPhaseMs (see phaseMs()). The stream sync before every mark makes the
@@ -2015,6 +2047,7 @@ void MeshToSDF<BuildT>::
     this->postProcess();         // signs are settled: fold the magnitudes, floor the interior
     this->fillOnOriginal();      // extend those signs off the band as invert masks
     mark();
+    return this->bakeBlindData();
 }// MeshToSDF<BuildT>::build
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -2286,6 +2319,73 @@ void MeshToSDF<BuildT>::postProcess()
     cudaCheck(cudaMemcpyAsync(mUDF.deviceData(), &bg, sizeof(float), cudaMemcpyHostToDevice, mStream));
     cudaCheck(cudaStreamSynchronize(mStream));
 }// MeshToSDF<BuildT>::postProcess
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+/// @details Step 6. Copy every sidecar into the grid's own buffer as blind data, so one handle
+///          carries the whole field. See MeshToSDF::build() for the channel list.
+///
+///          tools::cuda::addBlindData appends one array per call, each time allocating a buffer the
+///          size of everything so far and copying into it, so this walks the chain once. The grid is
+///          small next to the channels -- it is an index grid, and its leaves store no values -- so
+///          the repeated copying costs little; what it buys is that nothing downstream has to be
+///          handed a sidecar separately.
+template <typename BuildT>
+typename MeshToSDF<BuildT>::Handle MeshToSDF<BuildT>::bakeBlindData()
+{
+    using Traits = util::cuda::DeviceGridTraits<BuildT>;
+    namespace tc = nanovdb::tools::cuda;
+
+    const auto*    d_grid = this->deviceGrid();
+    const uint64_t slots  = Traits::getActiveVoxelCount(d_grid) + 1;
+    const auto&    tree   = Traits::getTreeData(d_grid);
+    const uint32_t leaves = tree.mNodeCount[0], lowers = tree.mNodeCount[1], uppers = tree.mNodeCount[2];
+
+    // Channel 0. The pipeline keeps sign and magnitude apart; a consumer wants the product.
+    auto  sdfBuf = Buffer::create(slots * sizeof(float), nullptr, false);
+    auto* d_sdf  = static_cast<float*>(sdfBuf.deviceData());
+    util::cuda::lambdaKernel<<<(unsigned int)((slots + 255) / 256), 256, 0, mStream>>>(
+        slots, sdf_detail::SignedDistanceFunctor{}, this->deviceUDF(), mSign, d_sdf);
+    cudaCheckError();
+
+    Handle h = tc::addBlindData<BuildT, float>(d_grid, d_sdf, slots,
+                   GridBlindDataClass::ChannelArray, GridBlindDataSemantic::LevelSet, "sdf",
+                   Buffer(), mStream);
+
+    // Channels 1-3. A Mask<N> is a flat bit array, so it travels as the uint64 words it already is.
+    auto addMask = [&](const void* d_src, uint64_t words, const char* name) {
+        if (!words) return;
+        h = tc::addBlindData<BuildT, uint64_t>(h.template deviceGrid<BuildT>(),
+                static_cast<const uint64_t*>(d_src), words,
+                GridBlindDataClass::ChannelArray, GridBlindDataSemantic::Unknown, name,
+                Buffer(), mStream);
+    };
+    addMask(this->deviceLeafInvertMask(),  uint64_t(leaves) * (sizeof(nanovdb::Mask<3>) / 8), "leaf_invert");
+    addMask(this->deviceLowerInvertMask(), uint64_t(lowers) * (sizeof(nanovdb::Mask<4>) / 8), "lower_invert");
+    addMask(this->deviceUpperInvertMask(), uint64_t(uppers) * (sizeof(nanovdb::Mask<5>) / 8), "upper_invert");
+
+    // Channels 4-5. The root sidecar covers regions with no node at all, so unlike the masks above it
+    // is not indexed by a node and needs its origin and dims carried alongside.
+    const nanovdb::Coord tileMin = this->rootTileMin(), dims = this->rootTileDims();
+    const uint64_t       cells   = uint64_t(dims[0]) * dims[1] * dims[2];
+    if (cells) {
+        h = tc::addBlindData<BuildT, uint8_t>(h.template deviceGrid<BuildT>(),
+                this->deviceRootInterior(), cells,
+                GridBlindDataClass::ChannelArray, GridBlindDataSemantic::Unknown, "root_interior",
+                Buffer(), mStream);
+
+        const int32_t extent[6] = {tileMin[0], tileMin[1], tileMin[2], dims[0], dims[1], dims[2]};
+        int32_t*      d_extent  = nullptr;
+        cudaCheck(cudaMalloc(&d_extent, sizeof(extent)));
+        cudaCheck(cudaMemcpyAsync(d_extent, extent, sizeof(extent), cudaMemcpyHostToDevice, mStream));
+        cudaCheck(cudaStreamSynchronize(mStream));
+        h = tc::addBlindData<BuildT, int32_t>(h.template deviceGrid<BuildT>(), d_extent, 6,
+                GridBlindDataClass::ChannelArray, GridBlindDataSemantic::Unknown, "root_extent",
+                Buffer(), mStream);
+        cudaCheck(cudaFree(d_extent));
+    }
+    return h;
+}// MeshToSDF<BuildT>::bakeBlindData
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 

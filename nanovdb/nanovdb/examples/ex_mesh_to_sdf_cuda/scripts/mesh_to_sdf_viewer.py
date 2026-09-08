@@ -45,6 +45,20 @@ Options:
   --no-ovdb         ignore the OpenVDB comparison companion even if present
   --split-cc        register EACH connected component as its own structure (toggle individually)
   --cc RANKS        show only these component ranks (comma list, e.g. --cc 2,3,4; rank 0 = largest)
+  --balls           draw the union-of-balls exterior certificate (see below)
+  --ball-max R      with --balls, keep only spheres of radius <= R voxels
+  --mesh OBJ        also load the input surface, to check it against the balls
+  --slice           add a slice plane that cuts the spheres open
+
+The '--balls' view exists because the containment guarantee lives on BALLS, not on cells. Ball
+B(V, udf(V)) has radius equal to V's distance to the surface, so by construction it cannot contain
+surface material -- every sphere is tangent to the input mesh, none swallows a piece of it. Drawing
+the certified-exterior voxels at that radius therefore shows the object the guarantee is about, and
+a sphere seen eating into the mesh means the UDF over-estimated the distance there. Pair it with
+'--mesh' and '--slice':
+
+    CC_EXPORT_VIS=/tmp/bunny.ccvis CC_VIS_BALL=1 CC_BARRIER=ball ./ex_mesh_to_sdf_cuda bunny.obj 0.008
+    python scripts/mesh_to_sdf_viewer.py /tmp/bunny.ccvis --balls --mesh bunny.obj --slice
 
 Binary layout (little-endian), matching exportMeshToSdf() in the .cu:
     char   magic[8] = "CCVIS001"
@@ -171,6 +185,21 @@ def load_ovdb(path, expect_n):
     return rec, magic
 
 
+def load_obj(path):
+    """Minimal OBJ reader: vertex positions and fan-triangulated faces. Everything else ignored."""
+    verts, faces = [], []
+    with open(path) as f:
+        for line in f:
+            if line.startswith("v "):
+                verts.append([float(x) for x in line.split()[1:4]])
+            elif line.startswith("f "):
+                # face entries are "v", "v/vt", "v//vn" or "v/vt/vn"; OBJ indices are 1-based
+                idx = [int(t.split("/")[0]) - 1 for t in line.split()[1:]]
+                for k in range(1, len(idx) - 1):
+                    faces.append([idx[0], idx[k], idx[k + 1]])
+    return np.asarray(verts, dtype=np.float64), np.asarray(faces, dtype=np.int32)
+
+
 def rank_components(cc, sign):
     """Return (rank_of_voxel, table) where table is a list of (rank, cc_id, count, majority_sign)
     sorted by size descending. Barrier voxels (cc<0) keep rank -1."""
@@ -214,6 +243,21 @@ def main():
     ap.add_argument("--sign", action="store_true",
                     help="start with the unified sign coloring (interior/exterior) enabled on EVERY "
                          "structure — active voxels and all fill levels — to verify signs across levels")
+    ap.add_argument("--balls", action="store_true",
+                    help="draw each certified-exterior voxel as a sphere of radius = its UDF, the "
+                         "union-of-balls exterior certificate the containment guarantee is about")
+    ap.add_argument("--ball-max", type=float, default=None, metavar="R",
+                    help="with --balls, keep only spheres whose radius is <= R voxels")
+    ap.add_argument("--slab", type=float, default=None, metavar="W",
+                    help="with --balls, keep only spheres whose centre is within W voxels of the "
+                         "slice plane (a slice view does not need the rest, and dropping them is "
+                         "what keeps the window responsive)")
+    ap.add_argument("--slab-axis", default="z", choices=("x", "y", "z"),
+                    help="axis the --slab is measured along (default z, matching --slice)")
+    ap.add_argument("--mesh", default=None, metavar="OBJ",
+                    help="also load this OBJ (the input surface) to check it against --balls")
+    ap.add_argument("--slice", action="store_true",
+                    help="add a scene slice plane that cuts the spheres open instead of hiding them")
     ap.add_argument("--alpha", type=float, default=None,
                     help="start every structure at this transparency (0=invisible..1=opaque); you can "
                          "still fine-tune per structure with the UI Transparency slider")
@@ -277,8 +321,22 @@ def main():
     import polyscope as ps
 
     ps.init()
+
+    # --balls gives the scene to the spheres, so the voxel structures start hidden (re-enable any of
+    # them in the UI). Every registration below goes through this helper so none is missed.
+    voxel_structs = []
+
+    def reg_grid(*a, **kw):
+        g = ps.register_sparse_volume_grid(*a, **kw)
+        voxel_structs.append(g)
+        return g
+
     ps.set_up_dir("z_up")
-    ps.set_transparency_mode("pretty")   # enables the per-structure Transparency slider in the UI
+    # "pretty" transparency is multi-pass depth peeling: cheap for a few volume grids, but the
+    # dominant per-frame cost once --balls puts hundreds of thousands of sphere impostors on
+    # screen. Only turn it on when transparency is actually going to be used.
+    if args.alpha is not None or not args.balls:
+        ps.set_transparency_mode("pretty")   # enables the per-structure Transparency slider
 
     # Polyscope cell (i,j,k) lower corner at origin + (i,j,k)*cell_width; a NanoVDB voxel center sits
     # at index (i,j,k). Offset origin by half a cell so cell centers land on true voxel centers.
@@ -289,6 +347,9 @@ def main():
     # "ours" panel (not overlaid), colored by OpenVDB's sign. Default ON when the .ovdb companion is
     # present. The copy reuses the same integer cells, only the structure origin is shifted in world X.
     side_by_side = (ovdb is not None) and (args.side_by_side is not False)
+    if side_by_side and args.balls and args.side_by_side is None:
+        # the shifted copy would sit on top of the spheres, which are drawn unshifted
+        side_by_side = False
     if args.side_by_side and ovdb is None:
         print("--side-by-side requested but no '.ovdb' companion loaded; showing a single panel.")
     prefix = "ours: " if side_by_side else ""
@@ -322,7 +383,7 @@ def main():
     # The right-hand "openvdb: ..." panel — same cells, shifted origin, colored by OpenVDB's sign (its
     # 'sign' quantity IS OpenVDB's). --mismatch flips both panels to the disagreement coloring.
     def register_ovdb_panel(name, mask, grey):
-        go = ps.register_sparse_volume_grid(name, origin_ovdb, cw, ijk[mask], enabled=True)
+        go = reg_grid(name, origin_ovdb, cw, ijk[mask], enabled=True)
         if grey:
             go.set_color((0.65, 0.65, 0.68))
         go.add_color_quantity("sign", sign_to_rgb(ov_sign[mask]), defined_on="cells",
@@ -335,7 +396,7 @@ def main():
             go.set_transparency(args.alpha)
 
     if band.any():
-        g = ps.register_sparse_volume_grid(prefix + "band voxels", origin, cw, ijk[band],
+        g = reg_grid(prefix + "band voxels", origin, cw, ijk[band],
                                            enabled=True)
         g.add_scalar_quantity("cc", rank[band], defined_on="cells",
                               datatype="categorical", enabled=not (args.sign or args.mismatch))
@@ -348,7 +409,7 @@ def main():
             register_ovdb_panel(f"{other}: band voxels", band, grey=False)
 
     if barrier.any():
-        g = ps.register_sparse_volume_grid(prefix + "barrier voxels", origin, cw, ijk[barrier],
+        g = reg_grid(prefix + "barrier voxels", origin, cw, ijk[barrier],
                                            enabled=True)
         g.set_color((0.65, 0.65, 0.68))              # neutral grey shell when 'sign' is off
         g.add_color_quantity("sign", sign_to_rgb(sign[barrier]), defined_on="cells",
@@ -368,7 +429,7 @@ def main():
                   f"consider --cc to pick a few ranks instead.")
         for r, c, n, s in table:
             m = rank == r
-            ps.register_sparse_volume_grid(
+            reg_grid(
                 prefix + f"cc {r:02d}  (n={n}, {'+' if s > 0 else '-'})", origin, cw, ijk[m], enabled=False)
 
     # Step-6 interior fill: one box per interior region, sized to its tree level. Deep interior lives in
@@ -385,7 +446,7 @@ def main():
                 continue
             counts.append(f"{label}:{int(m.sum())}")
             cells = base[m] // size                      # tile bases are size-aligned -> exact
-            g = ps.register_sparse_volume_grid(
+            g = reg_grid(
                 prefix + f"interior voxels ({label})", forigin, (size * fvs,) * 3, cells, enabled=False)
             g.set_color(color)                           # per-level color (shown when 'sign' is off)
             a = args.alpha if args.alpha is not None else alpha
@@ -397,6 +458,61 @@ def main():
             g.add_color_quantity("sign", interior, defined_on="cells", enabled=args.sign)
         print(f"step-6 interior fill: {', '.join(counts) if counts else '(none)'} "
               f"boxes (all interior, sign -).")
+
+    # ---- The union-of-balls exterior certificate (--balls) ---------------------------------------
+    # A voxel's own UDF is its distance to the surface, so the ball of that radius around it cannot
+    # contain surface material -- it is tangent to the mesh at worst. Drawing the certified-exterior
+    # voxels at that radius shows the set the containment guarantee is stated on (the cells those
+    # voxels occupy carry no such guarantee). A sphere that visibly eats into the mesh means the UDF
+    # over-estimated the distance there, which is the one premise the guarantee rests on.
+    balls_pc = None
+    if args.balls:
+        if ovdb is not None and ball:
+            label, src = ov_sign, "ball certification"     # the certification's own verdict
+        else:
+            label, src = sign, "shipped sign"
+            print("--balls: no CCBALL01 companion (rerun the example with CC_VIS_BALL=1 to get the "
+                  "certification's own labels); falling back to the shipped sign.")
+        keep = label > 0
+        if args.ball_max is not None:
+            keep = keep & (udf <= args.ball_max * vs)
+        if args.slab is not None:
+            # Only spheres near the cut can show up in it; the rest are pure render cost.
+            ax = {"x": 0, "y": 1, "z": 2}[args.slab_axis]
+            mid = 0.5 * (int(ijk[:, ax].min()) + int(ijk[:, ax].max()))
+            keep = keep & (np.abs(ijk[:, ax] - mid) <= args.slab)
+            print(f"--slab {args.slab:g}: keeping spheres within {args.slab:g} voxels of "
+                  f"{args.slab_axis} = {mid:g}")
+        if not keep.any():
+            print("--balls: nothing to draw (no voxel is labelled exterior after filtering).")
+        else:
+            centers = translation + ijk[keep] * vs          # NanoVDB voxel centre, world units
+            radii   = udf[keep]
+            balls_pc = ps.register_point_cloud("exterior balls", centers)
+            balls_pc.add_scalar_quantity("udf", radii, cmap="viridis", enabled=True)
+            # autoscale=False keeps the radius in world units; the default would normalise it away
+            balls_pc.set_point_radius_quantity("udf", autoscale=False)
+            if args.alpha is not None:
+                balls_pc.set_transparency(args.alpha)
+            print(f"--balls: {int(keep.sum())} spheres from the {src}, radius = UDF "
+                  f"({radii.min():g} .. {radii.max():g} world units)")
+
+    if args.mesh is not None:
+        mv, mf = load_obj(args.mesh)
+        ps.register_surface_mesh("input mesh", mv, mf)
+        print(f"--mesh: {mv.shape[0]} vertices, {mf.shape[0]} triangles from {args.mesh}")
+
+    if args.balls and balls_pc is not None:
+        for g in voxel_structs:
+            g.set_enabled(False)
+
+    if args.slice:
+        ps.add_scene_slice_plane()
+        if balls_pc is not None:
+            # cut each sphere open at the plane rather than hiding whole ones, so the cross-section
+            # circles are visible against the mesh's cross-section curve
+            balls_pc.set_cull_whole_elements(False)
+        print("--slice: drag the slice plane in the UI (Slice Planes section).")
 
     print("\nPolyscope structures (toggle each in the left panel):")
     band_quants = "'cc' / 'sign' / 'udf'" + (f" / '{Q_SIGN}' / '{Q_MM}'" if ovdb is not None else "")

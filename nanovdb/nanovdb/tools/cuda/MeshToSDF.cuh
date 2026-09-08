@@ -20,7 +20,15 @@
                                              so each closed surface is exactly one component
              3  per surface: carve it out and sign it alone -> its own complete sign field
              4  compose by nesting parity     a point wrapped by k surfaces is inside iff k is odd
+             4b finalize magnitudes           report distance to the signed surface, floor the interior
              5  fill                          extend the composed sign off the band
+
+           The surface signed is { udf == isoValue }, the mesh itself when isoValue is 0
+           (setIsoValue()). Everything above works on the DISPLACEMENT udf - isoValue rather than on
+           udf, so moving the surface moves the barrier shell, the components and the seed together
+           instead of leaving them behind at the mesh. Step 4b is the one place the two are folded
+           back into a single magnitude, and it runs last because folding destroys the side
+           information the earlier steps depend on.
 
            Step 3 is sdf_detail::SurfaceSigner, whose stages are, in call order:
 
@@ -114,6 +122,11 @@ public:
     /// @brief How the barrier voxels -- the ones the surface passes through, which the connected
     ///        components stage has to remove and therefore leaves unsigned -- get their sign.
     enum class BarrierSigning {
+        Interior,   ///< call every barrier voxel interior. No oracle, no neighbour search: the shell
+                    ///< is exactly the set that might hold surface, so declaring it interior is the
+                    ///< one choice that cannot put surface in the exterior set. Loosest of the three
+                    ///< -- the reported surface can stand up to √3/2 voxels out -- and the baseline
+                    ///< the other two are measured against.
         Heuristic,  ///< mirror of OpenVDB's ComputeIntersectingVoxelSign: find an exterior neighbour
                     ///< and test whether this voxel lies in the same half space about that
                     ///< neighbour's closest surface point. One-sided and approximate near curvature.
@@ -123,8 +136,22 @@ public:
                     ///< at the surface, which then default to interior.
     };
 
-    /// @brief Choose the barrier signing method (default Heuristic).
+    /// @brief Choose the barrier signing method (default Interior).
     void setBarrierSigning(BarrierSigning m) { mBarrierSigning = m; }
+
+    /// @brief How a point enclosed by several of the input's closed surfaces is signed.
+    enum class NestingRule {
+        EvenOdd,  ///< inside iff an ODD number of surfaces enclose it (default). A shell inside a
+                  ///< shell is a cavity, which is what a hollow model means, and it is the rule
+                  ///< OpenVDB and most mesh formats follow.
+        Solid     ///< inside iff ANY surface encloses it. Only the outermost boundary of each object
+                  ///< separates inside from outside; whatever it wraps is filled, however much
+                  ///< internal structure the mesh has. Use it when the interior detail is noise --
+                  ///< a scan's inner shells, or a shrink wrap that only wants the outer hull.
+    };
+
+    /// @brief Choose the nesting rule (default EvenOdd).
+    void setNestingRule(NestingRule r) { mNestingRule = r; }
 
     /// @brief Stencil half-width for BarrierSigning::Ball: 1 = the 26 neighbours (default), 2 = 5x5x5.
     ///        Costs (2r+1)^3 loads per voxel per round. Ball radii are capped at the band width, so
@@ -132,30 +159,30 @@ public:
     ///        nothing.
     void setBallStencilRadius(int radius) { mBallStencilRadius = radius; }
 
-    /// @brief Offset the surface outward by @a offset WORLD units before signing, so the result is
-    ///        the signed distance to { x : udf(x) == offset } rather than to the mesh itself.
+    /// @brief Sign the isosurface { x : udf(x) == isoValue } rather than the mesh itself, so the
+    ///        result is the signed distance to a surface standing @a isoValue WORLD units off the
+    ///        mesh. Must be >= 0; zero (the default) signs the mesh. This is the dilation a
+    ///        shrink-wrap or offset pipeline asks for.
     ///
-    /// This is the operation a dilation / shrink-wrap pipeline needs. It is applied while the sign
-    /// is still undetermined, so the certified-outside decision is made about the OFFSET interface
-    /// rather than inherited from the mesh and patched up afterwards.
+    /// The whole pipeline runs on udf - isoValue rather than on udf, from the barrier test onwards.
+    /// That field is already signed in the only sense the pipeline needs -- negative within isoValue
+    /// of the mesh, positive elsewhere -- and it has TWO zero crossings, one on each side of the
+    /// mesh. The interior one is not a problem to be avoided but the reason the rest of the pipeline
+    /// exists: dropping the barrier splits the band, and the component holding the minimum index-space
+    /// voxel is the only one that is outside, so the crossing buried inside the mesh ends up enclosed
+    /// by an interior component and is signed away. Subtracting the constant from the FINISHED signed
+    /// field instead would leave the barrier shell hugging the mesh, isoValue away from the surface
+    /// actually being signed.
     ///
-    /// Two things fall out of carrying the offset in the unsigned distance itself. The narrow band
-    /// is widened by @a offset internally, so the band around the offset interface ends up as wide
-    /// as narrowBandWidth() would have made it around the mesh -- ask for the width you want at the
-    /// offset surface. And the ball certification needs no change: the unsigned distance is
-    /// 1-Lipschitz, so a ball of radius |udf(V) - offset| about V cannot reach any point whose udf
-    /// equals offset, which is the same lemma the method relies on at offset == 0.
+    /// Only the reported magnitude is folded about the isovalue, as |udf - isoValue|, and only after
+    /// every sign is settled.
     ///
-    /// @note Pieces that merge under the offset are handled: the offset is applied during
-    ///       rasterization, before the band is partitioned, so the partition and the nesting parity
-    ///       built on it both describe the offset geometry. Two spheres 30 voxels apart, dilated
-    ///       until they overlap, come out as one surface and match the union of the two analytic
-    ///       spheres exactly.
+    /// It also gives an OPEN mesh an interior. A mesh with a hole has none -- inside and outside are
+    /// one region -- but { udf == isoValue } closes over any hole narrower than isoValue.
     ///
-    /// @warning Cost grows with the offset. The band has to reach from the mesh out to the offset
-    ///          interface, so everything within @a offset of the input stays materialized -- the two
-    ///          spheres above go from 47k active voxels to 753k when dilated by 25 voxels.
-    void setOffset(float offset = 0.f) { mOffset = offset; }
+    /// @warning The band is rasterized out to isoValue + narrowBandWidth(), so everything within
+    ///          isoValue of the mesh stays materialized and the cost grows accordingly.
+    void setIsoValue(float isoValue = 0.f) { mIsoValue = isoValue; }
 
     /// @brief Run the whole pipeline. Afterwards the accessors below describe a complete sign field
     ///        over the rasterized band, extended off it by the invert masks.
@@ -182,7 +209,9 @@ public:
     /// @brief Per-active-voxel closed-surface id in [0, surfaceCount()), on the rasterized band.
     const uint32_t* deviceSurfaceLabels() const { return mSurfaceLabels.first; }
     /// @brief Per surface: 1 iff its nesting depth is odd, so its own signs were negated.
-    const std::vector<uint8_t>& nestingParity() const { return mParity; }
+    const std::vector<uint32_t>& nestingDepth() const { return mNestingDepth; }
+    /// @brief The nesting rule the last build() resolved those depths with.
+    NestingRule nestingRule() const { return mNestingRule; }
 
     /// @name Invert masks — the sign of everything the band does not cover, valid after build().
     ///       Consumed together with deviceGrid() and deviceSign() by sdf_detail::signedSignAt().
@@ -228,7 +257,7 @@ private:
                            // mesh has a single closed surface — that band is then used as-is.
         Buffer  subUdf;    // udf / nearest-triangle index re-indexed onto subGrid (carving renumbers
         Buffer  subIndex;  // the value slots). Both empty in that same single-surface case.
-        Handle  derived;   // barrier-pruned copy of the surface grid = connected-components input
+        Handle  derived;   // barrier-pruned copy of the surface grid = connected-components input todo: name to something as barrierPrunedGrid
         std::unique_ptr<ConnectedComponents<BuildT>> cc;
         std::pair<uint32_t*, uint64_t>               ccLabels{nullptr, 0};
         std::unique_ptr<Signer>                      signer;
@@ -238,6 +267,7 @@ private:
     void partition();                    // step 2, run connected component on un-pruned grid for seperating each surfaces.
     void signSurface(uint32_t surface);  // step 3, once per closed surface
     void composeByInclusion();           // step 4
+    void finalizeMagnitudes();           // step 4b, report distance to the isosurface, not to the mesh
     void fillOnOriginal();               // step 5 TODO: let's rename it to more specific name?
 
     // Surface i's grid: its own carved band, or the rasterized band when uncarved.
@@ -251,9 +281,9 @@ private:
     cudaStream_t          mStream{0};
     int                   mVerbose{0};
     float                 mBandWidth{3.f};
-    BarrierSigning        mBarrierSigning{BarrierSigning::Heuristic};
+    BarrierSigning        mBarrierSigning{BarrierSigning::Interior};
+    float                 mIsoValue{0.f};  // world units, >= 0; see setIsoValue()
     int                   mBallStencilRadius{1};  // see setBallStencilRadius()
-    float                 mOffset{0.f};    // world units; see setOffset()
     float                 mPhaseMs[5]{};   // per-phase wall time from the last build(), see phaseMs()
     // Sizes below use A = the rasterized band's active voxel count and N = the closed-surface count.
     // Every per-voxel sidecar is A+1 long and indexed by leaf.getValue(n), so slot 0 is the background.
@@ -266,7 +296,8 @@ private:
     std::vector<SurfaceField> mSurfaces;   // step 3: N entries, one per closed surface — the count
                                            // itself is surfaceCount(), not a separate member
 
-    std::vector<uint8_t> mParity;          // step 4: N x uint8, 1 iff that surface's nesting depth is odd
+    NestingRule          mNestingRule{NestingRule::EvenOdd};
+    std::vector<uint32_t> mNestingDepth;   // step 4: N x uint32, how many other surfaces enclose each
     Buffer               mComposedSign;    // (A+1) x int8_t: gathered signs on the rasterized band. EMPTY
                                            // when a lone uncarved surface's own array is used instead —
                                            // which is also how fillOnOriginal knows its fill is already done.
@@ -288,7 +319,7 @@ namespace sdf_detail {
 ///        assumes exactly one closed surface (see the file notes); MeshToSDF partitions and drives it.
 /// @tparam BuildT Build type of the index grid (e.g. nanovdb::ValueOnIndex).
 template <typename BuildT>
-class SurfaceSigner
+class SurfaceSigner //todo: rename? or do we really need this class? why this class should keep invert Mask?
 {
     using GridT = NanoGrid<BuildT>;
 
@@ -304,23 +335,25 @@ public:
 
     /// @brief Prune the surface/barrier shell of a narrow-band UDF index grid, producing a clean
     ///        ValueOnIndex grid of the non-barrier voxels (the input to connected components).
-    ///        A voxel is dropped iff udf^2 < 0.75·voxelSize^2 (within √3/2 voxels of the surface).
+    ///        A voxel is dropped iff (udf - isoValue)^2 < 0.75·voxelSize^2, i.e. it lies within
+    ///        √3/2 voxels of the surface { udf == isoValue } being signed.
     /// @param d_srcGrid device narrow-band ValueOnIndex grid
     /// @param d_udf     device UDF sidecar (WORLD units), indexed by leaf.getValue(n); slot 0 = background
     /// @param voxelSize world-space voxel size (to convert the √3/2-voxel barrier into world units)
+    /// @param isoValue  WORLD-unit level set of @a d_udf to sign; 0 signs the mesh itself
     /// @return a handle to the derived (barrier-pruned) ValueOnIndex grid
     template <typename BufferT = nanovdb::cuda::DeviceBuffer>
     GridHandle<BufferT> computeDerivedTopology(const GridT* d_srcGrid, const float* d_udf,
-                                               float voxelSize, const BufferT& buffer = BufferT());
+                                               float voxelSize, float isoValue = 0.f,
+                                               const BufferT& buffer = BufferT());
 
     /// @brief Sign the non-barrier voxels of a CC-labeled grid: the component containing the grid's
     ///        minimum-x active voxel is the exterior (+); every other component is interior (-).
     ///        Convention: +outside / -inside.
     ///
-    ///        The rule is a statement about ONE closed surface, and holds only on a grid that carries
-    ///        one — the leftmost voxel of a lone closed surface is necessarily outside it. Several
-    ///        objects at once would need one seed each, which is why the caller partitions the band
-    ///        into closed surfaces first and runs this per surface (see the header notes above).
+    ///        Valid only on a grid carrying ONE closed surface: its leftmost voxel is necessarily
+    ///        outside it. Several objects would need a seed each, so the caller partitions the band
+    ///        into closed surfaces first and runs this per surface.
     /// @param d_grid        the CC-labeled (derived) device grid
     /// @param d_voxelLabel  per-active-voxel component-label sidecar for @a d_grid (from
     ///                      ConnectedComponents::getVoxelLabelsAndCount()), indexed by leaf.getValue(n).
@@ -345,64 +378,76 @@ public:
     /// @param d_points    device mesh vertices (WORLD space).
     /// @param d_triangles device triangle vertex-index list.
     /// @param map         the world<->index transform used to build the grid.
+    /// @param isoValue  WORLD-unit level set being signed; 0 signs the mesh itself
+    /// @param voxelSize world-space voxel size (the test runs in index space)
     void signBarrier(const GridT* d_grid, const uint32_t* d_index,
                      const nanovdb::Vec3f* d_points, const nanovdb::Vec3i* d_triangles,
-                     const nanovdb::Map& map); //TODO: SignBarrierVoxels
+                     const nanovdb::Map& map, float isoValue = 0.f,
+                     float voxelSize = 1.f); //TODO: SignBarrierVoxels
+
+    /// @brief Sign every barrier voxel interior, completing the sign field with no oracle at all.
+    ///        The cheapest of the three barrier policies and the only one whose exterior set provably
+    ///        holds no surface, at the cost of a surface that stands up to √3/2 voxels out.
+    ///        Requires injectSignsToOriginal() first; the result lands in deviceSignedVoxelSign().
+    /// @param d_grid the original (post-injection) grid being signed.
+    void signBarrierAsInterior(const GridT* d_grid);
 
     /// @brief EXPERIMENTAL alternative to signBarrier: decide the barrier voxels by ball-intersection
-    ///        certification instead of the closest-point heuristic. Runs to a fixed point from both
-    ///        the exterior and the interior seeds and leaves anything it cannot prove at 0, so the
-    ///        two can be compared voxel by voxel. Does not touch deviceSignedVoxelSign().
+    ///        certification instead of the closest-point heuristic. Iterates to a fixed point from
+    ///        both exterior and interior seeds, leaving anything it cannot prove at 0 so the two
+    ///        methods stay comparable voxel by voxel. Does not touch deviceSignedVoxelSign().
     /// @param d_grid    the grid whose barrier voxels are to be decided
     /// @param d_udf     unsigned distance sidecar for @a d_grid, WORLD units
     /// @param voxelSize world-space voxel size
-    /// @param maxRounds cap on Jacobi rounds; measured worst case is 6
-    /// @param radius stencil half-width: 1 = the 26 neighbours, 2 = 5x5x5. Pairs further apart than
-    ///        2*bandWidth voxels can never overlap, so nothing is gained past that.
+    /// @param maxRounds cap on Jacobi rounds
+    /// @param radius    stencil half-width: 1 = the 26 neighbours, 2 = 5x5x5. Pairs further apart
+    ///                  than 2*bandWidth voxels can never overlap, so nothing is gained past that.
+    /// @param isoValue  WORLD-unit level set being signed; 0 signs the mesh itself
     void signBarrierByBalls(const GridT* d_grid, const float* d_udf, float voxelSize,
-                            int maxRounds = 32, int radius = 1);
+                            int maxRounds = 32, int radius = 1, float isoValue = 0.f);
 
     /// @brief Result of signBarrierByBalls(): +1 ext / -1 int / 0 = not proven either way.
     int8_t* deviceBallVoxelSign() { return static_cast<int8_t*>(mBallVoxelSign.deviceData()); }
     /// @brief Voxels signBarrierByBalls() could prove nothing about: no neighbour's ball reached
     ///        them. They fall back to interior, the safe direction.
     uint32_t ballUndecided() const { return mBallUndecided; }
-    /// @brief DISTINCT voxels signBarrierByBalls() proved both ways, counted once each however many
-    ///        rounds they stayed contradicted. The lemma forbids it, so a non-zero count is evidence
-    ///        the surface does not separate those neighbours -- a hole, or a sheet thinner than the
-    ///        grid resolves.
+
+    /// @brief DISTINCT voxels that signBarrierByBalls() proved both ways, counted once each however
+    ///        many rounds they persist for.
+    ///
+    /// The lemma forbids this: overlapping balls are surface-free, so a path exists between the two
+    /// neighbours that never meets the surface, and a closed surface would have to separate them.
+    /// A non-zero count therefore means the surface does not separate them there -- a hole, or a
+    /// sheet thinner than the grid resolves. Tangency has to be excluded strictly for this to mean
+    /// anything; see the epsilon in BallCertifyFunctor.
     uint32_t ballContradictions() const { return mBallContradictions; }
     uint32_t ballRounds() const { return mBallRounds; }
 
-    /// @brief Step 6 (chunk A, leaf level): build the per-leaf invert masks that sign the INACTIVE
-    ///        voxels inside materialized leaves — bit ON => interior (-background), bit OFF =>
-    ///        exterior (+background, the default). Floods interior signs from the interior active
-    ///        band through each leaf's inactive voxels (active voxels are walls). Needs
-    ///        completed signs (from signBarrier(), or supplied via @a d_sign). Coarser levels (lower/upper/
-    ///        root) are later pipeline chunks.
+    /// @brief Build the per-leaf invert masks that sign the INACTIVE voxels of materialized leaves:
+    ///        bit ON => interior (-background), bit OFF => exterior (+background, the default).
+    ///        Floods interior signs from the active band through each leaf's inactive voxels, with
+    ///        active voxels as walls. Needs completed signs, from signBarrier() or @a d_sign.
     /// @param d_grid the original (fully signed) device grid.
     /// @param d_sign optional per-active-voxel sign array for @a d_grid, overriding the one this
     ///               object computed. Lets the fill run on a grid it did not sign — a per-component
     ///               sub-grid, or the original grid after the signs were recomposed.
     void fillLeafInvertMask(const GridT* d_grid, const int8_t* d_sign = nullptr);
 
-    /// @brief Step 6 (chunk B, lower + upper levels): fill the coarse invert masks that sign the
-    ///        CHILDLESS child slots of lower and upper internal nodes (bit ON => that tile is
-    ///        interior / -background). Bottom-up per plan §7a: leaf faces seed lower/upper tiles ->
-    ///        flood lower -> lower faces seed upper tiles -> flood upper. Root-level tiles and the
-    ///        topology rebuild are chunk C. Requires fillLeafInvertMask() first.
+    /// @brief Fill the coarse invert masks that sign the CHILDLESS child slots of lower and upper
+    ///        internal nodes (bit ON => that tile is interior). Bottom-up: leaf faces seed the lower
+    ///        and upper tiles they abut, lower floods, lower faces seed upper, upper floods.
+    ///        Requires fillLeafInvertMask() first.
     /// @param d_grid the original (fully signed) device grid.
     /// @param d_sign optional per-active-voxel sign array for @a d_grid, overriding the one this
     ///               object computed. Lets the fill run on a grid it did not sign — a per-component
     ///               sub-grid, or the original grid after the signs were recomposed.
     void fillCoarseInvertMasks(const GridT* d_grid, const int8_t* d_sign = nullptr);
 
-    /// @brief Step 6 (chunk C, root level): build the root-interior SIDECAR that signs the deep
-    ///        interior beyond any upper node. A small P×Q×R cell array over the grid's root-tile
-    ///        bounding range (one uint8 per 4096^3 root region): pre-existing root entries are walls,
-    ///        faces from ALL THREE levels seed interior evidence into abutting ABSENT cells, and a
-    ///        multi-seed flood fills enclosed interiors. The GRID IS NOT MUTATED — queries consult the
-    ///        sidecar via signedSignAt(). Requires fillCoarseInvertMasks() first.
+    /// @brief Build the root-interior SIDECAR that signs the deep interior beyond any upper node: a
+    ///        PxQxR cell array over the grid's root-tile range, one uint8 per 4096^3 root region.
+    ///        Existing root entries are walls, faces from all three levels seed interior evidence
+    ///        into abutting absent cells, and a flood fills what is enclosed. The grid is NOT
+    ///        mutated -- queries go through signedSignAt(). Requires fillCoarseInvertMasks() first.
     /// @param d_grid the original (fully signed) device grid.
     /// @param d_sign optional per-active-voxel sign array for @a d_grid, overriding the one this
     ///               object computed. Lets the fill run on a grid it did not sign — a per-component
@@ -488,33 +533,91 @@ private:
 
 static constexpr int LEAF_SIZE = 512;  // 8^3 voxels per leaf
 
-/// @brief CUDA functor: re-centre the unsigned-distance sidecar on the offset interface, mapping
-///        udf -> |udf - offset|. One thread per sidecar slot via lambdaKernel.
+/// @brief CUDA functor: turn the distance-to-mesh sidecar into the magnitude actually reported,
+///        once every sign is settled. One thread per sidecar slot via lambdaKernel.
+///        See MeshToSDF::setIsoValue() and MeshToSDF::finalizeMagnitudes().
 ///
-/// The result is again a true unsigned distance, now to { x : udf(x) == offset }, which is why every
-/// later stage -- the barrier shell test, connected components, both signing methods -- runs
-/// unchanged. Slot 0 is the background: rasterization clamped it to (bandWidth + offset/h)*h, so it
-/// lands on exactly the requested background magnitude here.
-struct UDFOffsetFunctor
+///        Two steps. Folding udf about the isovalue makes the pair (sign, magnitude) describe one
+///        surface: the sign came from udf - isoValue, so leaving the magnitude as the distance to the
+///        mesh would report a field off by isoValue everywhere. The fold is safe here and not earlier
+///        precisely because it destroys the very information -- which side of the mesh -- that the
+///        signing stages needed.
+///
+///        The clamp then pushes interior magnitudes out to at least half a voxel diagonal. Subtracting
+///        a constant from a coarsely sampled distance field leaves values like udf 0.99 -> -0.01,
+///        which claims an interface that is not there: the neighbouring samples are nowhere near
+///        consistent with one, and a contouring pass would put the surface back roughly where the
+///        isovalue moved it from. Non-barrier interior voxels are already beyond this threshold by the
+///        barrier test itself, so the clamp only ever bites on barrier voxels signed interior.
+template <typename BuildT>
+struct IsoMagnitudeFunctor
 {
-    __device__ void operator()(const uint64_t slot, float* d_udf, float offsetWorld) const
+    static constexpr int MaxThreadsPerBlock         = LEAF_SIZE;
+    static constexpr int MinBlocksPerMultiprocessor = 1;
+
+    __device__ void operator()(const NanoGrid<BuildT>* d_grid, float* d_udf, const int8_t* d_sign,
+                               float isoValue, float interiorFloor)
     {
-        d_udf[slot] = fabsf(d_udf[slot] - offsetWorld);
+        const int leafID = blockIdx.x, n = threadIdx.x;
+        const auto& leaf = d_grid->tree().template getFirstNode<0>()[leafID];
+        if (!leaf.isActive(uint32_t(n))) return;
+
+        const uint64_t v = leaf.getValue(uint32_t(n));
+        const float    m = fabsf(d_udf[v] - isoValue);
+        d_udf[v] = m;
+        if (d_sign[v] >= int8_t(0) || m >= interiorFloor) return;   // nothing to floor
+
+        // Only a voxel with an exterior FACE neighbour can carry the interface: a marching-cubes
+        // vertex lands on an axis edge, between two face-adjacent samples of opposite sign. Flooring
+        // such a voxel would drag that crossing along, so leave it alone and floor the rest.
+        const nanovdb::Coord local = nanovdb::NanoLeaf<BuildT>::OffsetToLocalCoord(uint32_t(n));
+        const int lx = local[0], ly = local[1], lz = local[2];
+        const int off[6][3] = {{-1,0,0},{1,0,0},{0,-1,0},{0,1,0},{0,0,-1},{0,0,1}};
+
+        bool touchesExterior = false, needsAccessor = false;
+        for (int k = 0; k < 6 && !touchesExterior; ++k) {
+            const int nx = lx + off[k][0], ny = ly + off[k][1], nz = lz + off[k][2];
+            if (nx < 0 || nx > 7 || ny < 0 || ny > 7 || nz < 0 || nz > 7) { needsAccessor = true; continue; }
+            const uint32_t nOff = (uint32_t(nx) << 6) | (uint32_t(ny) << 3) | uint32_t(nz);
+            if (leaf.isActive(nOff) && d_sign[leaf.getValue(nOff)] > int8_t(0)) touchesExterior = true;
+        }
+        if (!touchesExterior && needsAccessor) {
+            const nanovdb::Coord origin = leaf.origin();
+            auto acc = d_grid->getAccessor();
+            for (int k = 0; k < 6 && !touchesExterior; ++k) {
+                const int nx = lx + off[k][0], ny = ly + off[k][1], nz = lz + off[k][2];
+                if (nx >= 0 && nx <= 7 && ny >= 0 && ny <= 7 && nz >= 0 && nz <= 7) continue;
+                const nanovdb::Coord nijk(origin[0] + nx, origin[1] + ny, origin[2] + nz);
+                if (acc.isActive(nijk) && d_sign[acc.getValue(nijk)] > int8_t(0)) touchesExterior = true;
+            }
+        }
+        if (!touchesExterior) d_udf[v] = interiorFloor;
     }
-};// sdf_detail::UDFOffsetFunctor
+};// sdf_detail::IsoMagnitudeFunctor
 
 //-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 // Step 2 - prune the surface/barrier shell.
-// Voxels within sqrt(3)/2 of the surface straddle it, so which side they are on is not yet decided.
-// Dropping them splits each closed surface's band into a separate inner and outer shell, which is
-// what connected components then labels.
+// Voxels within sqrt(3)/2 of the surface being signed straddle it, so which side they are on is not
+// yet decided. Dropping them splits the band into shells that connected components can label, and
+// each shell then lies wholly on one side.
 
 /// @brief CUDA functor: build a per-leaf retain bitmask that drops the surface/barrier shell. A
-///        voxel is PRUNED iff it is within √3/2 voxels of the surface (half a voxel space-diagonal —
-///        the same barrier OpenVDB's MeshToVolume uses); every other active voxel is RETAINED.
-///        Because the UDF sidecar is in WORLD units, the test is
-///        udf^2 < (√3/2 · voxelSize)^2 = 0.75 · voxelSize^2, passed in precomputed.
-///        Launched via operatorKernel, one block per leaf, 512 threads (one per voxel in the 8^3 leaf).
+///        voxel is PRUNED iff it is within √3/2 voxels of the signed surface (half a voxel
+///        space-diagonal — the same barrier OpenVDB's MeshToVolume uses); every other active voxel is
+///        RETAINED. Launched via operatorKernel, one block per leaf, 512 threads (one per voxel in
+///        the 8^3 leaf).
+///
+///        The surface being signed is { udf == isoValue }, so the test is on the DISPLACEMENT
+///        udf - isoValue, not on udf. Both are in the sidecar's WORLD units and the comparison is
+///        made squared: (udf - isoValue)^2 < (√3/2 · voxelSize)^2 = 0.75 · voxelSize^2, passed in
+///        precomputed. With isoValue == 0 this is the plain mesh barrier.
+///
+///        What retaining leaves behind, for isoValue > 0, is three kinds of region: the true exterior
+///        (udf > isoValue), the mesh's deep interior (also udf > isoValue, but walled off from the
+///        exterior by the shell), and the tube hugging the mesh (udf < isoValue) which is connected
+///        THROUGH the mesh surface because udf == 0 is not a barrier here. Only the first holds the
+///        minimum index-space voxel, so the other two are signed interior — which is what folds the
+///        isosurface's second, buried zero crossing away.
 template <typename BuildT>
 struct UDFBarrierPruneMaskFunctor
 {
@@ -524,6 +627,7 @@ struct UDFBarrierPruneMaskFunctor
     __device__ void operator()(
         const nanovdb::NanoGrid<BuildT>* d_grid,
         const float*                     d_udf,           // UDF sidecar, WORLD units
+        float                            isoValue,        // signed surface = { udf == isoValue }, world
         float                            barrierSqWorld,  // (√3/2 · voxelSize)^2, world^2 units
         nanovdb::Mask<3>*                d_dstLeafMasks)
     {
@@ -539,8 +643,8 @@ struct UDFBarrierPruneMaskFunctor
         __syncthreads();
 
         if (auto n = leaf.data()->getValue(threadID)) {  // n != 0 => active voxel
-            const float udf = d_udf[n];
-            if (udf * udf >= barrierSqWorld)             // retain non-barrier voxels
+            const float d = d_udf[n] - isoValue;
+            if (d * d >= barrierSqWorld)                 // retain non-barrier voxels
                 resultMask.setOnAtomic(threadID);
         }
     }
@@ -603,24 +707,20 @@ struct SignNonBarrierFunctor
 
 static constexpr uint32_t INVALID_TRIANGLE = 0xFFFFFFFFu;  // nearest-triangle-index sentinel
 
-/// @brief Exterior-anchor proof used by signBarrier (a faithful mirror of one neighbor test in
-///        OpenVDB MeshToVolume.h ComputeIntersectingVoxelSign): given a candidate barrier voxel @a q
-///        (world/index-space center @a q_xyz) and a neighbor voxel @a n (value-index @a nv, index-space
-///        coord @a nijk), returns true iff @a n is a confidently-EXTERIOR voxel (sign == +1) whose
-///        nearest triangle places @a q on the SAME side of the surface as @a n — i.e.
-///        normalize(n - cp) · normalize(q - cp) > 0, where cp is the closest point on n's nearest
-///        triangle to n. Interior / barrier / no-hit neighbors never prove exteriority.
-///        Host+device (__hostdev__) so the CPU oracle can reuse the identical math.
+/// @brief True iff neighbour @a n proves barrier voxel @a q exterior: @a n must itself be exterior
+///        (sign == +1), and its nearest triangle must place both on the same side, i.e.
+///        normalize(n - cp) . normalize(q - cp) > 0 for cp the closest point on that triangle to n.
+///        Interior, barrier and no-hit neighbours prove nothing. Mirrors one neighbour test of
+///        OpenVDB MeshToVolume.h ComputeIntersectingVoxelSign; __hostdev__ so the CPU oracle can
+///        reuse it.
 ///
-///        The geometry is done in DOUBLE precision, matching OpenVDB's Vec3d sign test: this is a
-///        sign-of-dot decision, and at large index coordinates float cancellation can flip that sign
-///        between host and device (different FMA contraction under -use_fast_math). Double precision
-///        resolves it reproducibly, so the CPU oracle agrees with the GPU bit-robustly.
+///        Double precision is deliberate: this is a sign-of-dot decision, and at large index
+///        coordinates float cancellation can flip it differently on host and device.
 __hostdev__ inline bool
 barrierExteriorProof(uint64_t nv, const nanovdb::Coord& nijk, const nanovdb::Vec3d& q_xyz,
                      const int8_t* d_sign, const uint32_t* d_index,
                      const nanovdb::Vec3f* d_points, const nanovdb::Vec3i* d_triangles,
-                     const nanovdb::Map& map)
+                     const nanovdb::Map& map, double isoValueIndex)
 {
     if (d_sign[nv] != int8_t(1)) return false;       // only exterior (+1) neighbors anchor
     const uint32_t tid = d_index[nv];
@@ -638,28 +738,33 @@ barrierExteriorProof(uint64_t nv, const nanovdb::Coord& nijk, const nanovdb::Vec
     double t0, t1;
     const nanovdb::Vec3d cp = nanovdb::math::closestPointOnTriangleToPoint(v0, v1, v2, n_xyz, t0, t1);
     nanovdb::Vec3d dn = n_xyz - cp; dn.normalize();   // surface -> neighbor (its confident side)
-    nanovdb::Vec3d dq = q_xyz - cp; dq.normalize();   // surface -> q
+
+    // Slide the reference point out onto the surface actually being signed. cp is the nearest point
+    // of the MESH to n, so every point of the segment [cp, n] has cp as ITS nearest point too, and
+    // the one isoValue along it therefore sits exactly on { udf == isoValue }. Offset surfaces are
+    // parallel, so dn is its normal there as well and only the base point moves.
+    const nanovdb::Vec3d base = cp + dn * isoValueIndex;
+
+    nanovdb::Vec3d dq = q_xyz - base; dq.normalize();  // surface -> q
     return dn.dot(dq) > 0.0;                           // same side => q is exterior
 }
 
 
-/// @brief One Jacobi round of ball-intersection certification (EXPERIMENTAL, runs beside
-///        SignBarrierFunctor rather than replacing it).
+/// @brief One Jacobi round of ball-intersection certification (EXPERIMENTAL, an alternative to
+///        SignBarrierFunctor).
 ///
-/// The lemma: the open ball of radius udf(V) about a voxel centre cannot meet the surface, since
-/// every point of it is strictly nearer to V than V is to the surface. Two such balls that overlap
-/// form a connected surface-free set, so their centres lie on the same side of it. Overlap is
-/// exactly |V1 - V0| < d0 + d1, so a voxel of unknown sign may take the sign of any already-certain
-/// neighbour satisfying that. Unlike the closest-point heuristic this is a proof rather than a test,
-/// it touches no triangle geometry, and it works from interior seeds as readily as exterior ones.
+/// The ball of radius udf(V) about a voxel centre cannot reach the surface, so two overlapping such
+/// balls form a connected surface-free set and their centres share a side. Overlap is
+/// |V1 - V0| < d0 + d1, so an unknown voxel may take the sign of any certain neighbour meeting it.
+/// This is a proof rather than a heuristic, it reads distances only, and it propagates from interior
+/// and exterior seeds alike.
 ///
-/// Tangency must be excluded. Balls that touch without overlapping say nothing, and on axis-aligned
-/// input exact tangency is common enough that float rounding would decide it arbitrarily -- and
-/// differently on the two sides, which shows up as a voxel certified both ways. Hence the tolerance.
+/// Tangency is excluded by a tolerance: touching balls prove nothing, and on axis-aligned input
+/// exact tangency is common enough that rounding would decide it differently on the two sides.
 ///
-/// Jacobi: reads @a d_labelIn, writes @a d_labelOut, so the result does not depend on execution
-/// order. A voxel certified from both sides contradicts the lemma and is left undecided and counted;
-/// it can only happen where the surface is not closed.
+/// Reads @a d_labelIn and writes @a d_labelOut, so the round is order-independent. A voxel certified
+/// both ways contradicts the lemma; it is left undecided and counted, and can only happen where the
+/// surface is not closed.
 template <typename BuildT>
 struct BallCertifyFunctor
 {
@@ -675,7 +780,8 @@ struct BallCertifyFunctor
         uint32_t*               d_changed,       // incremented once per newly decided voxel
         uint32_t*               d_contradictions,// incremented once per voxel, on its FIRST contradiction
         uint32_t*               d_everContradicted,  // one bit per slot, persistent across rounds
-        int                     radius)          // stencil half-width in voxels; 1 = the 26 neighbours
+        int                     radius,          // stencil half-width in voxels; 1 = the 26 neighbours
+        float                   isoValue)        // surface signed = { udf == isoValue }, world units
     {
         const int leafID = blockIdx.x, n = threadIdx.x;
         const auto& leaf = d_grid->tree().template getFirstNode<0>()[leafID];
@@ -688,7 +794,10 @@ struct BallCertifyFunctor
         const nanovdb::Coord local  = nanovdb::NanoLeaf<BuildT>::OffsetToLocalCoord(uint32_t(n));
         const int            lx = local[0], ly = local[1], lz = local[2];
         const nanovdb::Coord origin = leaf.origin();
-        const float          dq  = d_udf[qv];
+        // Radii are distances to the surface being signed, not to the mesh. |udf - isoValue| is a
+        // 1-Lipschitz under-estimate of that near the medial axis, which is the safe direction: it
+        // shrinks the balls, so it can only certify fewer voxels, never wrongly.
+        const float          dq  = fabsf(d_udf[qv] - isoValue);
         const float          eps = 1e-5f * voxelSize;
 
         bool ext = false, inr = false;
@@ -699,7 +808,7 @@ struct BallCertifyFunctor
             const int8_t ln = d_labelIn[nv];
             if (ln == int8_t(0)) return;                                   // neighbour not certain yet
             const float len = sqrtf(float(dx*dx + dy*dy + dz*dz)) * voxelSize;
-            if (d_udf[nv] + dq <= len + eps) return;                       // balls do not overlap
+            if (fabsf(d_udf[nv] - isoValue) + dq <= len + eps) return;      // balls do not overlap
             if (ln > 0) ext = true; else inr = true;
         };
 
@@ -737,9 +846,10 @@ struct BallCertifyFunctor
         }
 
         if (ext && inr) {
-            // Count the VOXEL, not the event: a voxel that stays contradicted is re-detected every
-            // round, and one contradicted only in a middle round would vanish from the tally
-            // entirely, since the loop exits on the round that changes nothing.
+            // The lemma forbids this, so it is evidence the surface does not separate the two
+            // neighbours -- a hole, or a sheet thinner than the grid resolves. Count the VOXEL, not
+            // the event: a voxel that stays contradicted is re-detected every round, and a voxel
+            // contradicted only in a middle round would otherwise vanish from the tally entirely.
             const uint32_t word = uint32_t(qv >> 5), bit = 1u << (uint32_t(qv) & 31u);
             if ((atomicOr(d_everContradicted + word, bit) & bit) == 0u)
                 atomicAdd(d_contradictions, 1u);
@@ -769,18 +879,37 @@ struct BallFinalizeFunctor
     }
 };
 
-/// @brief Sign every barrier voxel (sign == 0) in place, as a faithful mirror of OpenVDB's
-///        ComputeIntersectingVoxelSign. One block per leaf, one thread per voxel:
-///          - non-barrier voxels (sign != 0): copy their sign through to the output unchanged;
-///          - barrier voxels: search neighbors for the first EXTERIOR (+1) anchor that proves q
-///            exterior (barrierExteriorProof). Pass 1 scans the in-leaf 3×3×3 directly off the leaf
-///            buffer and early-outs; pass 2 (only for unresolved voxels touching the leaf boundary)
-///            scans the 26-neighborhood crossing the boundary via ONE reused ReadAccessor. If no anchor
-///            proves exteriority, q defaults to interior (-1).
-///        Anchors are read from @a d_signIn (immutable post-injection snapshot: +1/-1 non-barrier,
-///        0 barrier) and results written to a separate @a d_signOut, so a just-signed barrier voxel is
-///        never used as an anchor (matching OpenVDB, which anchors only on confident voxels) and the
-///        result is independent of thread/block execution order.
+/// @brief Sign every barrier voxel (sign == 0), mirroring OpenVDB's ComputeIntersectingVoxelSign.
+///        One block per leaf, one thread per voxel. Non-barrier voxels pass through unchanged;
+///        a barrier voxel searches its 26 neighbours for an exterior anchor that proves it exterior
+///        (barrierExteriorProof) and defaults to interior if none does. Pass 1 stays inside the leaf
+///        buffer, pass 2 crosses the leaf boundary through one reused ReadAccessor.
+///
+///        Anchors come from @a d_signIn and results go to a separate @a d_signOut, so a just-signed
+///        barrier voxel never anchors another and the result is order-independent.
+///
+///        That last property also bounds which voxels this can move. An anchor has to carry +1 in
+///        @a d_signIn, and the only +1 entries there are the certified-outside voxels the component
+///        stage decided -- every barrier voxel is 0. So a barrier voxel more than one neighbourhood
+///        away from certified outside has no anchor to find and falls through to interior, whatever
+///        the shell's thickness. The rule "re-sign the layer adjacent to certified outside and call
+///        everything beyond it interior" is therefore not an extra pass to add; it is what a single
+///        anchored round already computes.
+/// @brief CUDA functor: carry the non-barrier signs through and call every barrier voxel interior.
+///        One thread per sidecar slot via lambdaKernel. Slot 0 (background) is set by the caller.
+///
+///        The barrier shell is by construction the only place the surface can be, so declaring all
+///        of it interior is the one assignment that cannot leave surface inside the exterior set.
+///        It needs no neighbour search and no oracle.
+struct BarrierToInteriorFunctor
+{
+    __device__ void operator()(const uint64_t slot, const int8_t* d_signIn, int8_t* d_signOut) const
+    {
+        const int8_t s = d_signIn[slot];
+        d_signOut[slot] = (s != int8_t(0)) ? s : int8_t(-1);
+    }
+};// sdf_detail::BarrierToInteriorFunctor
+
 template <typename BuildT>
 struct SignBarrierFunctor
 {
@@ -794,7 +923,8 @@ struct SignBarrierFunctor
         const uint32_t*         d_index,      // nearest-triangle index sidecar (original grid)
         const nanovdb::Vec3f*   d_points,     // mesh vertices, WORLD space
         const nanovdb::Vec3i*   d_triangles,  // triangle vertex indices
-        nanovdb::Map            map)          // world<->index transform (by value)
+        nanovdb::Map            map,          // world<->index transform (by value)
+        double                  isoValueIndex)// surface signed = { udf == isoValue }, INDEX units
     {
         const int leafID = blockIdx.x, n = threadIdx.x;
         const auto& leaf = d_grid->tree().template getFirstNode<0>()[leafID];
@@ -822,8 +952,8 @@ struct SignBarrierFunctor
                     const uint32_t nOff = (uint32_t(nx) << 6) | (uint32_t(ny) << 3) | uint32_t(nz);
                     if (!leaf.isActive(nOff)) continue;
                     const nanovdb::Coord nijk(origin[0] + nx, origin[1] + ny, origin[2] + nz);
-                    if (barrierExteriorProof(leaf.getValue(nOff), nijk, q_xyz,
-                                             d_signIn, d_index, d_points, d_triangles, map)) {
+                    if (barrierExteriorProof(leaf.getValue(nOff), nijk, q_xyz, d_signIn, d_index,
+                                             d_points, d_triangles, map, isoValueIndex)) {
                         exterior = true; break;
                     }
                 }
@@ -842,8 +972,8 @@ struct SignBarrierFunctor
                             continue;  // in-leaf neighbor already handled by pass 1
                         const nanovdb::Coord nijk(origin[0] + nx, origin[1] + ny, origin[2] + nz);
                         if (!acc.isActive(nijk)) continue;
-                        if (barrierExteriorProof(acc.getValue(nijk), nijk, q_xyz,
-                                                 d_signIn, d_index, d_points, d_triangles, map)) {
+                        if (barrierExteriorProof(acc.getValue(nijk), nijk, q_xyz, d_signIn, d_index,
+                                                 d_points, d_triangles, map, isoValueIndex)) {
                             exterior = true; break;
                         }
                     }
@@ -859,15 +989,11 @@ struct SignBarrierFunctor
 // per-level invert mask whose bits mark the interior regions. Each level is flooded outwards from the
 // signed band, with the active voxels acting as walls.
 
-/// @brief Step 6 (chunk A, leaf level): build one invert Mask<3> per materialized leaf that signs the
-///        INACTIVE voxels — bit ON => interior (-background), bit OFF => exterior (+background, the
-///        default). One block per leaf, 512 threads (one per voxel), shared-memory Jacobi flood:
-///          - injectors  = ACTIVE voxels with sign -1 (the interior side of the signed band);
-///          - walls      = ALL active voxels (exterior/barrier active neighbors never turn a bit on);
-///          - propagation runs through INACTIVE voxels only, via the 6 face neighbors, entirely
-///            within the leaf. The active band bounds the flood, so it cannot leak from
-///            interior-inactive to exterior-inactive.
-///        A leaf with no interior voxels stays all-0. Cross-leaf / coarser-level fill is a later chunk.
+/// @brief Leaf-level invert mask: one Mask<3> per leaf signing that leaf's INACTIVE voxels, bit ON
+///        meaning interior. One block per leaf, 512 threads, shared-memory Jacobi flood seeded from
+///        the active interior voxels and bounded by ALL active voxels, propagating through inactive
+///        voxels via the 6 face neighbours. The active band walls the flood in, so it cannot leak
+///        from interior to exterior. A leaf with no interior voxels stays all-0.
 template <typename BuildT>
 struct FillLeafInvertMaskFunctor
 {
@@ -932,7 +1058,7 @@ struct FillLeafInvertMaskFunctor
 // faces seed the upper level and it floods in turn.
 
 /// @brief Descend root -> upper -> lower for the 8^3 leaf-region at coord @a c and report where the
-///        finest CHILDLESS tile containing it lives (the face->coarser seeding target, plan §7a).
+///        finest CHILDLESS tile containing it lives -- the target a face seeds into.
 /// @return 0 = skip: root-level value tile or refined all the way to a leaf (handled at the finer
 ///         level); 1 = childless LOWER slot; 2 = childless UPPER slot; 3 = ABSENT root region (no
 ///         root tile at all — the chunk-C root-cell target, cell = floorDiv(c,4096) per axis).
@@ -946,7 +1072,7 @@ probeChildlessSlot(const NanoGrid<BuildT>& grid, const nanovdb::Coord& c,
     using LowerT = NanoLower<BuildT>;
     const auto& tree = grid.tree();
     const auto* tile = tree.root().probeTile(c);
-    if (!tile) return 3;                                        // absent root region (chunk C)
+    if (!tile) return 3;                                        // absent root region -> root sidecar
     if (!tile->isChild()) return 0;                             // root-level value tile: skip
     const UpperT* upper = tree.root().getChild(tile);
     const LowerT* lower = upper->probeChild(c);
@@ -964,17 +1090,14 @@ probeChildlessSlot(const NanoGrid<BuildT>& grid, const nanovdb::Coord& c,
     return 0;                                                   // refined to a leaf
 }
 
-/// @brief Chunk-B seeding pass 1 (plan §7a): each leaf classifies its 6 faces and accumulates
-///        interior/exterior evidence into the childless coarse tile across each face. One block per
-///        leaf, 384 threads = 6 faces × 64 face voxels. Face voxel classification:
-///          interior = (active && sign == -1) || (inactive && leaf invert bit ON)
-///          exterior = (active && sign == +1) || (inactive && leaf invert bit OFF)
-///        (No barrier special-case: a face abutting a CHILDLESS tile is barrier-free by construction —
-///        a barrier voxel forces the neighbor across to be refined, §6d rule 3.)
-///        The whole 8×8 face abuts exactly one 8^3 region across, so one probe per face decides the
-///        target: childless lower/upper slot -> atomically OR the per-tile sawInterior/sawExterior
-///        bits; refined or root-level -> skip. The final seed gate (sawInt && !sawExt) is applied by
-///        the flood kernel.
+/// @brief Coarse-fill seeding: each leaf classifies its 6 faces and records interior/exterior
+///        evidence on the childless tile across each one. One block per leaf, 384 threads
+///        (6 faces x 64 voxels). A face voxel counts as interior if it is active with sign -1 or
+///        inactive with its leaf invert bit ON, and exterior in the mirror case.
+///
+///        An 8x8 face abuts exactly one 8^3 region, so one probe per face finds the target: a
+///        childless tile gets its sawInterior/sawExterior bit OR-ed in, anything refined is skipped.
+///        The flood kernel applies the seed gate (sawInterior && !sawExterior).
 template <typename BuildT>
 struct LeafFaceSeedFunctor
 {
@@ -1027,12 +1150,12 @@ struct LeafFaceSeedFunctor
     }
 };
 
-/// @brief Chunk-B seeding pass 2 (plan §7a): each LOWER node classifies the childless slots on its 6
-///        faces (via the already-flooded lower invert mask) and accumulates into the childless UPPER
-///        tile across each face. Refined face slots are skipped — their finer content contributed via
-///        LeafFaceSeedFunctor. A probe landing on another lower node's slot is a SAME-level neighbor:
-///        cross-node same-level propagation is deferred (like leaf<->leaf), not chunk B. One block per
-///        lower node, 512 threads striding 6 faces × 16×16 = 1536 face cells.
+/// @brief The lower-level counterpart of LeafFaceSeedFunctor: each LOWER node classifies the
+///        childless slots on its 6 faces, using the already-flooded lower invert mask, and seeds the
+///        childless UPPER tile across each face. Refined face slots are skipped -- their finer
+///        content was contributed by LeafFaceSeedFunctor. A probe landing on another lower node is a
+///        same-level neighbour and is left to the flood. One block per lower node, 512 threads over
+///        6 faces x 16x16 cells.
 template <typename BuildT>
 struct LowerFaceSeedFunctor
 {
@@ -1078,14 +1201,14 @@ struct LowerFaceSeedFunctor
     }
 };
 
-/// @brief Chunk-B finalize + within-node flood at a coarse level (LEVEL 1 = lower/16^3, 2 = upper/
-///        32^3), the coarse-granularity analogue of FillLeafInvertMaskFunctor. Per node: seed =
-///        childless slots passing the §6d.4 gate (sawInterior && !sawExterior — errs to exterior on
-///        mixed evidence, the safe side), then a monotone ON-flood over 6-adjacent CHILDLESS slots;
-///        REFINED slots are walls. Safety invariant: two adjacent childless slots can never be on
-///        opposite sides of the surface (the surface between them would force refinement), so the
-///        flood cannot leak interior -> exterior. One block per node, 512 threads striding the slots;
-///        slot bits live in shared memory as packed words (Mask<4> 512 B / Mask<5> 4 KB).
+/// @brief Within-node flood at a coarse level (LEVEL 1 = lower/16^3, 2 = upper/32^3): the coarse
+///        analogue of FillLeafInvertMaskFunctor. Seeds are childless slots with interior evidence and
+///        none to the contrary (mixed evidence errs to exterior, the safe side), then a monotone
+///        ON-flood over 6-adjacent childless slots with refined slots as walls.
+///
+///        The flood cannot leak interior -> exterior because two adjacent CHILDLESS slots can never
+///        straddle the surface -- a surface between them would have forced refinement. One block per
+///        node, 512 threads striding the slots, slot bits packed in shared memory.
 template <typename BuildT, int LEVEL>
 struct CoarseInvertFloodFunctor
 {
@@ -1436,16 +1559,27 @@ struct InclusionProbeFunctor
 };
 
 // Flip each voxel's sign once per enclosing surface: sign *= (-1)^depth(surface).
-struct FlipSignByDepthFunctor
+/// @brief CUDA functor: turn per-surface signs into the composed sign, under either nesting rule.
+///        One thread per sidecar slot via lambdaKernel.
+///
+///        Both rules are the same count. A voxel belongs to exactly one surface, and its sign there
+///        already says whether it is inside THAT one, so the number of surfaces enclosing it is the
+///        surface's own nesting depth plus one if the voxel sits inside it. EvenOdd then calls the
+///        voxel interior on an odd count, Solid on any non-zero count -- which leaves only the
+///        outermost boundary of each object separating inside from outside.
+struct ResolveNestingFunctor
 {
-    __device__ void operator()(size_t v, const uint32_t* d_surfaceLabel, const uint8_t* d_flip,
-                               uint32_t surfaceCount, int8_t* d_sign) const
+    __device__ void operator()(size_t v, const uint32_t* d_surfaceLabel, const uint32_t* d_depth,
+                               uint32_t surfaceCount, bool evenOdd, int8_t* d_sign) const
     {
-        if (v == 0) return;                       // slot 0 is the background
+        if (v == 0) return;                                  // slot 0 is the background
         const uint32_t s = d_surfaceLabel[v];
-        if (s < surfaceCount && d_flip[s]) d_sign[v] = int8_t(-d_sign[v]);
+        if (s >= surfaceCount) return;
+        const uint32_t enclosing = d_depth[s] + (d_sign[v] < int8_t(0) ? 1u : 0u);
+        const bool interior = evenOdd ? ((enclosing & 1u) != 0u) : (enclosing != 0u);
+        d_sign[v] = interior ? int8_t(-1) : int8_t(1);
     }
-};
+};// sdf_detail::ResolveNestingFunctor
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -1453,9 +1587,9 @@ template <typename BuildT>
 template <typename BufferT>
 GridHandle<BufferT>
 SurfaceSigner<BuildT>::computeDerivedTopology(const GridT* d_srcGrid, const float* d_udf,
-                                          float voxelSize, const BufferT& buffer)
+                                          float voxelSize, float isoValue, const BufferT& buffer)
 {
-    using PruneOp = UDFBarrierPruneMaskFunctor<BuildT>;
+    using PruneOp = UDFBarrierPruneMaskFunctor<BuildT>; //todo: this PruneOp is too misleading let's be more specific. PruneBarrierOp or something like that.
 
     // Barrier threshold √3/2 voxels expressed in the sidecar's WORLD units, squared.
     const float    barrierSqWorld = 0.75f * voxelSize * voxelSize;
@@ -1465,10 +1599,10 @@ SurfaceSigner<BuildT>::computeDerivedTopology(const GridT* d_srcGrid, const floa
     auto  retainMask   = nanovdb::cuda::DeviceBuffer::create(
         std::size_t(srcLeafCount) * sizeof(nanovdb::Mask<3>), nullptr, false);
     auto* d_retainMask = static_cast<nanovdb::Mask<3>*>(retainMask.deviceData());
-
+    // todo: here we may have to consider that barrier voxel should be voxel neighbor to outside voxels.
     if (mVerbose==1) mTimer.start("Prune barrier shell -> derived topology");
     util::cuda::operatorKernel<PruneOp><<<srcLeafCount, PruneOp::MaxThreadsPerBlock, 0, mStream>>>(
-        d_srcGrid, d_udf, barrierSqWorld, d_retainMask);
+        d_srcGrid, d_udf, isoValue, barrierSqWorld, d_retainMask);
     cudaCheckError();
 
     // Topological pruning -> clean, topology-only derived index grid (UDF no longer needed).
@@ -1546,9 +1680,32 @@ void SurfaceSigner<BuildT>::injectSignsToOriginal(const GridT* d_origGrid, const
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 template <typename BuildT>
+void SurfaceSigner<BuildT>::signBarrierAsInterior(const GridT* d_grid)
+{
+    const uint64_t activeCount = activeCountOf(d_grid);
+    const uint64_t slots       = activeCount + 1;
+
+    mSignedVoxelSign = nanovdb::cuda::DeviceBuffer::create(slots * sizeof(int8_t), nullptr, false);
+    cudaCheck(cudaMemsetAsync(mSignedVoxelSign.deviceData(), 0, slots * sizeof(int8_t), mStream));
+    cudaCheck(cudaMemsetAsync(mSignedVoxelSign.deviceData(), 1, sizeof(int8_t), mStream)); // slot 0 = +1
+    if (leafCountOf(d_grid) == 0) return;
+
+    if (mVerbose==1) mTimer.start("Sign: barrier voxels (all interior)");
+    util::cuda::lambdaKernel<<<(unsigned int)((slots + 255) / 256), 256, 0, mStream>>>(
+        slots, BarrierToInteriorFunctor{}, deviceOriginalVoxelSign(), deviceSignedVoxelSign());
+    cudaCheckError();
+    // The kernel also writes slot 0, which holds +1 rather than a voxel sign; restore it.
+    const int8_t one = 1;
+    cudaCheck(cudaMemcpyAsync(mSignedVoxelSign.deviceData(), &one, sizeof(int8_t),
+                              cudaMemcpyHostToDevice, mStream));
+    cudaCheck(cudaStreamSynchronize(mStream));
+    if (mVerbose==1) mTimer.stop();
+}// SurfaceSigner<BuildT>::signBarrierAsInterior
+
+template <typename BuildT>
 void SurfaceSigner<BuildT>::signBarrier(const GridT* d_grid, const uint32_t* d_index,
                                     const nanovdb::Vec3f* d_points, const nanovdb::Vec3i* d_triangles,
-                                    const nanovdb::Map& map)
+                                    const nanovdb::Map& map, float isoValue, float voxelSize)
 {
     const uint64_t activeCount = activeCountOf(d_grid);
     const uint32_t leafCount = leafCountOf(d_grid);
@@ -1564,7 +1721,8 @@ void SurfaceSigner<BuildT>::signBarrier(const GridT* d_grid, const uint32_t* d_i
     if (mVerbose==1) mTimer.start("Sign: barrier voxels (intersecting-voxel-sign mirror)");
     util::cuda::operatorKernel<Op><<<leafCount, Op::MaxThreadsPerBlock, 0, mStream>>>(
         d_grid, deviceOriginalVoxelSign(), deviceSignedVoxelSign(),
-        d_index, d_points, d_triangles, map);
+        d_index, d_points, d_triangles, map,
+        (voxelSize > 0.f) ? double(isoValue) / double(voxelSize) : 0.0);
     cudaCheckError();
     if (mVerbose==1) mTimer.stop();
 }// SurfaceSigner<BuildT>::signBarrier
@@ -1577,7 +1735,8 @@ void SurfaceSigner<BuildT>::signBarrier(const GridT* d_grid, const uint32_t* d_i
 /// writes, and stops when a round decides nothing.
 template <typename BuildT>
 void SurfaceSigner<BuildT>::signBarrierByBalls(const GridT* d_grid, const float* d_udf,
-                                               float voxelSize, int maxRounds, int radius)
+                                               float voxelSize, int maxRounds, int radius,
+                                               float isoValue)
 {
     const uint64_t activeCount = activeCountOf(d_grid);
     const uint32_t leafCount   = leafCountOf(d_grid);
@@ -1597,15 +1756,14 @@ void SurfaceSigner<BuildT>::signBarrierByBalls(const GridT* d_grid, const float*
     auto  counters = nanovdb::cuda::DeviceBuffer::create(2 * sizeof(uint32_t), nullptr, false);
     auto* d_counters = static_cast<uint32_t*>(counters.deviceData());
 
-    // One persistent bit per slot: which voxels have ever been proven both ways. Zeroed once, so a
-    // voxel is tallied on its first contradiction and never again.
-    const uint64_t contraWords = (activeCount + 1 + 31) / 32;
-    auto  contraBuf   = nanovdb::cuda::DeviceBuffer::create(contraWords * sizeof(uint32_t), nullptr, false);
-    auto* d_everContra = static_cast<uint32_t*>(contraBuf.deviceData());
+    // One BIT per slot, zeroed ONCE and never per round, so a contradicted voxel is counted the
+    // first time it is seen and not again: it is re-detected every round (a contradiction writes
+    // back 0, which is not a change, so the voxel never settles).
+    const std::size_t contraWords = std::size_t((activeCount + 1 + 31) / 32);
+    auto  everContra   = nanovdb::cuda::DeviceBuffer::create(contraWords * sizeof(uint32_t), nullptr, false);
+    auto* d_everContra = static_cast<uint32_t*>(everContra.deviceData());
     cudaCheck(cudaMemsetAsync(d_everContra, 0, contraWords * sizeof(uint32_t), mStream));
 
-    // Both counters start at zero. Only the change counter is reset per round below; the
-    // contradiction tally is a running total, so this is the only time it is cleared.
     cudaCheck(cudaMemsetAsync(d_counters, 0, 2 * sizeof(uint32_t), mStream));
 
     int8_t* labelIn  = static_cast<int8_t*>(mBallVoxelSign.deviceData());
@@ -1615,11 +1773,11 @@ void SurfaceSigner<BuildT>::signBarrierByBalls(const GridT* d_grid, const float*
     if (mVerbose==1) mTimer.start("Sign: barrier voxels (ball certification)");
     uint32_t host[2] = {0, 0};
     for (int r = 0; r < maxRounds; ++r) {
-        // Only the change counter resets; the contradiction tally accumulates across rounds.
+        // Only 'changed' resets; the contradiction tally accumulates across rounds by construction.
         cudaCheck(cudaMemsetAsync(d_counters, 0, sizeof(uint32_t), mStream));
         util::cuda::operatorKernel<Op><<<leafCount, Op::MaxThreadsPerBlock, 0, mStream>>>(
             d_grid, labelIn, labelOut, d_udf, voxelSize, d_counters, d_counters + 1, d_everContra,
-            radius);
+            radius, isoValue);
         cudaCheckError();
         cudaCheck(cudaMemcpyAsync(host, d_counters, 2 * sizeof(uint32_t), cudaMemcpyDeviceToHost, mStream));
         cudaCheck(cudaStreamSynchronize(mStream));
@@ -1824,7 +1982,8 @@ void SurfaceSigner<BuildT>::fillRootInteriorMask(const GridT* d_grid, const int8
 //-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 template <typename BuildT>
-void MeshToSDF<BuildT>::build()
+void MeshToSDF<BuildT>::
+    build()
 {
     // Time each phase into mPhaseMs (see phaseMs()). The stream sync before every mark makes the
     // marks true phase boundaries rather than kernel-launch boundaries, so the five numbers sum to
@@ -1838,6 +1997,11 @@ void MeshToSDF<BuildT>::build()
         ++phase;
     };
 
+    // The isovalue only ever moves the surface outward, and a negative one would ask for a level set
+    // the unsigned distance does not have.
+    if (mIsoValue < 0.f)
+        throw std::runtime_error("MeshToSDF: setIsoValue() must be >= 0");
+
     mark();
     this->rasterize();          // mesh -> narrow band, with the UDF and nearest-triangle sidecars
     mark();
@@ -1846,9 +2010,10 @@ void MeshToSDF<BuildT>::build()
     for (uint32_t i = 0; i < uint32_t(mSurfaces.size()); ++i)
         this->signSurface(i);   // carve surface i out, prune its barrier shell, label, and sign it alone
     mark();
-    this->composeByInclusion(); // nesting parity per surface, then merge the signs onto the band
+    this->composeByInclusion();  // nesting parity per surface, then merge the signs onto the band
     mark();
-    this->fillOnOriginal();     // extend those signs off the band as invert masks
+    this->finalizeMagnitudes();  // signs are settled: report |udf - isoValue|, floor the interior
+    this->fillOnOriginal();      // extend those signs off the band as invert masks
     mark();
 }// MeshToSDF<BuildT>::build
 
@@ -1859,23 +2024,17 @@ void MeshToSDF<BuildT>::rasterize()
 {
     const float voxelSize = float(mMap.getVoxelSize()[0]);
 
-    // With an offset the interface moves out to udf == mOffset, so rasterize a band wide enough to
-    // still hold mBandWidth voxels of it on both sides once re-centred below.
-    const float bandWidth = mBandWidth + (voxelSize > 0.f ? mOffset / voxelSize : 0.f);
+    // The signed surface stands mIsoValue out from the mesh, so the band has to reach that far again
+    // to still hold mBandWidth voxels beyond it. Rasterizing 3 + isoValue/voxelSize wide and signing
+    // the isosurface lands mBandWidth voxels of band outside it -- the width the caller asked for,
+    // measured where they meant it.
+    //TODO: in the future, we may have to prune inside voxels to keep bandwidth 3 after iso value setting.
+    const float extra = (voxelSize > 0.f) ? mIsoValue / voxelSize : 0.f;
 
     MeshToGrid<BuildT> converter(mPoints, mPointCount, mTriangles, mTriangleCount, mMap, mStream);
     converter.setVerbose(mVerbose);
-    converter.setNarrowBandWidth(bandWidth);
+    converter.setNarrowBandWidth(mBandWidth + extra);
     std::tie(mGridHandle, mUDF, mIndex) = converter.getHandleAndUDFAndIndex();
-
-    if (mOffset != 0.f) {
-        // udf -> |udf - offset|, over every slot including the background at 0.
-        const uint64_t slots = util::cuda::DeviceGridTraits<BuildT>::getActiveVoxelCount(this->deviceGrid()) + 1;
-        util::cuda::lambdaKernel<<<(unsigned int)((slots + 255) / 256), 256, 0, mStream>>>(
-            slots, sdf_detail::UDFOffsetFunctor{},
-            static_cast<float*>(mUDF.deviceData()), mOffset);
-        cudaCheckError();
-    }
 }// MeshToSDF<BuildT>::rasterize
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -1904,18 +2063,20 @@ void MeshToSDF<BuildT>::partition()
 /// stay empty and the rasterized arrays are used directly. That is a memory decision: carving
 /// duplicates the grid plus the UDF, index and sign sidecars, ~9 bytes per voxel.
 template <typename BuildT>
-void MeshToSDF<BuildT>::signSurface(uint32_t surface)
+void MeshToSDF<BuildT>::signSurface(uint32_t surface) //todo: change name from Surface to Component
 {
     using Traits = util::cuda::DeviceGridTraits<BuildT>;
 
     SurfaceField&  sf         = mSurfaces[surface];
     const auto*    d_orig     = this->deviceGrid();
-    const uint32_t origLeaves = Traits::getTreeData(d_orig).mNodeCount[0];
+    const uint32_t origLeaves = Traits::getTreeData(d_orig).mNodeCount[0]; //todo: rename more clearer (origLeafCounts or something)
     const float    voxelSize  = float(mMap.getVoxelSize()[0]);
 
     // (a) Carve this surface out, and re-index onto the carved grid the two sidecars the stages below
     //     read. Carving renumbers the value slots, so the transfer goes through the injection functor
     //     (leaf-origin pairing + popcount rank) rather than a memcpy.
+    // TODO: specify that most case: surface count is zero. single closed surface is the most common case input
+    // TODO: could be a function? such as carveComponent(i)
     if (mSurfaces.size() > 1) {
         util::cuda::Timer timer(mStream);
         if (mVerbose==1) timer.start("Carve closed surface out of the band");
@@ -1950,12 +2111,13 @@ void MeshToSDF<BuildT>::signSurface(uint32_t surface)
 
     const auto* d_grid = this->surfaceGrid(surface);
     // TODO: Seems signer does many things. it not only signs the narrow band, it fills the inside. In that sense, we may have to reconsider the class name
+    // TODO: or we can reconsider creating another class which "fills inside"
     sf.signer = std::make_unique<Signer>(mStream);
     sf.signer->setVerbose(mVerbose);
 
     // (b) Drop the barrier shell, then label what remains. This surface's inner and outer sides fall
     //     apart into separate components — the split the signing rule relies on.
-    sf.derived = sf.signer->computeDerivedTopology(d_grid, this->surfaceUdf(surface), voxelSize);
+    sf.derived = sf.signer->computeDerivedTopology(d_grid, this->surfaceUdf(surface), voxelSize, mIsoValue);
     const auto* d_derived = sf.derived.template deviceGrid<BuildT>();
 
     sf.cc = std::make_unique<ConnectedComponents<BuildT>>(d_derived, mStream);
@@ -1967,11 +2129,20 @@ void MeshToSDF<BuildT>::signSurface(uint32_t surface)
     //     barrier shell that (b) set aside.
     sf.signer->signNonBarrier(d_derived, sf.ccLabels.first);
     sf.signer->injectSignsToOriginal(d_grid, d_derived);
-    if (mBarrierSigning == BarrierSigning::Ball)
-        sf.signer->signBarrierByBalls(d_grid, this->surfaceUdf(surface), float(voxelSize),
-                                      32, mBallStencilRadius);
-    else
-        sf.signer->signBarrier(d_grid, this->surfaceIndex(surface), mPoints, mTriangles, mMap);
+    switch (mBarrierSigning) {
+    case BarrierSigning::Ball:
+        sf.signer->signBarrierByBalls(d_grid, this->surfaceUdf(surface), voxelSize,
+                                      32, mBallStencilRadius, mIsoValue);
+        break;
+    case BarrierSigning::Heuristic:
+        sf.signer->signBarrier(d_grid, this->surfaceIndex(surface), mPoints, mTriangles, mMap,
+                               mIsoValue, voxelSize);
+        break;
+    case BarrierSigning::Interior:
+    default:
+        sf.signer->signBarrierAsInterior(d_grid);
+        break;
+    }
 
     // (d) Extend the sign off the band. That is what lets the inclusion test query this field at
     //     another surface's band — and, for a single-surface mesh, it is already the finished result.
@@ -1987,7 +2158,7 @@ void MeshToSDF<BuildT>::signSurface(uint32_t surface)
 /// fields into one sign array on the rasterized band, negating the odd-depth surfaces on the way in.
 /// Requires every field to be complete through its invert-mask fill.
 template <typename BuildT>
-void MeshToSDF<BuildT>::composeByInclusion()
+void MeshToSDF<BuildT>::composeByInclusion() //todo: change this function name since we may add another parity policty
 {
     using Traits = util::cuda::DeviceGridTraits<BuildT>;
 
@@ -1998,7 +2169,8 @@ void MeshToSDF<BuildT>::composeByInclusion()
     // band — so there is no depth to recover and nothing to gather. Aliasing here is what keeps the
     // single-surface case free of the extra full-length sign array a merge would allocate.
     if (numSurfaces == 1 && !mSurfaces[0].subGrid.bufferSize()) {
-        mParity.assign(1, 0);
+        // Depth 0 under either rule: the surface's own field is already the answer.
+        mNestingDepth.assign(1, 0u);
         mSign = mSurfaces[0].signer->deviceSignedVoxelSign();
         return;
     }
@@ -2045,19 +2217,14 @@ void MeshToSDF<BuildT>::composeByInclusion()
     cudaCheck(cudaMemcpyAsync(inc.data(), d_inc, inc.size() * sizeof(int8_t), cudaMemcpyDeviceToHost, mStream));
     cudaCheck(cudaStreamSynchronize(mStream));
 
-    std::vector<uint32_t> depth(numSurfaces, 0);
-    mParity.assign(numSurfaces, 0);
-    for (uint32_t j = 0; j < numSurfaces; ++j) {
+    mNestingDepth.assign(numSurfaces, 0u);
+    for (uint32_t j = 0; j < numSurfaces; ++j)
         for (uint32_t i = 0; i < numSurfaces; ++i)
-            if (i != j && inc[std::size_t(i) * numSurfaces + j] < 0) ++depth[j];   // field i says surface j is inside
-        // Each enclosing surface flips this one's signs once, and flipping twice is the identity, so
-        // only the low bit of the depth survives — that single bit is all step (4) needs.
-        mParity[j] = uint8_t(depth[j] & 1u);
-    }
+            if (i != j && inc[std::size_t(i) * numSurfaces + j] < 0) ++mNestingDepth[j];  // field i says j is inside
 
     // (4) Merge. Gather every surface's signs back onto the rasterized band — the surfaces partition
     //     its active voxels, so the per-surface injections write disjoint slots and together cover all —
-    //     then negate the odd-depth ones in place.
+    //     then resolve each voxel against the nesting rule in place.
     mComposedSign = Buffer::create((origActive + 1) * sizeof(int8_t), nullptr, false);
     mSign = static_cast<int8_t*>(mComposedSign.deviceData());
     cudaCheck(cudaMemsetAsync(mSign, 1, (origActive + 1) * sizeof(int8_t), mStream));  // slot 0 = background +1
@@ -2069,15 +2236,56 @@ void MeshToSDF<BuildT>::composeByInclusion()
             d_sub, d_orig, mSurfaces[i].signer->deviceSignedVoxelSign(), mSign);
         cudaCheckError();
     }
-    auto  flipBuf = Buffer::create(numSurfaces * sizeof(uint8_t), nullptr, false);
-    auto* d_flip  = static_cast<uint8_t*>(flipBuf.deviceData());
-    cudaCheck(cudaMemcpyAsync(d_flip, mParity.data(), numSurfaces * sizeof(uint8_t), cudaMemcpyHostToDevice, mStream));
+    auto  depthBuf = Buffer::create(numSurfaces * sizeof(uint32_t), nullptr, false);
+    auto* d_depth  = static_cast<uint32_t*>(depthBuf.deviceData());
+    cudaCheck(cudaMemcpyAsync(d_depth, mNestingDepth.data(), numSurfaces * sizeof(uint32_t),
+                              cudaMemcpyHostToDevice, mStream));
     util::cuda::lambdaKernel<<<(unsigned int)((origActive + 256) / 256), 256, 0, mStream>>>(
-        origActive + 1, sdf_detail::FlipSignByDepthFunctor{}, mSurfaceLabels.first, d_flip, numSurfaces, mSign);
+        origActive + 1, sdf_detail::ResolveNestingFunctor{}, mSurfaceLabels.first, d_depth,
+        numSurfaces, mNestingRule == NestingRule::EvenOdd, mSign);
     cudaCheckError();
     cudaCheck(cudaStreamSynchronize(mStream));
     if (mVerbose==1) timer.stop();
 }// MeshToSDF<BuildT>::composeByInclusion
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+/// @details Step 4b. Rewrites the UDF sidecar from "distance to the mesh" into the magnitude this
+///          pipeline reports, now that every sign is settled: udf -> |udf - mIsoValue|, then interior
+///          magnitudes floored at half a voxel diagonal. See sdf_detail::IsoMagnitudeFunctor for why
+///          each step is what it is.
+///
+///          The ordering is the whole point. Folding about the isovalue throws away which side of the
+///          MESH a voxel is on, and every stage before this one needed exactly that -- the barrier
+///          test, the components, the min-vertex seed. Running here costs one pass over the sidecar
+///          and leaves the signs untouched, so nothing downstream has to be redone.
+///
+///          Runs before fillOnOriginal() only for tidiness; the fill reads signs, not magnitudes.
+template <typename BuildT>
+void MeshToSDF<BuildT>::finalizeMagnitudes()
+{
+    if (mIsoValue == 0.f || mSurfaces.empty() || mSign == nullptr) return;
+
+    const float voxelSize = float(mMap.getVoxelSize()[0]);
+
+    // sqrt(3)/2 voxels: the same half-diagonal the barrier test uses, so the floor lands exactly at
+    // the edge of the shell the oracle was responsible for.
+    const float interiorFloor = 0.8660254f * voxelSize;
+
+    using Op = sdf_detail::IsoMagnitudeFunctor<BuildT>;
+    const uint32_t leaves = util::cuda::DeviceGridTraits<BuildT>::getTreeData(this->deviceGrid()).mNodeCount[0];
+    if (leaves)
+        util::cuda::operatorKernel<Op><<<leaves, Op::MaxThreadsPerBlock, 0, mStream>>>(
+            this->deviceGrid(), static_cast<float*>(mUDF.deviceData()), mSign, mIsoValue, interiorFloor);
+    cudaCheckError();
+
+    // Slot 0 is the background sentinel, not a voxel. The kernel above walks active voxels and never
+    // reaches it, but it is restated here so the value is the exterior background whatever the
+    // rasterizer left, rather than something an earlier stage happened to write.
+    const float bg = mBandWidth * voxelSize;
+    cudaCheck(cudaMemcpyAsync(mUDF.deviceData(), &bg, sizeof(float), cudaMemcpyHostToDevice, mStream));
+    cudaCheck(cudaStreamSynchronize(mStream));
+}// MeshToSDF<BuildT>::finalizeMagnitudes
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 

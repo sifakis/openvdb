@@ -27,6 +27,7 @@
 #ifdef NANOVDB_USE_OPENVDB
 #include <openvdb/openvdb.h>
 #include <openvdb/tools/MeshToVolume.h>  // meshToLevelSet — independent sign cross-check
+#include <openvdb/tools/VolumeToMesh.h>  // volumeToMesh — extract our own result back to a mesh
 #endif
 
 #include <thrust/universal_vector.h>
@@ -683,17 +684,37 @@ SdfPipeline* buildMeshToSdf(const std::vector<nanovdb::Vec3f>& points,
     p->sdf->setNarrowBandWidth(bandWidth);
     // CC_BARRIER=ball selects ball-intersection certification for the barrier voxels instead of the
     // closest-point heuristic. Both are timed under the same label so the two runs are comparable.
-    // CC_OFFSET=<world units> dilates the surface before signing, i.e. the pipeline solves for the
-    // signed distance to { x : udf(x) == offset }. This is the operation a shrink-wrap / dilation
-    // pipeline asks for, and it is exact on a sphere, which is what the analytic check below uses.
-    if (const char* o = std::getenv("CC_OFFSET")) p->sdf->setOffset(std::stof(o));
+    // CC_ISOVALUE=<world> signs { x : udf(x) == isovalue } rather than the mesh, so the result is the
+    // signed distance to a surface standing that far out from it -- the dilation an offset or
+    // shrink-wrap pipeline wants, and also what gives an open mesh an interior. Must be >= 0. Exact
+    // on a sphere (a sphere dilated by t is a sphere of radius R+t), which is what lets the analytic
+    // check below stay a proof rather than a smoke test.
+    if (const char* v = std::getenv("CC_ISOVALUE")) p->sdf->setIsoValue(std::stof(v));
 
     // CC_BALL_RADIUS=<n> widens the ball stencil from the 26 neighbours (1) outward.
     if (const char* r = std::getenv("CC_BALL_RADIUS")) p->sdf->setBallStencilRadius(std::atoi(r));
 
-    if (const char* m = std::getenv("CC_BARRIER"))
-        if (std::string(m) == "ball")
-            p->sdf->setBarrierSigning(MeshToSDFT::BarrierSigning::Ball);
+    // CC_BARRIER picks how the barrier shell is signed: "interior" (the default -- every barrier
+    // voxel interior, no oracle), "heuristic" (OpenVDB's ComputeIntersectingVoxelSign mirror) or
+    // "ball" (ball-intersection certification).
+    // CC_NESTING picks how a point enclosed by several closed surfaces is signed: "evenodd" (the
+    // default -- nested shells are cavities) or "solid" (only the outermost boundary separates).
+    if (const char* r = std::getenv("CC_NESTING")) {
+        const std::string rule(r);
+        if      (rule == "solid")   p->sdf->setNestingRule(MeshToSDFT::NestingRule::Solid);
+        else if (rule == "evenodd") p->sdf->setNestingRule(MeshToSDFT::NestingRule::EvenOdd);
+        else std::cerr << "CC_NESTING: unknown rule '" << rule
+                       << "' (want evenodd|solid); keeping the default\n";
+    }
+
+    if (const char* m = std::getenv("CC_BARRIER")) {
+        const std::string mode(m);
+        if      (mode == "ball")      p->sdf->setBarrierSigning(MeshToSDFT::BarrierSigning::Ball);
+        else if (mode == "heuristic") p->sdf->setBarrierSigning(MeshToSDFT::BarrierSigning::Heuristic);
+        else if (mode == "interior")  p->sdf->setBarrierSigning(MeshToSDFT::BarrierSigning::Interior);
+        else std::cerr << "CC_BARRIER: unknown mode '" << mode
+                       << "' (want interior|heuristic|ball); keeping the default\n";
+    }
     p->sdf->build();
 
     // Per-phase wall time. Rasterization normally dominates the total, so it is reported separately
@@ -710,10 +731,18 @@ SdfPipeline* buildMeshToSdf(const std::vector<nanovdb::Vec3f>& points,
     printGridDiagnostics(p->sdf->gridHandle(), "Rasterized UDF grid");
     std::cout << "Closed surfaces (un-pruned components): " << p->sdf->surfaceCount() << "\n";
     for (uint32_t i = 0; i < p->sdf->surfaceCount(); ++i)
-        if (p->sdf->nestingParity()[i])
-            std::cout << "  surface " << i << ": odd nesting depth -> signs flipped\n";
+        if (p->sdf->nestingDepth()[i])
+            std::cout << "  surface " << i << ": enclosed by " << p->sdf->nestingDepth()[i]
+                      << " other surface(s)\n";
 
-    validateUDFAndIndex(*p->sdf, points, triangles, bandWidth);
+    // With an isovalue the UDF sidecar ends up holding distance to the ISOSURFACE, so recomputing it
+    // from the nearest triangle would disagree by exactly the isovalue. The check validates
+    // rasterization, which the isovalue does not touch, so skip it rather than weaken it.
+    if (std::getenv("CC_ISOVALUE"))
+        std::cout << "UDF nearest-triangle index validation:  skipped (the isovalue moves the surface "
+                     "away from the mesh the triangles describe)\n";
+    else
+        validateUDFAndIndex(*p->sdf, points, triangles, bandWidth);
     return p;
 }
 
@@ -774,6 +803,7 @@ void cpuBallCertify(const GridT* g,
             }
 
     std::vector<int8_t> label(signIn.begin(), signIn.end());   // frozen once non-zero
+    std::vector<char>   everContra(label.size(), 0);        // one flag per slot, never reset
     std::vector<float>  udf(udfWorld.size());
     for (std::size_t i = 0; i < udfWorld.size(); ++i) udf[i] = float(udfWorld[i] / voxelSize);
 
@@ -810,7 +840,12 @@ void cpuBallCertify(const GridT* g,
                 if (double(udf[nv]) + dq <= e.len + 1e-5) continue;
                 if (ln > 0) ext = true; else inr = true;
             }
-            if (ext && inr) { ++st.contradictions; continue; }   // the lemma forbids this
+            // The lemma forbids this. Count the VOXEL once, not once per round: a contradicted
+            // voxel never settles, so it is re-detected on every subsequent round.
+            if (ext && inr) {
+                if (!everContra[qv]) { everContra[qv] = 1; ++st.contradictions; }
+                continue;
+            }
             if (ext || inr) decided.emplace_back(qv, ext ? int8_t(1) : int8_t(-1));
         }
         if (decided.empty()) break;
@@ -840,6 +875,121 @@ void cpuBallCertify(const GridT* g,
     }
 }
 
+#ifdef NANOVDB_USE_OPENVDB
+/// @brief Bake a completed MeshToSDF result into a self-contained OpenVDB level set.
+///
+/// The pipeline does not store a signed distance anywhere: it stores an unsigned distance plus a
+/// sign per active voxel, and carries the sign beyond the band in four sidecars (a bit per inactive
+/// voxel of a materialized leaf, a bit per childless lower and upper tile, and a small array for the
+/// regions with no node at all). This resolves all of that into ordinary values, so the result can
+/// be handed to any OpenVDB tool -- volumeToMesh below, or a shrink-wrap loop -- with no sidecars
+/// travelling alongside it.
+///
+/// Values follow the OpenVDB level-set convention: inside the band the true signed distance, beyond
+/// it a saturated +/-background, which is all the pipeline ever knew there anyway.
+///
+/// @note The tree layouts line up (both are 5-4-3), so each sidecar maps onto the matching level.
+static openvdb::FloatGrid::Ptr toFloatGrid(const MeshToSDFT& sdf, const std::string& name)
+{
+    using BuildT = nanovdb::ValueOnIndex;
+
+    const auto&  map       = sdf.map();
+    const double voxelSize = map.getVoxelSize()[0];
+    const float  background = float(sdf.narrowBandWidth() * voxelSize);
+
+    auto grid = openvdb::FloatGrid::create(background);
+    grid->setName(name);
+    grid->setGridClass(openvdb::GRID_LEVEL_SET);
+    grid->setTransform(openvdb::math::Transform::createLinearTransform(voxelSize));
+
+    // Host copies of the grid blob and every sidecar this reads.
+    const auto&    handle    = sdf.gridHandle();
+    const uint64_t gridBytes = handle.gridSize();
+    void*          blob      = nullptr;
+    cudaCheck(cudaMallocHost(&blob, gridBytes));
+    cudaCheck(cudaMemcpy(blob, handle.deviceData(), gridBytes, cudaMemcpyDeviceToHost));
+    const auto* h_grid = reinterpret_cast<const nanovdb::NanoGrid<BuildT>*>(blob);
+
+    const uint32_t leafCount  = h_grid->tree().nodeCount(0);
+    const uint32_t lowerCount = h_grid->tree().nodeCount(1);
+    const uint32_t upperCount = h_grid->tree().nodeCount(2);
+    const uint64_t active     = nanovdb::util::cuda::DeviceGridTraits<BuildT>::getActiveVoxelCount(
+                                    sdf.deviceGrid());
+
+    std::vector<float>            udf(active + 1);
+    std::vector<int8_t>           sign(active + 1);
+    std::vector<nanovdb::Mask<3>> leafInv(leafCount);
+    std::vector<nanovdb::Mask<4>> lowInv(lowerCount);
+    std::vector<nanovdb::Mask<5>> upInv(upperCount);
+    cudaCheck(cudaMemcpy(udf.data(),  sdf.deviceUDF(),  (active + 1) * sizeof(float),  cudaMemcpyDeviceToHost));
+    cudaCheck(cudaMemcpy(sign.data(), sdf.deviceSign(), (active + 1) * sizeof(int8_t), cudaMemcpyDeviceToHost));
+    if (leafCount)  cudaCheck(cudaMemcpy(leafInv.data(), sdf.deviceLeafInvertMask(),
+                              std::size_t(leafCount) * sizeof(nanovdb::Mask<3>), cudaMemcpyDeviceToHost));
+    if (lowerCount) cudaCheck(cudaMemcpy(lowInv.data(), sdf.deviceLowerInvertMask(),
+                              std::size_t(lowerCount) * sizeof(nanovdb::Mask<4>), cudaMemcpyDeviceToHost));
+    if (upperCount) cudaCheck(cudaMemcpy(upInv.data(), sdf.deviceUpperInvertMask(),
+                              std::size_t(upperCount) * sizeof(nanovdb::Mask<5>), cudaMemcpyDeviceToHost));
+
+    auto acc = grid->getAccessor();
+
+    // (1) Leaves: active voxels get their signed distance and stay active; the inactive ones in the
+    //     same leaf get a saturated background whose sign comes from the leaf invert bit. Writing
+    //     them is what stops volumeToMesh from seeing a spurious crossing at the band's inner edge.
+    const auto* leaves = h_grid->tree().getFirstLeaf();
+    for (uint32_t li = 0; li < leafCount; ++li) {
+        const auto&          leaf = leaves[li];
+        const nanovdb::Coord o    = leaf.origin();
+        for (uint32_t n = 0; n < 512; ++n) {
+            const nanovdb::Coord ijk = o + nanovdb::NanoLeaf<BuildT>::OffsetToLocalCoord(n);
+            const openvdb::Coord c(ijk[0], ijk[1], ijk[2]);
+            if (leaf.isActive(n)) {
+                const uint64_t slot = leaf.getValue(n);
+                acc.setValue(c, float(sign[slot]) * udf[slot]);
+            } else {
+                acc.setValueOff(c, leafInv[li].isOn(n) ? -background : background);
+            }
+        }
+    }
+
+    // (2) Childless lower and upper slots: one inactive tile each, sign from the matching bit. A
+    //     childless slot cannot be crossed by the surface, so a single value describes all of it.
+    auto fillTiles = [&](const auto* nodes, uint32_t count, const auto* inv, int slots, int level) {
+        for (uint32_t ni = 0; ni < count; ++ni) {
+            const auto& node = nodes[ni];
+            for (int n = 0; n < slots; ++n) {
+                if (node.childMask().isOn(uint32_t(n))) continue;   // refined: handled a level down
+                const nanovdb::Coord g = node.offsetToGlobalCoord(uint32_t(n));
+                acc.addTile(level, openvdb::Coord(g[0], g[1], g[2]),
+                            inv[ni].isOn(uint32_t(n)) ? -background : background, /*active=*/false);
+            }
+        }
+    };
+    fillTiles(h_grid->tree().template getFirstNode<1>(), lowerCount, lowInv.data(), 4096,   1);
+    fillTiles(h_grid->tree().template getFirstNode<2>(), upperCount, upInv.data(), 32768, 2);
+
+    // (3) Regions with no node at all. The sidecar covers a small cell array over the grid's root
+    //     range; a cell that is ON is deep interior, and everything outside the array keeps the
+    //     grid's +background, which is already right.
+    const nanovdb::Coord tileMin = sdf.rootTileMin(), dims = sdf.rootTileDims();
+    const std::size_t    cells   = std::size_t(dims[0]) * dims[1] * dims[2];
+    if (cells) {
+        std::vector<uint8_t> rootInterior(cells);
+        cudaCheck(cudaMemcpy(rootInterior.data(), sdf.deviceRootInterior(), cells, cudaMemcpyDeviceToHost));
+        for (int i = 0; i < dims[0]; ++i)
+        for (int j = 0; j < dims[1]; ++j)
+        for (int k = 0; k < dims[2]; ++k) {
+            if (!rootInterior[(std::size_t(i) * dims[1] + j) * dims[2] + k]) continue;
+            const openvdb::Coord c((tileMin[0] + i) << 12, (tileMin[1] + j) << 12, (tileMin[2] + k) << 12);
+            if (grid->tree().probeConstLeaf(c)) continue;           // a node already covers it
+            acc.addTile(3, c, -background, /*active=*/false);       // root level
+        }
+    }
+
+    cudaCheck(cudaFreeHost(blob));
+    return grid;
+}
+#endif// NANOVDB_USE_OPENVDB
+
 // ---------------------------------------------------------------------------------------------------
 SDFResult validateMeshToSdf(const SdfPipeline* p,
                const std::vector<nanovdb::Vec3f>& points,
@@ -852,7 +1002,9 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
 {
     SDFResult result;
     using BuildT = nanovdb::ValueOnIndex;
-    const float analyticOffset = std::getenv("CC_OFFSET") ? std::stof(std::getenv("CC_OFFSET")) : 0.f;
+    // How far the reported surface sits from the mesh: the isovalue picks which level set is signed.
+    const float analyticOffset =
+        (std::getenv("CC_ISOVALUE") ? std::stof(std::getenv("CC_ISOVALUE")) : 0.f);
     using Traits = nanovdb::util::cuda::DeviceGridTraits<BuildT>;
 
     const auto&                  origHandle   = p->sdf->gridHandle();
@@ -885,6 +1037,8 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
                          std::size_t(origActive + 1) * sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
     uint64_t    totalComponents = 0, derActiveTotal = 0;
+    const char* barrierEnv = std::getenv("CC_BARRIER");
+    const bool  barrierPolicyIsHeuristic = barrierEnv && std::string(barrierEnv) == "heuristic";
     std::size_t adjViolations = 0, signMismatch = 0, injMismatch = 0, barrierMism = 0;
     std::size_t barrierCount = 0, residualZeros = 0, ambiguous = 0;
     BallCertifyStats ballStats[2];   // [0] = 26-neighbourhood, [1] = 5x5x5
@@ -1023,12 +1177,20 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
         cudaCheck(cudaMemcpy(hSurfIndex.data(), p->sdf->surfaceIndex(si),
                              std::size_t(surfActive + 1) * sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
-        std::size_t bCount = 0, bZeros = 0, bAmbig = 0;
-        barrierMism   += cpuSignBarrier(h_surf, gpuSurfSign, gpuSurfSigned, hSurfIndex,
-                                        points, triangles, map, bCount, bZeros, bAmbig);
-        barrierCount  += bCount;
-        residualZeros += bZeros;
-        ambiguous     += bAmbig;
+        // cpuSignBarrier mirrors the HEURISTIC rule, so the comparison only says anything when that
+        // is the policy the pipeline actually ran. Under the other two it would report the policy
+        // difference as an error.
+        if (barrierPolicyIsHeuristic) {
+            std::size_t bCount = 0, bZeros = 0, bAmbig = 0;
+            barrierMism   += cpuSignBarrier(h_surf, gpuSurfSign, gpuSurfSigned, hSurfIndex,
+                                            points, triangles, map, bCount, bZeros, bAmbig);
+            barrierCount  += bCount;
+            residualZeros += bZeros;
+            ambiguous     += bAmbig;
+        } else {
+            for (uint64_t v = 1; v <= surfActive; ++v)
+                if (gpuSurfSign[v] == int8_t(0)) ++barrierCount;
+        }
 
         // ---- DIAGNOSTIC: the same certification on the GPU, compared against the CPU run above
         //      and against the heuristic the pipeline shipped ----
@@ -1087,16 +1249,19 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
         }
         if (gpuSurfSigned[0] != int8_t(1)) ++residualZeros;
 
-        // ---- Contribution to the merge oracle: this surface's signs, negated iff its depth is odd ----
-        const bool flip = (si < p->sdf->nestingParity().size()) && p->sdf->nestingParity()[si];
+        // ---- Contribution to the merge oracle: this surface's signs, resolved against the rule ----
+        const uint32_t sDepth = (si < p->sdf->nestingDepth().size()) ? p->sdf->nestingDepth()[si] : 0u;
+        const bool     rEvenOdd = p->sdf->nestingRule() == MeshToSDFT::NestingRule::EvenOdd;
         for (uint32_t li = 0; li < surfLeaves; ++li) {
             const auto& sleaf = sFirst[li];
             const auto* oleaf = h_orig->tree().root().probeLeaf(sleaf.origin());
             if (!oleaf) continue;
             for (uint32_t n = 0; n < 512; ++n) {
                 if (!sleaf.isActive(n)) continue;
-                const int8_t s = gpuSurfSigned[sleaf.getValue(n)];
-                mergeExpected[oleaf->getValue(n)] = flip ? int8_t(-s) : s;
+                const int8_t   s         = gpuSurfSigned[sleaf.getValue(n)];
+                const uint32_t enclosing = sDepth + (s < int8_t(0) ? 1u : 0u);
+                const bool     interior  = rEvenOdd ? ((enclosing & 1u) != 0u) : (enclosing != 0u);
+                mergeExpected[oleaf->getValue(n)] = interior ? int8_t(-1) : int8_t(1);
             }
         }
 
@@ -1119,9 +1284,14 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
     const bool barrierPass = (barrierMism == 0) && (residualZeros == 0);
     result.barrierMismatches    = barrierMism;
     result.barrierResidualZeros = residualZeros;
-    std::cout << "CC barrier sign validation:             " << (barrierPass ? "PASS" : "FAIL") << " ("
-              << barrierCount << " barrier voxels, " << barrierMism << " mismatches, "
-              << ambiguous << " surface-tangent ties, " << residualZeros << " residual zeros)\n";
+    if (barrierPolicyIsHeuristic)
+        std::cout << "CC barrier sign validation:             " << (barrierPass ? "PASS" : "FAIL") << " ("
+                  << barrierCount << " barrier voxels, " << barrierMism << " mismatches, "
+                  << ambiguous << " surface-tangent ties, " << residualZeros << " residual zeros)\n";
+    else
+        std::cout << "CC barrier sign validation:             skipped (" << barrierCount
+                  << " barrier voxels; the CPU mirror reproduces the heuristic rule, which is not "
+                     "the policy in force)\n";
 
     // ---- DIAGNOSTIC report: the GPU ball certification ----
     if (std::getenv("CC_BALL_GPU")) {
@@ -1179,16 +1349,19 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
     // The surfaces partition the original grid's active voxels, so gathering their signs must cover
     // every slot exactly once; the odd-depth ones are negated on the way in. Reproduced above while
     // walking each surface, and compared here against what the GPU actually composed.
-    {
+    if (analyticOffset != 0.f) {
+        std::cout << "Surface-merge validation:               skipped (the per-surface signs describe "
+                     "the mesh, the composed field the offset surface)\n";
+    } else {
         std::size_t mergeMismatch = 0;
         for (uint64_t i = 0; i <= origActive; ++i)
             if (gpuSigned[i] != mergeExpected[i]) ++mergeMismatch;
-        std::size_t odd = 0;
-        for (uint8_t f : p->sdf->nestingParity()) odd += f;
+        std::size_t nested = 0;
+        for (uint32_t d : p->sdf->nestingDepth()) nested += (d != 0u);
         result.mergeMismatches = mergeMismatch;
         std::cout << "Surface-merge validation:               " << (mergeMismatch == 0 ? "PASS" : "FAIL")
                   << " (" << origActive << " orig voxels, " << p->sdf->surfaceCount() << " surfaces, "
-                  << odd << " at odd nesting depth, " << mergeMismatch << " mismatches)\n";
+                  << nested << " enclosed by another, " << mergeMismatch << " mismatches)\n";
     }
 
 #if 0  // [Retained for reference] white-box CC cross-checks — used the now-private CC internal accessors.
@@ -1345,7 +1518,10 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
     // final per-voxel sign. Conventions match (+ outside / - inside). meshToLevelSet signed-flood-fills,
     // so the sign is defined at every coord (band gives true distance; beyond it, ±background). Voxels
     // essentially on the surface (|value| within a tiny tie band) are reported separately, not counted.
-    {
+    if (analyticOffset != 0.f) {
+        std::cout << "OpenVDB sign cross-check:               skipped (meshToLevelSet describes the "
+                     "mesh, not the offset surface)\n";
+    } else {
         openvdb::initialize();
         const double voxelSize = map.getVoxelSize()[0];
         openvdb::math::Transform::Ptr xform = openvdb::math::Transform::createLinearTransform(voxelSize);
@@ -1486,6 +1662,12 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
     // exact for a box (it underestimates the Euclidean distance outside near corners, which only widens
     // the tie band — the safe direction). Signs are compared in the confident region (|d| >= √3/2
     // voxel); the shell is method-dependent and only reported.
+    // The Solid rule fills whatever the outermost boundary wraps, so a point is inside when ANY
+    // primitive contains it -- exactly union semantics. Ask the oracle the same question the
+    // pipeline was asked, or it would report the rule difference as an error.
+    const bool unionSemantics = analyticUnion ||
+                                (p->sdf->nestingRule() == MeshToSDFT::NestingRule::Solid);
+
     bool haveAnalytic = (analyticSpheres && numAnalyticSpheres > 0) ||
                               (analyticBoxes   && numAnalyticBoxes   > 0);
     const double vsWorld = map.getVoxelSize()[0];
@@ -1518,18 +1700,18 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
                          az = std::fabs(pz - analyticBoxes[4*b+2]);
             accumulate(std::max(ax, std::max(ay, az)) - analyticBoxes[4*b+3]);
         }
-        if (analyticUnion) return sdf;
+        if (unionSemantics) return sdf;
         return (inside & 1) ? -mag : mag;
     };
 
-    // Dilating a sphere of radius R by t gives exactly a sphere of radius R+t, so inflating the
-    // oracle's radii turns the existing analytic check into a correctness proof for the offset.
-    // A dilated BOX is not a bigger box -- its edges become rounded -- so the L-infinity box oracle
-    // would report false mismatches, and the check is skipped rather than trusted.
+    // The t-isosurface of a sphere's distance field is exactly a sphere of radius R+t, so growing the
+    // oracle's radii turns the analytic check into a correctness proof for the isovalue rather than a
+    // smoke test. A dilated BOX is not a box -- its edges round off -- so the L-infinity box oracle
+    // would report false mismatches and is switched off instead of trusted.
     std::vector<double> offsetSpheres;
     if (haveAnalytic && analyticOffset != 0.f) {
         if (numAnalyticBoxes > 0) {
-            std::cout << "Analytic check skipped: an offset box has rounded edges, which the "
+            std::cout << "Analytic check skipped: a dilated box has rounded edges, which the "
                          "box oracle does not model.\n";
             haveAnalytic = false;
         } else {
@@ -1564,12 +1746,43 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
         result.analyticChecked             = true;
         result.analyticConfidentMismatches = aMis;
         result.analyticInShellTies         = aTie;
-        std::cout << (analyticUnion ? "Analytic union sign check:              "
+        std::cout << (unionSemantics ? "Analytic union sign check:              "
                                     : "Analytic even-odd sign check:           ")
                   << (aMis == 0 ? "PASS" : "FAIL")
                   << " (" << origActive << " orig voxels, " << aMis << " mismatches beyond shell";
         if (aMis) std::cout << " (max " << maxAVox << " vox)";
         std::cout << ", " << aTie << " in-shell ties)\n";
+    }
+
+    // ---- Extract our own result back to a mesh, for a geometric comparison against the input ----
+    // Every other check here reads the sign at voxel CENTRES. This one asks a different question:
+    // where does the field actually cross zero, and does the surface that comes out enclose the input?
+    // That is what containment means, and it is not visible in per-voxel signs -- a field can have
+    // every centre right and still cross zero in the wrong place between them.
+    if (const char* meshPath = std::getenv("CC_EXPORT_MESH")) {
+        auto ls = toFloatGrid(*p->sdf, "meshToSdf");
+
+        std::vector<openvdb::Vec3s> pts;
+        std::vector<openvdb::Vec3I> tris;
+        std::vector<openvdb::Vec4I> quads;
+        // adaptivity 0: keep the mesher at grid resolution, so any difference from the input is the
+        // pipeline's, not the mesher's simplification.
+        openvdb::tools::volumeToMesh(*ls, pts, tris, quads, /*isovalue=*/0.0, /*adaptivity=*/0.0);
+
+        std::ofstream obj(meshPath);
+        if (!obj) {
+            std::cerr << "CC_EXPORT_MESH: cannot open " << meshPath << " for writing\n";
+        } else {
+            for (const auto& v : pts) obj << "v " << v[0] << ' ' << v[1] << ' ' << v[2] << '\n';
+            for (const auto& t : tris) obj << "f " << t[0]+1 << ' ' << t[1]+1 << ' ' << t[2]+1 << '\n';
+            for (const auto& q : quads) {   // split each quad, so the file is triangles only
+                obj << "f " << q[0]+1 << ' ' << q[1]+1 << ' ' << q[2]+1 << '\n';
+                obj << "f " << q[0]+1 << ' ' << q[2]+1 << ' ' << q[3]+1 << '\n';
+            }
+            std::cout << "CC_EXPORT_MESH: wrote " << pts.size() << " verts, "
+                      << (tris.size() + 2 * quads.size()) << " triangles to " << meshPath
+                      << "  (level set " << (ls->memUsage() >> 20) << " MiB)\n";
+        }
     }
 
     // ---- Validate the leaf invert mask (pipeline step 6, chunk A) ----

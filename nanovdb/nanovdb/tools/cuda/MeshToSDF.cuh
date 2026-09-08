@@ -126,6 +126,12 @@ public:
     /// @brief Choose the barrier signing method (default Heuristic).
     void setBarrierSigning(BarrierSigning m) { mBarrierSigning = m; }
 
+    /// @brief Stencil half-width for BarrierSigning::Ball: 1 = the 26 neighbours (default), 2 = 5x5x5.
+    ///        Costs (2r+1)^3 loads per voxel per round. Ball radii are capped at the band width, so
+    ///        pairs further apart than 2*narrowBandWidth() never overlap and a wider stencil buys
+    ///        nothing.
+    void setBallStencilRadius(int radius) { mBallStencilRadius = radius; }
+
     /// @brief Offset the surface outward by @a offset WORLD units before signing, so the result is
     ///        the signed distance to { x : udf(x) == offset } rather than to the mesh itself.
     ///
@@ -246,6 +252,7 @@ private:
     int                   mVerbose{0};
     float                 mBandWidth{3.f};
     BarrierSigning        mBarrierSigning{BarrierSigning::Heuristic};
+    int                   mBallStencilRadius{1};  // see setBallStencilRadius()
     float                 mOffset{0.f};    // world units; see setOffset()
     float                 mPhaseMs[5]{};   // per-phase wall time from the last build(), see phaseMs()
     // Sizes below use A = the rasterized band's active voxel count and N = the closed-surface count.
@@ -350,14 +357,20 @@ public:
     /// @param d_udf     unsigned distance sidecar for @a d_grid, WORLD units
     /// @param voxelSize world-space voxel size
     /// @param maxRounds cap on Jacobi rounds; measured worst case is 6
+    /// @param radius stencil half-width: 1 = the 26 neighbours, 2 = 5x5x5. Pairs further apart than
+    ///        2*bandWidth voxels can never overlap, so nothing is gained past that.
     void signBarrierByBalls(const GridT* d_grid, const float* d_udf, float voxelSize,
-                            int maxRounds = 32);
+                            int maxRounds = 32, int radius = 1);
 
     /// @brief Result of signBarrierByBalls(): +1 ext / -1 int / 0 = not proven either way.
     int8_t* deviceBallVoxelSign() { return static_cast<int8_t*>(mBallVoxelSign.deviceData()); }
-    /// @brief Voxels signBarrierByBalls() could prove nothing about, and voxels it proved both ways
-    ///        (which the lemma forbids, so a non-zero count means the surface is not closed there).
+    /// @brief Voxels signBarrierByBalls() could prove nothing about: no neighbour's ball reached
+    ///        them. They fall back to interior, the safe direction.
     uint32_t ballUndecided() const { return mBallUndecided; }
+    /// @brief DISTINCT voxels signBarrierByBalls() proved both ways, counted once each however many
+    ///        rounds they stayed contradicted. The lemma forbids it, so a non-zero count is evidence
+    ///        the surface does not separate those neighbours -- a hole, or a sheet thinner than the
+    ///        grid resolves.
     uint32_t ballContradictions() const { return mBallContradictions; }
     uint32_t ballRounds() const { return mBallRounds; }
 
@@ -660,7 +673,9 @@ struct BallCertifyFunctor
         const float*            d_udf,       // unsigned distance sidecar, WORLD units
         float                   voxelSize,
         uint32_t*               d_changed,       // incremented once per newly decided voxel
-        uint32_t*               d_contradictions)
+        uint32_t*               d_contradictions,// incremented once per voxel, on its FIRST contradiction
+        uint32_t*               d_everContradicted,  // one bit per slot, persistent across rounds
+        int                     radius)          // stencil half-width in voxels; 1 = the 26 neighbours
     {
         const int leafID = blockIdx.x, n = threadIdx.x;
         const auto& leaf = d_grid->tree().template getFirstNode<0>()[leafID];
@@ -689,11 +704,11 @@ struct BallCertifyFunctor
         };
 
         // Pass 1: neighbours inside this leaf, straight off the leaf buffer.
-        for (int dx = -1; dx <= 1; ++dx) {
+        for (int dx = -radius; dx <= radius; ++dx) {
             const int nx = lx + dx; if (nx < 0 || nx > 7) continue;
-            for (int dy = -1; dy <= 1; ++dy) {
+            for (int dy = -radius; dy <= radius; ++dy) {
                 const int ny = ly + dy; if (ny < 0 || ny > 7) continue;
-                for (int dz = -1; dz <= 1; ++dz) {
+                for (int dz = -radius; dz <= radius; ++dz) {
                     const int nz = lz + dz; if (nz < 0 || nz > 7) continue;
                     if (!dx && !dy && !dz) continue;
                     const uint32_t nOff = (uint32_t(nx) << 6) | (uint32_t(ny) << 3) | uint32_t(nz);
@@ -702,14 +717,15 @@ struct BallCertifyFunctor
             }
         }
 
-        // Pass 2: the rest of the 3x3x3, which crosses the leaf boundary. One reused accessor.
-        if (lx == 0 || lx == 7 || ly == 0 || ly == 7 || lz == 0 || lz == 7) {
+        // Pass 2: the rest of the stencil, which crosses the leaf boundary. One reused accessor.
+        if (lx < radius || lx > 7 - radius || ly < radius || ly > 7 - radius ||
+            lz < radius || lz > 7 - radius) {
             auto acc = d_grid->getAccessor();
-            for (int dx = -1; dx <= 1; ++dx) {
+            for (int dx = -radius; dx <= radius; ++dx) {
                 const int nx = lx + dx;
-                for (int dy = -1; dy <= 1; ++dy) {
+                for (int dy = -radius; dy <= radius; ++dy) {
                     const int ny = ly + dy;
-                    for (int dz = -1; dz <= 1; ++dz) {
+                    for (int dz = -radius; dz <= radius; ++dz) {
                         const int nz = lz + dz;
                         if (!dx && !dy && !dz) continue;
                         if (nx >= 0 && nx <= 7 && ny >= 0 && ny <= 7 && nz >= 0 && nz <= 7) continue;
@@ -720,7 +736,16 @@ struct BallCertifyFunctor
             }
         }
 
-        if (ext && inr) { atomicAdd(d_contradictions, 1u); d_labelOut[qv] = int8_t(0); return; }
+        if (ext && inr) {
+            // Count the VOXEL, not the event: a voxel that stays contradicted is re-detected every
+            // round, and one contradicted only in a middle round would vanish from the tally
+            // entirely, since the loop exits on the round that changes nothing.
+            const uint32_t word = uint32_t(qv >> 5), bit = 1u << (uint32_t(qv) & 31u);
+            if ((atomicOr(d_everContradicted + word, bit) & bit) == 0u)
+                atomicAdd(d_contradictions, 1u);
+            d_labelOut[qv] = int8_t(0);
+            return;
+        }
         if (!ext && !inr) { d_labelOut[qv] = int8_t(0); return; }
         d_labelOut[qv] = ext ? int8_t(1) : int8_t(-1);
         atomicAdd(d_changed, 1u);
@@ -1552,7 +1577,7 @@ void SurfaceSigner<BuildT>::signBarrier(const GridT* d_grid, const uint32_t* d_i
 /// writes, and stops when a round decides nothing.
 template <typename BuildT>
 void SurfaceSigner<BuildT>::signBarrierByBalls(const GridT* d_grid, const float* d_udf,
-                                               float voxelSize, int maxRounds)
+                                               float voxelSize, int maxRounds, int radius)
 {
     const uint64_t activeCount = activeCountOf(d_grid);
     const uint32_t leafCount   = leafCountOf(d_grid);
@@ -1572,6 +1597,17 @@ void SurfaceSigner<BuildT>::signBarrierByBalls(const GridT* d_grid, const float*
     auto  counters = nanovdb::cuda::DeviceBuffer::create(2 * sizeof(uint32_t), nullptr, false);
     auto* d_counters = static_cast<uint32_t*>(counters.deviceData());
 
+    // One persistent bit per slot: which voxels have ever been proven both ways. Zeroed once, so a
+    // voxel is tallied on its first contradiction and never again.
+    const uint64_t contraWords = (activeCount + 1 + 31) / 32;
+    auto  contraBuf   = nanovdb::cuda::DeviceBuffer::create(contraWords * sizeof(uint32_t), nullptr, false);
+    auto* d_everContra = static_cast<uint32_t*>(contraBuf.deviceData());
+    cudaCheck(cudaMemsetAsync(d_everContra, 0, contraWords * sizeof(uint32_t), mStream));
+
+    // Both counters start at zero. Only the change counter is reset per round below; the
+    // contradiction tally is a running total, so this is the only time it is cleared.
+    cudaCheck(cudaMemsetAsync(d_counters, 0, 2 * sizeof(uint32_t), mStream));
+
     int8_t* labelIn  = static_cast<int8_t*>(mBallVoxelSign.deviceData());
     int8_t* labelOut = static_cast<int8_t*>(scratch.deviceData());
 
@@ -1579,14 +1615,16 @@ void SurfaceSigner<BuildT>::signBarrierByBalls(const GridT* d_grid, const float*
     if (mVerbose==1) mTimer.start("Sign: barrier voxels (ball certification)");
     uint32_t host[2] = {0, 0};
     for (int r = 0; r < maxRounds; ++r) {
-        cudaCheck(cudaMemsetAsync(d_counters, 0, 2 * sizeof(uint32_t), mStream));
+        // Only the change counter resets; the contradiction tally accumulates across rounds.
+        cudaCheck(cudaMemsetAsync(d_counters, 0, sizeof(uint32_t), mStream));
         util::cuda::operatorKernel<Op><<<leafCount, Op::MaxThreadsPerBlock, 0, mStream>>>(
-            d_grid, labelIn, labelOut, d_udf, voxelSize, d_counters, d_counters + 1);
+            d_grid, labelIn, labelOut, d_udf, voxelSize, d_counters, d_counters + 1, d_everContra,
+            radius);
         cudaCheckError();
         cudaCheck(cudaMemcpyAsync(host, d_counters, 2 * sizeof(uint32_t), cudaMemcpyDeviceToHost, mStream));
         cudaCheck(cudaStreamSynchronize(mStream));
         std::swap(labelIn, labelOut);
-        mBallContradictions = host[1];              // recomputed every round, so the last one stands
+        mBallContradictions = host[1];              // running total of distinct contradicted voxels
         if (host[0] == 0) { mBallRounds = uint32_t(r); break; }
         mBallRounds = uint32_t(r + 1);
     }
@@ -1930,7 +1968,8 @@ void MeshToSDF<BuildT>::signSurface(uint32_t surface)
     sf.signer->signNonBarrier(d_derived, sf.ccLabels.first);
     sf.signer->injectSignsToOriginal(d_grid, d_derived);
     if (mBarrierSigning == BarrierSigning::Ball)
-        sf.signer->signBarrierByBalls(d_grid, this->surfaceUdf(surface), float(voxelSize));
+        sf.signer->signBarrierByBalls(d_grid, this->surfaceUdf(surface), float(voxelSize),
+                                      32, mBallStencilRadius);
     else
         sf.signer->signBarrier(d_grid, this->surfaceIndex(surface), mPoints, mTriangles, mMap);
 

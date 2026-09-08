@@ -688,6 +688,9 @@ SdfPipeline* buildMeshToSdf(const std::vector<nanovdb::Vec3f>& points,
     // pipeline asks for, and it is exact on a sphere, which is what the analytic check below uses.
     if (const char* o = std::getenv("CC_OFFSET")) p->sdf->setOffset(std::stof(o));
 
+    // CC_BALL_RADIUS=<n> widens the ball stencil from the 26 neighbours (1) outward.
+    if (const char* r = std::getenv("CC_BALL_RADIUS")) p->sdf->setBallStencilRadius(std::atoi(r));
+
     if (const char* m = std::getenv("CC_BARRIER"))
         if (std::string(m) == "ball")
             p->sdf->setBarrierSigning(MeshToSDFT::BarrierSigning::Ball);
@@ -1035,7 +1038,10 @@ SDFResult validateMeshToSdf(const SdfPipeline* p,
                                  std::size_t(surfActive + 1) * sizeof(float), cudaMemcpyDeviceToHost));
             auto&      signer2 = p->sdf->surfaceSigner(si);
             const auto t0 = std::chrono::steady_clock::now();
-            signer2.signBarrierByBalls(d_surf, p->sdf->surfaceUdf(si), float(map.getVoxelSize()[0]));
+            const int ballRadius = std::getenv("CC_BALL_RADIUS")
+                                 ? std::atoi(std::getenv("CC_BALL_RADIUS")) : 1;
+            signer2.signBarrierByBalls(d_surf, p->sdf->surfaceUdf(si),
+                                       float(map.getVoxelSize()[0]), 32, ballRadius);
             const auto t1 = std::chrono::steady_clock::now();
             std::vector<int8_t> ball(surfActive + 1);
             cudaCheck(cudaMemcpy(ball.data(), signer2.deviceBallVoxelSign(),

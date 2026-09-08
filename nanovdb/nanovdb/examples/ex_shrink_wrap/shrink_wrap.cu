@@ -40,6 +40,7 @@
 #include <openvdb/tools/LevelSetMeasure.h> // levelSetVolume
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -327,6 +328,21 @@ static void compare(const openvdb::FloatGrid& a, const openvdb::FloatGrid& b, fl
 }
 
 // ---------------------------------------------------------------------------------------------------
+/// @brief Wall-clock seconds since construction.
+///
+/// @details Wall clock rather than a CUDA event, because the question is what a caller waits for:
+///          the device work, the host work, and the hand-off between them all count. Device work is
+///          synchronised before each reading is taken.
+struct Stopwatch
+{
+    std::chrono::steady_clock::time_point t0{std::chrono::steady_clock::now()};
+    void   reset() { t0 = std::chrono::steady_clock::now(); }
+    double s() const {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+};
+
+// ---------------------------------------------------------------------------------------------------
 /// @brief The shrink wrap loop, with the offset stage left as a parameter.
 ///
 /// @details A transcription of tools::PolySoupToLevelSet::process(). It is repeated here because
@@ -347,10 +363,16 @@ static openvdb::FloatGrid::Ptr shrinkWrapLoop(
     using GridT = openvdb::FloatGrid;
 
     std::vector<GridT::Ptr> grids;
+    double offsetSeconds = 0.0, wrapSeconds = 0.0;
+    Stopwatch clock;
     for (float dx = minVoxelSize; dx <= maxVoxelSize; dx *= 2.0f) {
+        clock.reset();
         grids.push_back(makeOffset(dx));
+        const double dt = clock.s();
+        offsetSeconds += dt;
         if (verbose) std::cout << "  offset dx=" << dx << ": " << grids.back()->activeVoxelCount()
-                               << " active voxels\n";
+                               << " active voxels, " << std::fixed << std::setprecision(2) << dt
+                               << " s\n" << std::defaultfloat;
     }
     if (grids.empty()) throw std::runtime_error("no resolutions in the ladder");
 
@@ -363,6 +385,7 @@ static openvdb::FloatGrid::Ptr shrinkWrapLoop(
     double vol[2] = {0.0, 0.0};
 
     const float maxDist = 2.0f;         // voxels eroded per step, as in PolySoupToLevelSet
+    clock.reset();
     for (auto iter = grids.rbegin(); iter != grids.rend(); ++iter) {
         // upsample: dx -> dx/2
         auto finer = openvdb::createLevelSet<GridT>(float(grid->voxelSize()[0]) / 2.f, halfWidth);
@@ -387,7 +410,10 @@ static openvdb::FloatGrid::Ptr shrinkWrapLoop(
             if (d > 0.f && openvdb::math::isApproxZero(vol[0] - vol[1])) break;
         }
         if (verbose) std::cout << "  wrapped at dx=" << dx << ": " << grid->activeVoxelCount()
-                               << " active voxels, volume " << vol[1] << "\n";
+                               << " active voxels, volume " << vol[1]
+                               << ", " << std::fixed << std::setprecision(2) << clock.s() - wrapSeconds
+                               << " s\n" << std::defaultfloat;
+        wrapSeconds = clock.s();
         // Contour the wrap as it stands so the shape can be inspected rung by rung. The loop erodes
         // and then unions the rung's target back in, so it does not simply simplify as it goes; where
         // a feature first appears is a question about which rung introduced it.
@@ -399,9 +425,17 @@ static openvdb::FloatGrid::Ptr shrinkWrapLoop(
             for (const auto& v : pts)   f << "v " << v[0] << " " << v[1] << " " << v[2] << "\n";
             for (const auto& t : tris)  f << "f " << t[0]+1 << " " << t[1]+1 << " " << t[2]+1 << "\n";
             for (const auto& q : quads) f << "f " << q[0]+1 << " " << q[1]+1 << " " << q[2]+1 << " " << q[3]+1 << "\n";
+            // Contouring for inspection is not part of the loop, so do not let it show up in the
+            // next rung's timing: roll the clock forward past it.
+            clock.t0 += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                            std::chrono::duration<double>(clock.s() - wrapSeconds));
         }
         *iter = grid;
     }
+    if (verbose) std::cout << "  [time] offset stage " << std::fixed << std::setprecision(2)
+                           << offsetSeconds << " s, wrap loop " << wrapSeconds
+                           << " s, total " << offsetSeconds + wrapSeconds << " s\n"
+                           << std::defaultfloat;
     return grid;
 }
 

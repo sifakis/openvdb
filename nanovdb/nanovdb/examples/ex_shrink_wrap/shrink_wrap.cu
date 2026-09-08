@@ -342,7 +342,7 @@ static void compare(const openvdb::FloatGrid& a, const openvdb::FloatGrid& b, fl
 static openvdb::FloatGrid::Ptr shrinkWrapLoop(
     const std::function<openvdb::FloatGrid::Ptr(float dx)>& makeOffset,
     float minVoxelSize, float maxVoxelSize, float halfWidth,
-    const openvdb::tools::ShrinkWrapLimit& D, bool verbose)
+    const openvdb::tools::ShrinkWrapLimit& D, bool verbose, const char* rungStem = nullptr)
 {
     using GridT = openvdb::FloatGrid;
 
@@ -388,6 +388,18 @@ static openvdb::FloatGrid::Ptr shrinkWrapLoop(
         }
         if (verbose) std::cout << "  wrapped at dx=" << dx << ": " << grid->activeVoxelCount()
                                << " active voxels, volume " << vol[1] << "\n";
+        // Contour the wrap as it stands so the shape can be inspected rung by rung. The loop erodes
+        // and then unions the rung's target back in, so it does not simply simplify as it goes; where
+        // a feature first appears is a question about which rung introduced it.
+        if (rungStem) {
+            std::vector<openvdb::Vec3s> pts; std::vector<openvdb::Vec3I> tris; std::vector<openvdb::Vec4I> quads;
+            openvdb::tools::volumeToMesh(*grid, pts, tris, quads, 0.0, 0.0);
+            std::ostringstream fn; fn << rungStem << "_dx" << dx << ".obj";
+            std::ofstream f(fn.str());
+            for (const auto& v : pts)   f << "v " << v[0] << " " << v[1] << " " << v[2] << "\n";
+            for (const auto& t : tris)  f << "f " << t[0]+1 << " " << t[1]+1 << " " << t[2]+1 << "\n";
+            for (const auto& q : quads) f << "f " << q[0]+1 << " " << q[1]+1 << " " << q[2]+1 << " " << q[3]+1 << "\n";
+        }
         *iter = grid;
     }
     return grid;
@@ -456,11 +468,15 @@ int main(int argc, char* argv[])
             openvdb::tools::PolySoupToLevelSet<openvdb::FloatGrid> wrapA_src(std::move(soupA), voxelSize, halfWidth);
 
             std::cout << "openvdb offset stage:\n";
+            const char* rungA = std::getenv("SW_EXPORT_RUNGS");
             auto wrapA = shrinkWrapLoop([&](float dx) { return wrapA_src.offset(dx, 0); },
-                                        voxelSize, maxVoxel, halfWidth, D, true);
+                                        voxelSize, maxVoxel, halfWidth, D, true,
+                                        rungA ? (std::string(rungA) + "_openvdb").c_str() : nullptr);
             std::cout << "nanovdb offset stage:\n";
+            const std::string rungBname = rungA ? std::string(rungA) + "_nanovdb" : std::string();
             auto wrapB = shrinkWrapLoop([&](float dx) { return nanovdbOffset(vtx, tri, dx, halfWidth); },
-                                        voxelSize, maxVoxel, halfWidth, D, true);
+                                        voxelSize, maxVoxel, halfWidth, D, true,
+                                        rungA ? rungBname.c_str() : nullptr);
             wrapA->setName("wrap_openvdb");
             wrapB->setName("wrap_nanovdb");
 

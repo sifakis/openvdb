@@ -20,7 +20,7 @@
                                              so each closed surface is exactly one component
              3  per surface: carve it out and sign it alone -> its own complete sign field
              4  compose by nesting parity     a point wrapped by k surfaces is inside iff k is odd
-             4b finalize magnitudes           report distance to the signed surface, floor the interior
+             4b post-process                  report distance to the signed surface, floor the interior
              5  fill                          extend the composed sign off the band
 
            The surface signed is { udf == isoValue }, the mesh itself when isoValue is 0
@@ -267,7 +267,7 @@ private:
     void partition();                    // step 2, run connected component on un-pruned grid for seperating each surfaces.
     void signSurface(uint32_t surface);  // step 3, once per closed surface
     void composeByInclusion();           // step 4
-    void finalizeMagnitudes();           // step 4b, report distance to the isosurface, not to the mesh
+    void postProcess();                  // step 4b, everything the finished field needs
     void fillOnOriginal();               // step 5 TODO: let's rename it to more specific name?
 
     // Surface i's grid: its own carved band, or the rasterized band when uncarved.
@@ -535,7 +535,7 @@ static constexpr int LEAF_SIZE = 512;  // 8^3 voxels per leaf
 
 /// @brief CUDA functor: turn the distance-to-mesh sidecar into the magnitude actually reported,
 ///        once every sign is settled. One thread per sidecar slot via lambdaKernel.
-///        See MeshToSDF::setIsoValue() and MeshToSDF::finalizeMagnitudes().
+///        See MeshToSDF::setIsoValue() and MeshToSDF::postProcess().
 ///
 ///        Two steps. Folding udf about the isovalue makes the pair (sign, magnitude) describe one
 ///        surface: the sign came from udf - isoValue, so leaving the magnitude as the distance to the
@@ -2012,7 +2012,7 @@ void MeshToSDF<BuildT>::
     mark();
     this->composeByInclusion();  // nesting parity per surface, then merge the signs onto the band
     mark();
-    this->finalizeMagnitudes();  // signs are settled: report |udf - isoValue|, floor the interior
+    this->postProcess();         // signs are settled: fold the magnitudes, floor the interior
     this->fillOnOriginal();      // extend those signs off the band as invert masks
     mark();
 }// MeshToSDF<BuildT>::build
@@ -2262,7 +2262,7 @@ void MeshToSDF<BuildT>::composeByInclusion() //todo: change this function name s
 ///
 ///          Runs before fillOnOriginal() only for tidiness; the fill reads signs, not magnitudes.
 template <typename BuildT>
-void MeshToSDF<BuildT>::finalizeMagnitudes()
+void MeshToSDF<BuildT>::postProcess()
 {
     if (mIsoValue == 0.f || mSurfaces.empty() || mSign == nullptr) return;
 
@@ -2285,7 +2285,7 @@ void MeshToSDF<BuildT>::finalizeMagnitudes()
     const float bg = mBandWidth * voxelSize;
     cudaCheck(cudaMemcpyAsync(mUDF.deviceData(), &bg, sizeof(float), cudaMemcpyHostToDevice, mStream));
     cudaCheck(cudaStreamSynchronize(mStream));
-}// MeshToSDF<BuildT>::finalizeMagnitudes
+}// MeshToSDF<BuildT>::postProcess
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 

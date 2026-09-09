@@ -5,8 +5,9 @@ what each stage does, and why the stages are ordered the way they are.
 
 The other documents here are design notes written *while* the pipeline was being built —
 `MeshToSDF_PipelinePlan.md` for the original plan, `InclusionSigningDesign.md` for the reasoning
-behind the multi-surface signing, `BENCHMARK.md` for measurements. This one describes the finished
-thing.
+behind the multi-surface signing, `BENCHMARK.md` for measurements, and `PartitionGridDesign.md` for a
+proposed operator that would replace the per-surface carve in stage 3a. This one describes the
+finished thing.
 
 ---
 

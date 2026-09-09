@@ -23,6 +23,7 @@ on NanoVDB index grids. This document is the running design notes for that work.
 | `scripts/mesh_to_sdf_viewer.py`                  | Polyscope viewer for the `exportMeshToSdf` dump (`.ccvis` + `.fill`). Not part of the build. |
 | `MeshToSDF_PipelinePlan.md`             | Umbrella pipeline plan (steps 1–6). |
 | `MeshToSDFDevelopmentPlan.md`           | This document (CC / step-3 running notes). |
+| `PartitionGridDesign.md`                | Design notes for a `PartitionGrid` topology operator that would replace the per-surface carve. Not implemented. |
 | `standalone/cc_vis.cpp`                 | Standalone 2D CPU visualizer of the SV hook/compress primitives (see `standalone/README.md`). **Not** part of the example build — it lives one directory down so the `nanovdb_example` source glob (non-recursive) skips it; otherwise its `main()` would collide with the driver's. |
 
 The actual per-leaf CC kernel lives in the library, not the example:

@@ -121,8 +121,6 @@ public:
     const Handle& gridHandle() const { return mGridHandle; }
     /// @brief Per-active-voxel unsigned distance in WORLD units, valid after build().
     const float* deviceUDF() const { return static_cast<const float*>(mUDF.deviceData()); }
-    /// @brief Per-active-voxel nearest-triangle index (0xFFFFFFFF = none), valid after build().
-    const uint32_t* deviceIndex() const { return static_cast<const uint32_t*>(mIndex.deviceData()); }
     /// @brief Per-active-voxel sign over the rasterized band (+1 outside / -1 inside), valid after
     ///        build(). Length activeVoxelCount+1, indexed by leaf.getValue(n); slot 0 = +1.
     const int8_t* deviceSign() const { return mSign; }
@@ -130,15 +128,6 @@ public:
     const nanovdb::Map& map() const { return mMap; }
     /// @brief The narrow-band width, in cell units, the grid was built with.
     float narrowBandWidth() const { return mBandWidth; }
-
-    /// @brief Number of closed surfaces the band was partitioned into, valid after build().
-    uint32_t surfaceCount() const { return uint32_t(mSurfaces.size()); }
-    /// @brief Per-active-voxel closed-surface id in [0, surfaceCount()), on the rasterized band.
-    const uint32_t* deviceSurfaceLabels() const { return mSurfaceLabels.first; }
-    /// @brief Number of other surfaces enclosing each surface.
-    const std::vector<uint32_t>& nestingDepth() const { return mNestingDepth; }
-    /// @brief The nesting rule the last build() resolved those depths with.
-    NestingRule nestingRule() const { return mNestingRule; }
 
     /// @name Invert masks — the sign of everything the band does not cover, valid after build().
     ///       Consumed together with deviceGrid() and deviceSign() by sdf_detail::signedSignAt().
@@ -150,21 +139,6 @@ public:
     nanovdb::Coord          rootTileMin() const;
     nanovdb::Coord          rootTileDims() const;
     /// @}
-
-    /// @brief The signer that produced surface @a i's own field, for tests and debugging.
-    Signer& surfaceSigner(uint32_t i) const { return *mSurfaces[i].signer; }
-    /// @brief Surface @a i's carved band, or the rasterized band when there is only one surface.
-    const Handle& surfaceGridHandle(uint32_t i) const;
-    /// @brief Surface @a i's barrier-pruned grid (the connected-components input).
-    const Handle& derivedGridHandle(uint32_t i) const { return mSurfaces[i].derived; }
-    /// @brief Surface @a i's per-active-voxel component labels, on its derived grid.
-    const uint32_t* deviceComponentLabels(uint32_t i) const { return mSurfaces[i].ccLabels.first; }
-    /// @brief How many components surface @a i's derived grid was labeled into.
-    uint64_t componentCount(uint32_t i) const { return mSurfaces[i].ccLabels.second; }
-    /// @brief Surface @a i's nearest-triangle index sidecar, re-indexed onto its carved band.
-    const uint32_t* surfaceIndex(uint32_t i) const;
-    /// @brief Surface @a i's unsigned-distance sidecar (WORLD units), re-indexed onto its carved band.
-    const float*    surfaceUdf(uint32_t i) const;
 
     /// @brief Wall-clock milliseconds for rasterize, partition, per-surface signing, composition,
     ///        and finalization/fill. Blind-data assembly is not included.
@@ -192,8 +166,11 @@ private:
     void fillOnOriginal();
     GridHandle<Buffer> bakeBlindData();
 
-    // Surface i's grid: its own carved band, or the rasterized band when uncarved.
+    const Handle&   surfaceGridHandle(uint32_t i) const;
     const GridT*    surfaceGrid(uint32_t i) const;
+    const uint32_t* surfaceIndex(uint32_t i) const;
+    const float*    surfaceUdf(uint32_t i) const;
+    void            releaseIntermediates();
 
     const nanovdb::Vec3f* mPoints{nullptr};
     uint32_t              mPointCount{0};
@@ -218,7 +195,6 @@ private:
     std::vector<SurfaceField> mSurfaces;   // one entry per surface
 
     NestingRule          mNestingRule{NestingRule::EvenOdd};
-    std::vector<uint32_t> mNestingDepth;   // number of surfaces enclosing each surface
     Buffer               mComposedSign;    // (A+1) x int8_t: gathered signs on the rasterized band. EMPTY
                                            // when a lone uncarved surface's own array is used instead —
                                            // which is also how fillOnOriginal knows its fill is already done.
@@ -278,15 +254,6 @@ public:
     void signBarrierByBalls(const GridT* d_grid, const float* d_udf, float voxelSize,
                             int maxRounds = 32, int radius = 1, float isoValue = 0.f);
 
-    /// @brief Result of signBarrierByBalls(): +1 ext / -1 int / 0 = not proven either way.
-    int8_t* deviceBallVoxelSign() { return static_cast<int8_t*>(mBallVoxelSign.deviceData()); }
-    /// @brief Number of unresolved voxels classified as interior.
-    uint32_t ballUndecided() const { return mBallUndecided; }
-
-    /// @brief Number of distinct voxels certified as both interior and exterior.
-    uint32_t ballContradictions() const { return mBallContradictions; }
-    uint32_t ballRounds() const { return mBallRounds; }
-
     /// @brief Build interior masks for inactive voxels in materialized leaves.
     void fillLeafInvertMask(const GridT* d_grid, const int8_t* d_sign = nullptr);
 
@@ -295,15 +262,6 @@ public:
 
     /// @brief Build interior flags for absent 4096^3 root regions.
     void fillRootInteriorMask(const GridT* d_grid, const int8_t* d_sign = nullptr);
-
-    /// @brief Non-barrier signs, indexed by active-voxel value.
-    int8_t* deviceVoxelSign() { return static_cast<int8_t*>(mVoxelSign.deviceData()); }
-
-    /// @brief Representative (slot) of the exterior component, valid after signNonBarrier().
-    uint64_t exteriorRepresentative() const { return mExteriorRep; }
-
-    /// @brief Source-grid signs with zero for unresolved barrier voxels.
-    int8_t* deviceOriginalVoxelSign() { return static_cast<int8_t*>(mOriginalVoxelSign.deviceData()); }
 
     /// @brief Completed source-grid signs.
     int8_t* deviceSignedVoxelSign() { return static_cast<int8_t*>(mSignedVoxelSign.deviceData()); }
@@ -336,16 +294,16 @@ private:
         return util::cuda::DeviceGridTraits<BuildT>::getActiveVoxelCount(g);
     }
 
+    int8_t* deviceVoxelSign() { return static_cast<int8_t*>(mVoxelSign.deviceData()); }
+    int8_t* deviceOriginalVoxelSign() { return static_cast<int8_t*>(mOriginalVoxelSign.deviceData()); }
+
     cudaStream_t                 mStream{0};
     util::cuda::Timer            mTimer;
     int                          mVerbose{0};
 
-    uint64_t                     mExteriorRep{0};  // the exterior component (see exteriorRepresentative())
     nanovdb::cuda::DeviceBuffer  mVoxelSign;       // (derived activeVoxelCount+1) × int8_t: +1 ext / -1 int
     nanovdb::cuda::DeviceBuffer  mOriginalVoxelSign; // (orig activeVoxelCount+1) × int8_t: +1/-1 non-barrier, 0 barrier
     nanovdb::cuda::DeviceBuffer  mSignedVoxelSign;   // (orig activeVoxelCount+1) × int8_t: +1/-1 everywhere (barriers signed)
-    nanovdb::cuda::DeviceBuffer  mBallVoxelSign;     // (orig activeVoxelCount+1) × int8_t: experimental ball result
-    uint32_t                     mBallUndecided{0}, mBallContradictions{0}, mBallRounds{0};
     nanovdb::cuda::DeviceBuffer  mLeafInvertMask;    // nodeCount[0] × Mask<3>: inactive-voxel interior bits
     nanovdb::cuda::DeviceBuffer  mLowerInvertMask;   // nodeCount[1] × Mask<4>: childless-lower-tile interior bits
     nanovdb::cuda::DeviceBuffer  mUpperInvertMask;   // nodeCount[2] × Mask<5>: childless-upper-tile interior bits
@@ -542,7 +500,7 @@ barrierExteriorProof(uint64_t nv, const nanovdb::Coord& nijk, const nanovdb::Vec
 
 /// @brief Perform one order-independent round of ball-intersection certification.
 /// @note Strictly overlapping surface-free balls certify the same sign; tangency proves nothing.
-/// Voxels certified both ways remain undecided and are counted as contradictions.
+/// Voxels certified both ways remain undecided.
 template <typename BuildT>
 struct BallCertifyFunctor
 {
@@ -556,8 +514,6 @@ struct BallCertifyFunctor
         const float*            d_udf,       // unsigned distance sidecar, WORLD units
         float                   voxelSize,
         uint32_t*               d_changed,       // incremented once per newly decided voxel
-        uint32_t*               d_contradictions,// incremented once per voxel, on its FIRST contradiction
-        uint32_t*               d_everContradicted,  // one bit per slot, persistent across rounds
         int                     radius,          // stencil half-width in voxels; 1 = the 26 neighbours
         float                   isoValue)        // surface signed = { udf == isoValue }, world units
     {
@@ -624,13 +580,6 @@ struct BallCertifyFunctor
         }
 
         if (ext && inr) {
-            // The lemma forbids this, so it is evidence the surface does not separate the two
-            // neighbours -- a hole, or a sheet thinner than the grid resolves. Count the VOXEL, not
-            // the event: a voxel that stays contradicted is re-detected every round, and a voxel
-            // contradicted only in a middle round would otherwise vanish from the tally entirely.
-            const uint32_t word = uint32_t(qv >> 5), bit = 1u << (uint32_t(qv) & 31u);
-            if ((atomicOr(d_everContradicted + word, bit) & bit) == 0u)
-                atomicAdd(d_contradictions, 1u);
             d_labelOut[qv] = int8_t(0);
             return;
         }
@@ -643,14 +592,12 @@ struct BallCertifyFunctor
 /// @brief Complete the ball-certified sign field, defaulting unresolved voxels to interior.
 struct BallFinalizeFunctor
 {
-    __device__ void operator()(size_t v, const int8_t* d_ball, int8_t* d_signOut,
-                               uint32_t* d_undecided) const
+    __device__ void operator()(size_t v, const int8_t* d_ball, int8_t* d_signOut) const
     {
         if (v == 0) { d_signOut[0] = int8_t(1); return; }   // slot 0 = background = exterior
         const int8_t l = d_ball[v];
         if (l != int8_t(0)) { d_signOut[v] = l; return; }
         d_signOut[v] = int8_t(-1);
-        atomicAdd(d_undecided, 1u);
     }
 };
 
@@ -1318,7 +1265,6 @@ template <typename BuildT>
 void SurfaceSigner<BuildT>::signNonBarrier(const GridT* d_grid, const uint32_t* d_voxelLabel)
 {
     const uint32_t leafCount = leafCountOf(d_grid);
-    mExteriorRep = 0;
     if (leafCount == 0) return;  // every materialized leaf has >=1 component, so leafCount==0 => K==0
 
     const uint64_t activeCount = activeCountOf(d_grid);
@@ -1336,7 +1282,7 @@ void SurfaceSigner<BuildT>::signNonBarrier(const GridT* d_grid, const uint32_t* 
     unsigned long long minKey = 0;   // low 32 bits of the min key = the exterior representative
     cudaCheck(cudaMemcpyAsync(&minKey, d_minKey, sizeof(minKey), cudaMemcpyDeviceToHost, mStream));
     cudaCheck(cudaStreamSynchronize(mStream));
-    mExteriorRep = uint64_t(uint32_t(minKey & 0xFFFFFFFFull));
+    const uint32_t exteriorRep = uint32_t(minKey & 0xFFFFFFFFull);
     if (mVerbose==1) mTimer.stop();
 
     // (2) Per-voxel sign: +1 exterior / -1 interior (slot 0 = background +1).
@@ -1345,7 +1291,7 @@ void SurfaceSigner<BuildT>::signNonBarrier(const GridT* d_grid, const uint32_t* 
     using SignOp = SignNonBarrierFunctor<BuildT>;
     if (mVerbose==1) mTimer.start("Sign: write per-voxel signs");
     util::cuda::operatorKernel<SignOp><<<leafCount, SignOp::MaxThreadsPerBlock, 0, mStream>>>(
-        d_grid, d_voxelLabel, uint32_t(mExteriorRep), deviceVoxelSign());
+        d_grid, d_voxelLabel, exteriorRep, deviceVoxelSign());
     cudaCheckError();
     if (mVerbose==1) mTimer.stop();
 }// SurfaceSigner<BuildT>::signNonBarrier
@@ -1441,66 +1387,45 @@ void SurfaceSigner<BuildT>::signBarrierByBalls(const GridT* d_grid, const float*
     const uint32_t leafCount   = leafCountOf(d_grid);
     const std::size_t bytes    = std::size_t(activeCount + 1) * sizeof(int8_t);
 
-    mBallVoxelSign = nanovdb::cuda::DeviceBuffer::create(bytes, nullptr, false);
-    mBallUndecided = mBallContradictions = mBallRounds = 0;
-    if (leafCount == 0) return;
+    mSignedVoxelSign = nanovdb::cuda::DeviceBuffer::create(bytes, nullptr, false);
+    if (leafCount == 0) {
+        cudaCheck(cudaMemsetAsync(mSignedVoxelSign.deviceData(), 1, sizeof(int8_t), mStream));
+        return;
+    }
 
     // Seed both buffers from the non-barrier signs; barrier voxels start at 0.
+    auto labels  = nanovdb::cuda::DeviceBuffer::create(bytes, nullptr, false);
     auto scratch = nanovdb::cuda::DeviceBuffer::create(bytes, nullptr, false);
-    cudaCheck(cudaMemcpyAsync(mBallVoxelSign.deviceData(), deviceOriginalVoxelSign(), bytes,
+    cudaCheck(cudaMemcpyAsync(labels.deviceData(), deviceOriginalVoxelSign(), bytes,
                               cudaMemcpyDeviceToDevice, mStream));
     cudaCheck(cudaMemcpyAsync(scratch.deviceData(), deviceOriginalVoxelSign(), bytes,
                               cudaMemcpyDeviceToDevice, mStream));
 
-    auto  counters = nanovdb::cuda::DeviceBuffer::create(2 * sizeof(uint32_t), nullptr, false);
-    auto* d_counters = static_cast<uint32_t*>(counters.deviceData());
-
-    // One BIT per slot, zeroed ONCE and never per round, so a contradicted voxel is counted the
-    // first time it is seen and not again: it is re-detected every round (a contradiction writes
-    // back 0, which is not a change, so the voxel never settles).
-    const std::size_t contraWords = std::size_t((activeCount + 1 + 31) / 32);
-    auto  everContra   = nanovdb::cuda::DeviceBuffer::create(contraWords * sizeof(uint32_t), nullptr, false);
-    auto* d_everContra = static_cast<uint32_t*>(everContra.deviceData());
-    cudaCheck(cudaMemsetAsync(d_everContra, 0, contraWords * sizeof(uint32_t), mStream));
-
-    cudaCheck(cudaMemsetAsync(d_counters, 0, 2 * sizeof(uint32_t), mStream));
-
-    int8_t* labelIn  = static_cast<int8_t*>(mBallVoxelSign.deviceData());
+    auto  counter   = nanovdb::cuda::DeviceBuffer::create(sizeof(uint32_t), nullptr, false);
+    auto* d_changed = static_cast<uint32_t*>(counter.deviceData());
+    int8_t* labelIn  = static_cast<int8_t*>(labels.deviceData());
     int8_t* labelOut = static_cast<int8_t*>(scratch.deviceData());
 
     using Op = BallCertifyFunctor<BuildT>;
     if (mVerbose==1) mTimer.start("Sign: barrier voxels (ball certification)");
-    uint32_t host[2] = {0, 0};
+    uint32_t changed = 0;
     for (int r = 0; r < maxRounds; ++r) {
-        // Only 'changed' resets; the contradiction tally accumulates across rounds by construction.
-        cudaCheck(cudaMemsetAsync(d_counters, 0, sizeof(uint32_t), mStream));
+        cudaCheck(cudaMemsetAsync(d_changed, 0, sizeof(uint32_t), mStream));
         util::cuda::operatorKernel<Op><<<leafCount, Op::MaxThreadsPerBlock, 0, mStream>>>(
-            d_grid, labelIn, labelOut, d_udf, voxelSize, d_counters, d_counters + 1, d_everContra,
-            radius, isoValue);
+            d_grid, labelIn, labelOut, d_udf, voxelSize, d_changed, radius, isoValue);
         cudaCheckError();
-        cudaCheck(cudaMemcpyAsync(host, d_counters, 2 * sizeof(uint32_t), cudaMemcpyDeviceToHost, mStream));
+        cudaCheck(cudaMemcpyAsync(&changed, d_changed, sizeof(uint32_t), cudaMemcpyDeviceToHost, mStream));
         cudaCheck(cudaStreamSynchronize(mStream));
         std::swap(labelIn, labelOut);
-        mBallContradictions = host[1];              // running total of distinct contradicted voxels
-        if (host[0] == 0) { mBallRounds = uint32_t(r); break; }
-        mBallRounds = uint32_t(r + 1);
+        if (changed == 0) break;
     }
     if (mVerbose==1) mTimer.stop();
 
-    // labelIn holds the newest labels; make sure that is the buffer we hand back.
-    if (labelIn != mBallVoxelSign.deviceData())
-        cudaCheck(cudaMemcpyAsync(mBallVoxelSign.deviceData(), labelIn, bytes,
-                                  cudaMemcpyDeviceToDevice, mStream));
-
-    // Complete the field: unproven voxels default to interior, and are counted.
-    mSignedVoxelSign = nanovdb::cuda::DeviceBuffer::create(bytes, nullptr, false);
-    cudaCheck(cudaMemsetAsync(d_counters, 0, sizeof(uint32_t), mStream));
+    // Complete the field: unproven voxels default to interior.
     util::cuda::lambdaKernel<<<(unsigned int)((activeCount + 256) / 256), 256, 0, mStream>>>(
-        activeCount + 1, BallFinalizeFunctor{}, deviceBallVoxelSign(), deviceSignedVoxelSign(),
-        d_counters);
+        activeCount + 1, BallFinalizeFunctor{}, labelIn, deviceSignedVoxelSign());
     cudaCheckError();
-    cudaCheck(cudaMemcpyAsync(&mBallUndecided, d_counters, sizeof(uint32_t),
-                              cudaMemcpyDeviceToHost, mStream));
+    // The temporary label buffers must outlive the finalization kernel.
     cudaCheck(cudaStreamSynchronize(mStream));
 }// SurfaceSigner<BuildT>::signBarrierByBalls
 
@@ -1712,7 +1637,9 @@ typename MeshToSDF<BuildT>::Handle MeshToSDF<BuildT>::
     this->postProcess();         // signs are settled: fold the magnitudes, floor the interior
     this->fillOnOriginal();      // extend those signs off the band as invert masks
     mark();
-    return this->bakeBlindData();
+    Handle handle = this->bakeBlindData();
+    this->releaseIntermediates();
+    return handle;
 }// MeshToSDF<BuildT>::build
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -1790,7 +1717,8 @@ void MeshToSDF<BuildT>::signSurface(uint32_t surface)
             d_orig, d_sub, this->deviceUDF(), static_cast<float*>(sf.subUdf.deviceData()));
         cudaCheckError();
         util::cuda::operatorKernel<InjectIndex><<<origLeaves, InjectIndex::MaxThreadsPerBlock, 0, mStream>>>(
-            d_orig, d_sub, this->deviceIndex(), static_cast<uint32_t*>(sf.subIndex.deviceData()));
+            d_orig, d_sub, static_cast<const uint32_t*>(mIndex.deviceData()),
+            static_cast<uint32_t*>(sf.subIndex.deviceData()));
         cudaCheckError();
         cudaCheck(cudaStreamSynchronize(mStream));
         if (mVerbose==1) timer.stop();
@@ -1832,6 +1760,13 @@ void MeshToSDF<BuildT>::signSurface(uint32_t surface)
     sf.signer->fillCoarseInvertMasks(d_grid);
     sf.signer->fillRootInteriorMask(d_grid);
     cudaCheck(cudaStreamSynchronize(mStream));
+
+    // These inputs are not needed by composition; retain only the surface grid and completed field.
+    sf.subUdf   = Buffer();
+    sf.subIndex = Buffer();
+    sf.derived  = Handle();
+    sf.cc.reset();
+    sf.ccLabels = {nullptr, 0};
 }// MeshToSDF<BuildT>::signSurface
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -1851,8 +1786,6 @@ void MeshToSDF<BuildT>::composeByInclusion()
     // band — so there is no depth to recover and nothing to gather. Aliasing here is what keeps the
     // single-surface case free of the extra full-length sign array a merge would allocate.
     if (numSurfaces == 1 && !mSurfaces[0].subGrid.bufferSize()) {
-        // Depth 0 under either rule: the surface's own field is already the answer.
-        mNestingDepth.assign(1, 0u);
         mSign = mSurfaces[0].signer->deviceSignedVoxelSign();
         return;
     }
@@ -1898,10 +1831,10 @@ void MeshToSDF<BuildT>::composeByInclusion()
     cudaCheck(cudaMemcpyAsync(inc.data(), d_inc, inc.size() * sizeof(int8_t), cudaMemcpyDeviceToHost, mStream));
     cudaCheck(cudaStreamSynchronize(mStream));
 
-    mNestingDepth.assign(numSurfaces, 0u);
+    std::vector<uint32_t> nestingDepth(numSurfaces, 0u);
     for (uint32_t j = 0; j < numSurfaces; ++j)
         for (uint32_t i = 0; i < numSurfaces; ++i)
-            if (i != j && inc[std::size_t(i) * numSurfaces + j] < 0) ++mNestingDepth[j];  // field i says j is inside
+            if (i != j && inc[std::size_t(i) * numSurfaces + j] < 0) ++nestingDepth[j];
 
     // (4) Merge. Gather every surface's signs back onto the rasterized band — the surfaces partition
     //     its active voxels, so the per-surface injections write disjoint slots and together cover all —
@@ -1919,7 +1852,7 @@ void MeshToSDF<BuildT>::composeByInclusion()
     }
     auto  depthBuf = Buffer::create(numSurfaces * sizeof(uint32_t), nullptr, false);
     auto* d_depth  = static_cast<uint32_t*>(depthBuf.deviceData());
-    cudaCheck(cudaMemcpyAsync(d_depth, mNestingDepth.data(), numSurfaces * sizeof(uint32_t),
+    cudaCheck(cudaMemcpyAsync(d_depth, nestingDepth.data(), numSurfaces * sizeof(uint32_t),
                               cudaMemcpyHostToDevice, mStream));
     util::cuda::lambdaKernel<<<(unsigned int)((origActive + 256) / 256), 256, 0, mStream>>>(
         origActive + 1, sdf_detail::ResolveNestingFunctor{}, mSurfaceLabels.first, d_depth,
@@ -1970,7 +1903,8 @@ void MeshToSDF<BuildT>::fillOnOriginal()
     if (mSurfaces.empty()) return;
 
     if (!mComposedSign.size()) {                 // composition aliased surface 0 -> its fill is the answer
-        mFinalSigner = mSurfaces[0].signer.get();
+        mOrigSigner  = std::move(mSurfaces[0].signer);
+        mFinalSigner = mOrigSigner.get();
         return;
     }
 
@@ -2043,6 +1977,17 @@ typename MeshToSDF<BuildT>::Handle MeshToSDF<BuildT>::bakeBlindData()
     }
     return h;
 }// MeshToSDF<BuildT>::bakeBlindData
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+template <typename BuildT>
+void MeshToSDF<BuildT>::releaseIntermediates()
+{
+    mSurfaceCC.reset();
+    mSurfaceLabels = {nullptr, 0};
+    mSurfaces.clear();
+    mIndex = Buffer();
+}
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 

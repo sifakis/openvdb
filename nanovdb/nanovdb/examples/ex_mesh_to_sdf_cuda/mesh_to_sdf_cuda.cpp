@@ -1,677 +1,116 @@
 // Copyright Contributors to the OpenVDB Project
 // SPDX-License-Identifier: Apache-2.0
 
-/// @file  mesh_to_sdf_cuda.cpp
-///
-/// @brief Host driver for the connected-components example (NanoVDB / CUDA only,
-///        no OpenVDB). Reads a triangle mesh from a Wavefront .obj file, builds the
-///        index<->world transform, and hands the mesh off to the CUDA side, which
-///        voxelizes it into a ValueOnIndex grid + UDF sidecar. Connected-components
-///        labeling on top of that grid will be added as a subsequent step.
-///
-///        See PIPELINE.md in this directory for how the pipeline works, and
-///        MeshToSDFDevelopmentPlan.md for the design notes and roadmap.
+/// @file mesh_to_sdf_cuda.cpp
+/// @brief Convert a Wavefront OBJ mesh to a NanoVDB signed distance field on the GPU.
 
-#include <nanovdb/NanoVDB.h>          // host-usable: Vec3f, Vec3i, Vec3d, Map
-#include <nanovdb/GridHandle.h>       // GridHandle (header-only, host-usable)
-#include <nanovdb/cuda/DeviceBuffer.h>// nanovdb::cuda::DeviceBuffer
+#include <nanovdb/NanoVDB.h>
+#include <nanovdb/GridHandle.h>
+#include <nanovdb/cuda/DeviceBuffer.h>
+#include <nanovdb/io/IO.h>
 
-#include <cmath>
 #include <cstdint>
-#include <cstdlib>   // std::getenv
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
-#include <tuple>
-#include <utility>
 #include <vector>
 
-// Types of the rasterization result handed across the host/device seam.
-using GridHandleT   = nanovdb::GridHandle<nanovdb::cuda::DeviceBuffer>;
-using UDFSidecarT   = nanovdb::cuda::DeviceBuffer;
-using IndexSidecarT = nanovdb::cuda::DeviceBuffer;
+using GridHandleT = nanovdb::GridHandle<nanovdb::cuda::DeviceBuffer>;
 
-// Summary of validateMeshToSdf's checks (definition must match mesh_to_sdf_cuda_kernels.cu).
-struct SDFResult {
-    uint64_t globalComponents            = 0;
-    uint64_t surfaceComponents           = 0;
-    uint64_t barrierMismatches           = 0;      // CPU-mirror barrier signing, per surface (must be 0)
-    uint64_t barrierResidualZeros        = 0;      // barrier voxels left unsigned (must be 0)
-    uint64_t mergeMismatches             = 0;      // per-surface signs vs the composed array (must be 0)
-    bool     openvdbChecked              = false;
-    uint64_t confidentSignMismatches     = 0;
-    uint64_t inShellTies                 = 0;
-    bool     analyticChecked             = false;
-    uint64_t analyticConfidentMismatches = 0;
-    uint64_t analyticInShellTies         = 0;
-    bool     invertChecked               = false;
-    uint64_t invertMismatches            = 0;
-    uint64_t invertOnBits                = 0;
-    bool     coarseInvertChecked         = false;
-    uint64_t coarseInvertMismatches      = 0;
-    uint64_t lowerOnTiles                = 0;
-    uint64_t upperOnTiles                = 0;
-    uint64_t rootInteriorCells           = 0;
-    bool     fullDomainChecked           = false;
-    uint64_t fullDomainMismatches        = 0;
-    uint64_t fullDomainTies              = 0;
-};
+GridHandleT meshToSdf(const std::vector<nanovdb::Vec3f>& points,
+                      const std::vector<nanovdb::Vec3i>& triangles,
+                      const nanovdb::Map& map,
+                      float bandWidth,
+                      float isoValue);
 
-// ---- Host/device seam (all implemented in mesh_to_sdf_cuda_kernels.cu) --------------------
-//
-// The mesh->SDF example runs as three passes over an opaque pipeline object (SdfPipeline; defined on
-// the CUDA side because it embeds CUDA-only types — the host driver only ever holds a pointer):
-//   buildMeshToSdf     run steps 1-6 (rasterize -> prune -> CC -> sign -> fill) -> live device state
-//   validateMeshToSdf  independent CPU oracles + OpenVDB / analytic cross-checks -> SDFResult metrics
-//   exportMeshToSdf    dump the Polyscope visualization files (.ccvis + .fill)
-// freeSdfPipeline releases the pipeline. Build once, then validate and/or export over it.
+namespace {
 
-struct SdfPipeline;   // opaque; defined in the .cu
-
-/// @brief Run the full pipeline (steps 1-6) and return the live device state.
-/// @param points,triangles,map  the source mesh + index<->world transform.
-/// @param bandWidth             narrow-band width (voxels).
-SdfPipeline* buildMeshToSdf(const std::vector<nanovdb::Vec3f>& points,
-                            const std::vector<nanovdb::Vec3i>& triangles,
-                            const nanovdb::Map&                map,
-                            float                              bandWidth);
-
-/// @brief Independent validation of a built pipeline (CPU oracles + optional OpenVDB / analytic
-///        ground-truth cross-checks). Read-only; returns the metrics summary.
-/// @param analyticSpheres optional numSpheres × {Cx,Cy,Cz,R} (world) enabling the analytic union sign
-///                        check (inside iff inside any primitive); else nullptr.
-/// @param analyticBoxes   optional numBoxes × {Cx,Cy,Cz,halfExtent} (world) axis-aligned cubes.
-SDFResult validateMeshToSdf(const SdfPipeline*                 pipeline,
-                            const std::vector<nanovdb::Vec3f>& points,
-                            const std::vector<nanovdb::Vec3i>& triangles,
-                            const double*                      analyticSpheres = nullptr,
-                            int                                numAnalyticSpheres = 0,
-                            const double*                      analyticBoxes = nullptr,
-                            int                                numAnalyticBoxes = 0,
-                            bool                               analyticUnion = false);
-
-/// @brief Dump the Polyscope visualization of a built pipeline to `<path>` (+ `<path>.fill`).
-void exportMeshToSdf(const SdfPipeline* pipeline, const std::string& path);
-
-/// @brief Release a pipeline returned by buildMeshToSdf.
-void freeSdfPipeline(SdfPipeline* pipeline);
-
-/// @brief Implemented on the CUDA side: prints topology diagnostics for the device-
-///        resident index grid (active voxels, node counts, bbox, occupancy, memory).
-void printGridDiagnostics(const GridHandleT& handle, const std::string& title);
-
-/// @brief Implemented on the CUDA side: synthetic unit test of the chunk-C root-interior flood
-///        (seed gate, multi-seed fill of disconnected regions, wall blocking). Returns 0 on PASS.
-int testRootInteriorFlood();
-
-/// @brief Minimal Wavefront .obj reader (vertices + faces) using NanoVDB types.
-///
-///        Polygons with more than 3 vertices are fan-triangulated. Vertex references
-///        of the form `v`, `v/vt`, `v//vn`, `v/vt/vn` are accepted, as are negative
-///        (relative) indices. Lines that are not `v` or `f` are ignored.
-static void readOBJ(const std::string&            filename,
-                    std::vector<nanovdb::Vec3f>&  points,
-                    std::vector<nanovdb::Vec3i>&  triangles)
+void readObj(const std::string& filename,
+             std::vector<nanovdb::Vec3f>& points,
+             std::vector<nanovdb::Vec3i>& triangles)
 {
     std::ifstream file(filename);
-    if (!file.is_open())
-        throw std::runtime_error("Failed to open OBJ file: " + filename);
+    if (!file) throw std::runtime_error("Failed to open OBJ file: " + filename);
 
     std::string line;
     int lineNumber = 0;
     while (std::getline(file, line)) {
         ++lineNumber;
-        std::istringstream iss(line);
+        std::istringstream input(line);
         std::string type;
-        iss >> type;
+        input >> type;
 
         if (type == "v") {
             float x, y, z;
-            iss >> x >> y >> z;
-            points.emplace_back(x, y, z);
+            if (input >> x >> y >> z) points.emplace_back(x, y, z);
         } else if (type == "f") {
             std::vector<int> face;
-            std::string vert;
-            while (iss >> vert) {
-                const size_t slash = vert.find('/');
-                const std::string idxStr = vert.substr(0, slash);
-                if (idxStr.empty()) continue;
-                int raw = std::stoi(idxStr);
-                // OBJ indices are 1-based; negatives are relative to points read so far.
-                int idx = (raw < 0) ? int(points.size()) + raw : raw - 1;
-                if (idx < 0 || idx >= int(points.size()))
-                    throw std::runtime_error("OBJ parse error on line " +
-                                             std::to_string(lineNumber) +
-                                             ": face index out of bounds");
-                face.push_back(idx);
+            std::string vertex;
+            while (input >> vertex) {
+                const std::string index = vertex.substr(0, vertex.find('/'));
+                if (index.empty()) continue;
+                const int raw = std::stoi(index);
+                const int i = raw < 0 ? int(points.size()) + raw : raw - 1;
+                if (i < 0 || i >= int(points.size())) {
+                    throw std::runtime_error(
+                        "OBJ face index out of bounds on line " + std::to_string(lineNumber));
+                }
+                face.push_back(i);
             }
-            for (size_t i = 2; i < face.size(); ++i)
+            for (std::size_t i = 2; i < face.size(); ++i)
                 triangles.emplace_back(face[0], face[i - 1], face[i]);
         }
     }
 }
 
-// ---------------------------------------------------------------------------------------------------
-// In-code analytic mesh generators (no .obj files) for the mirror-faithfulness self-tests.
-// ---------------------------------------------------------------------------------------------------
-
-/// @brief Axis-aligned cube, side 2*halfWorld, centered at the origin then translated by
-///        +0.5*voxelSize on every axis so no face lies on an integer grid plane (avoids on-plane
-///        dot ties). halfWorld is snapped to an integer number of voxels so the faces land exactly
-///        on half-voxel index planes (between voxel centers). 8 verts, 12 triangles, watertight.
-static void makeCube(float voxelSize, float halfWorld,
-                     std::vector<nanovdb::Vec3f>& P, std::vector<nanovdb::Vec3i>& T)
+void printUsage(const char* executable)
 {
-    const float h = std::round(halfWorld / voxelSize) * voxelSize;  // integer voxels
-    const float s = 0.5f * voxelSize;                               // fractional-voxel shift
-    const float c[8][3] = {{-h,-h,-h},{ h,-h,-h},{ h, h,-h},{-h, h,-h},
-                           {-h,-h, h},{ h,-h, h},{ h, h, h},{-h, h, h}};
-    for (auto& v : c) P.emplace_back(v[0] + s, v[1] + s, v[2] + s);
-    const int f[12][3] = {{0,1,2},{0,2,3}, {4,6,5},{4,7,6}, {0,4,5},{0,5,1},
-                          {1,5,6},{1,6,2}, {2,6,7},{2,7,3}, {3,7,4},{3,4,0}};
-    for (auto& t : f) T.emplace_back(t[0], t[1], t[2]);
+    std::cerr << "Usage: " << executable
+              << " mesh.obj [voxel-size=0.01] [band-width=3] [iso-value=0]"
+                 " [output=mesh_to_sdf.nvdb]\n";
 }
 
-/// @brief UV sphere of radius R centered at C, tessellated nLat x nLon. With nLat large the facet
-///        (chord) error R*(pi/nLat)^2/2 is << voxelSize. Watertight (two pole fans + quad rings).
-static void makeUVSphere(nanovdb::Vec3f C, float R, int nLat, int nLon,
-                         std::vector<nanovdb::Vec3f>& P, std::vector<nanovdb::Vec3i>& T)
-{
-    const float PI   = 3.14159265358979323846f;
-    const int   base = int(P.size());                           // composable: append after existing verts
-    const int   north = base;
-    P.emplace_back(C[0], C[1], C[2] + R);                       // north pole
-    for (int i = 1; i < nLat; ++i) {                            // interior rings
-        const float theta = PI * float(i) / float(nLat);
-        const float st = std::sin(theta), ct = std::cos(theta);
-        for (int j = 0; j < nLon; ++j) {
-            const float phi = 2.0f * PI * float(j) / float(nLon);
-            P.emplace_back(C[0] + R * st * std::cos(phi),
-                           C[1] + R * st * std::sin(phi),
-                           C[2] + R * ct);
-        }
-    }
-    const int south = int(P.size());
-    P.emplace_back(C[0], C[1], C[2] - R);                       // south pole
-    auto ring = [&](int r, int j) { return base + 1 + r * nLon + (j % nLon); };  // r in [0, nLat-2]
-    for (int j = 0; j < nLon; ++j)                              // north cap
-        T.emplace_back(north, ring(0, j), ring(0, j + 1));
-    for (int r = 0; r < nLat - 2; ++r)                          // quad rings -> 2 tris each
-        for (int j = 0; j < nLon; ++j) {
-            T.emplace_back(ring(r, j),     ring(r + 1, j), ring(r + 1, j + 1));
-            T.emplace_back(ring(r, j),     ring(r + 1, j + 1), ring(r, j + 1));
-        }
-    for (int j = 0; j < nLon; ++j)                              // south cap
-        T.emplace_back(south, ring(nLat - 2, j + 1), ring(nLat - 2, j));
-}
+} // namespace
 
-/// @brief Run the full mesh->SDF pipeline (build), optionally export it, and validate it against the
-///        analytic ground truth on an in-memory mesh. Returns the validator summary.
-static SDFResult runPipeline(const std::string& name,
-                            const std::vector<nanovdb::Vec3f>& points,
-                            const std::vector<nanovdb::Vec3i>& triangles,
-                            float voxelSize, float bandWidth,
-                            const double* analyticSpheres, int numAnalyticSpheres,
-                            const double* analyticBoxes = nullptr, int numAnalyticBoxes = 0,
-                            bool analyticUnion = false)
-{
-    std::cout << "\n================ " << name << " : " << points.size() << " verts, "
-              << triangles.size() << " tris (voxelSize=" << voxelSize
-              << ", bandWidth=" << bandWidth << ") ================\n";
-    nanovdb::Map map;
-    map.set(double(voxelSize), nanovdb::Vec3d(0.0), 1.0);
-
-    SdfPipeline* pipeline = buildMeshToSdf(points, triangles, map, bandWidth);
-    if (const char* visPath = std::getenv("CC_EXPORT_VIS")) exportMeshToSdf(pipeline, visPath);
-    SDFResult result = validateMeshToSdf(pipeline, points, triangles,
-                                         analyticSpheres, numAnalyticSpheres, analyticBoxes, numAnalyticBoxes,
-                                         analyticUnion);
-    freeSdfPipeline(pipeline);
-    return result;
-}
-
-/// @brief Scalability probe: @a n concentric spheres, 10 voxels apart, innermost at radius 10. Every
-///        surface is enclosed by the ones outside it, so the nesting depths run 0,1,..,n-1 and the
-///        signs of every other shell are flipped. Note the voxel count grows as O(n^3) here — the
-///        outer radius has to grow with n to keep the shells apart — so read this table together with
-///        the separated-sphere one, which grows the surface count at O(n) voxels.
-static int runNestedShells(int n, float voxelSize, float bandWidth)
-{
-    std::vector<nanovdb::Vec3f> P; std::vector<nanovdb::Vec3i> T;
-    const float          s = 0.5f * voxelSize;                  // fractional-voxel offset
-    const nanovdb::Vec3f C(s, s, s);
-    std::vector<double>  spheres(4 * std::size_t(n));
-    for (int i = 0; i < n; ++i) {
-        const float R = float(10 * (n - i)) * voxelSize;        // outermost first, 10 voxels apart
-        makeUVSphere(C, R, 128, 256, P, T);
-        spheres[4*i+0] = double(C[0]); spheres[4*i+1] = double(C[1]);
-        spheres[4*i+2] = double(C[2]); spheres[4*i+3] = double(R);
-    }
-    const SDFResult r = runPipeline("NESTED-SHELLS x" + std::to_string(n), P, T,
-                                    voxelSize, bandWidth, spheres.data(), n);
-    int failures = 0;
-    auto check = [&](const char* label, bool ok) {
-        std::cout << "  [" << (ok ? "PASS" : "FAIL") << "] " << label << "\n";
-        if (!ok) ++failures;
-    };
-    std::cout << "  nested-shells assertions:\n";
-    check("closed surfaces == n", r.surfaceComponents == uint64_t(n));
-    check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
-    check("0 barrier-signing mismatches (CPU mirror)", r.barrierMismatches == 0 && r.barrierResidualZeros == 0);
-    check("0 surface-merge mismatches (per-surface signs vs composed)", r.mergeMismatches == 0);
-    return failures;
-}
-
-/// @brief Scalability probe: @a n equal spheres of radius 10 voxels on a cubic lattice, 40 voxels
-///        apart, so none encloses another (all depths 0). The band voxels grow linearly with @a n,
-///        which is what makes this the control for the nested table: anything super-linear here is
-///        the per-surface machinery itself, not the extra geometry.
-static int runManySpheres(int n, float voxelSize, float bandWidth)
-{
-    std::vector<nanovdb::Vec3f> P; std::vector<nanovdb::Vec3i> T;
-    const float         R     = 10.f * voxelSize;
-    const float         pitch = 40.f * voxelSize;
-    const int           side  = int(std::ceil(std::cbrt(double(n))));   // cubic lattice, row-major
-    std::vector<double> spheres(4 * std::size_t(n));
-    for (int i = 0; i < n; ++i) {
-        const nanovdb::Vec3f C(float(i % side) * pitch,
-                               float((i / side) % side) * pitch,
-                               float(i / (side * side)) * pitch);
-        makeUVSphere(C, R, 64, 128, P, T);
-        spheres[4*i+0] = double(C[0]); spheres[4*i+1] = double(C[1]);
-        spheres[4*i+2] = double(C[2]); spheres[4*i+3] = double(R);
-    }
-    const SDFResult r = runPipeline("MANY-SPHERES x" + std::to_string(n), P, T,
-                                    voxelSize, bandWidth, spheres.data(), n);
-    int failures = 0;
-    auto check = [&](const char* label, bool ok) {
-        std::cout << "  [" << (ok ? "PASS" : "FAIL") << "] " << label << "\n";
-        if (!ok) ++failures;
-    };
-    std::cout << "  many-spheres assertions:\n";
-    check("closed surfaces == n", r.surfaceComponents == uint64_t(n));
-    check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
-    check("0 barrier-signing mismatches (CPU mirror)", r.barrierMismatches == 0 && r.barrierResidualZeros == 0);
-    check("0 surface-merge mismatches (per-surface signs vs composed)", r.mergeMismatches == 0);
-    return failures;
-}
-
-/// @brief Run the in-code analytic self-tests (cube + sphere). Returns the number of failed checks.
-static int runSelfTests(const std::string& which, float voxelSize, float bandWidth)
-{
-    int failures = 0;
-    auto check = [&](const char* label, bool ok) {
-        std::cout << "  [" << (ok ? "PASS" : "FAIL") << "] " << label << "\n";
-        if (!ok) ++failures;
-    };
-
-    // Every "N CC global components" count below is a statement about the shells the MESH's own
-    // barrier splits the band into. CC_ISOVALUE signs a surface standing off the mesh instead, which
-    // splits it differently -- a third region appears wherever the object is thicker than the
-    // isovalue, and the sliver left hugging the mesh breaks into specks once the isovalue exceeds
-    // sqrt(3)/2 voxels. Those counts are all correct and none of them is 2, so the assertion is
-    // skipped rather than made to predict them; the analytic sign check is what proves the run.
-    const bool countShells = std::getenv("CC_ISOVALUE") == nullptr;
-    auto checkComponents = [&](const char* label, bool ok) {
-        if (countShells) check(label, ok);
-        else std::cout << "  [SKIP] " << label << " (CC_ISOVALUE moves the surface off the mesh)\n";
-    };
-
-    // The invert-mask and full-domain checks are only as available as the analytic oracle that feeds
-    // them, and that oracle steps aside for a dilated box (its edges round off, which an L-infinity
-    // box does not model). Report that as not run rather than as a mismatch: folding "@a ran" into
-    // the assertion the way "ran && 0 mismatches" does turns a skipped check into a failed one.
-    auto checkVsOracle = [&](const char* label, bool ran, bool ok) {
-        if (ran) check(label, ok);
-        else std::cout << "  [SKIP] " << label << " (no analytic oracle for this case)\n";
-    };
-
-    if (which == "--selftest") {
-        // The interior-ON path of the root flood needs an object >4096 voxels thick — unreachable by
-        // rasterization — so it is exercised synthetically.
-        check("root-interior flood unit test (synthetic)", testRootInteriorFlood() == 0);
-    }
-
-    if (which == "--cube" || which == "--selftest") {
-        std::vector<nanovdb::Vec3f> P; std::vector<nanovdb::Vec3i> T;
-        makeCube(voxelSize, 15.0f * voxelSize, P, T);          // half-size ~15 voxels
-        // Analytic ground truth: axis-aligned box, center = the +0.5-voxel shift, half = snapped h.
-        const double s = 0.5 * voxelSize;
-        const double h = std::round(15.0) * voxelSize;         // same snap as makeCube
-        const double box[4] = { s, s, s, h };
-        const SDFResult r = runPipeline("CUBE", P, T, voxelSize, bandWidth, nullptr, 0, box, 1);
-        std::cout << "  cube assertions:\n";
-        checkComponents("exactly 2 CC global components", r.globalComponents == 2);
-        if (r.openvdbChecked) check("0 confident-region OpenVDB sign mismatches", r.confidentSignMismatches == 0);
-        if (r.analyticChecked) check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
-        checkVsOracle("0 leaf invert-mask mismatches (inactive voxels)", r.invertChecked, r.invertMismatches == 0);
-        checkVsOracle("0 coarse invert-mask mismatches (childless tiles)", r.coarseInvertChecked, r.coarseInvertMismatches == 0);
-        checkVsOracle("0 full-domain sign query mismatches", r.fullDomainChecked, r.fullDomainMismatches == 0);
-    }
-
-    if (which == "--sphere" || which == "--selftest") {
-        std::vector<nanovdb::Vec3f> P; std::vector<nanovdb::Vec3i> T;
-        const float s = 0.5f * voxelSize;
-        const nanovdb::Vec3f C(s, s, s);                       // fractional-voxel center
-        const float R = 20.0f * voxelSize;                     // radius ~20 voxels
-        makeUVSphere(C, R, 128, 256, P, T);
-        const double sphere[4] = { double(C[0]), double(C[1]), double(C[2]), double(R) };
-        const SDFResult r = runPipeline("SPHERE", P, T, voxelSize, bandWidth, sphere, 1);
-        std::cout << "  sphere assertions:\n";
-        checkComponents("exactly 2 CC global components", r.globalComponents == 2);
-        if (r.openvdbChecked) check("0 confident-region OpenVDB sign mismatches", r.confidentSignMismatches == 0);
-        if (r.analyticChecked) check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
-        checkVsOracle("0 leaf invert-mask mismatches (inactive voxels)", r.invertChecked, r.invertMismatches == 0);
-        checkVsOracle("0 coarse invert-mask mismatches (childless tiles)", r.coarseInvertChecked, r.coarseInvertMismatches == 0);
-        checkVsOracle("0 full-domain sign query mismatches", r.fullDomainChecked, r.fullDomainMismatches == 0);
-    }
-
-    // R = 230 voxels: big enough that fully-interior 128^3-aligned regions exist, so childless UPPER
-    // tiles get marked interior (the R=20 sphere only exercises the exterior/OFF path at upper level).
-    if (which == "--big-sphere" || which == "--selftest") {
-        std::vector<nanovdb::Vec3f> P; std::vector<nanovdb::Vec3i> T;
-        const float s = 0.5f * voxelSize;
-        const nanovdb::Vec3f C(s, s, s);
-        const float R = 230.0f * voxelSize;
-        makeUVSphere(C, R, 256, 512, P, T);                    // facet error ~0.02 voxels
-        const double sphere[4] = { double(C[0]), double(C[1]), double(C[2]), double(R) };
-        const SDFResult r = runPipeline("BIG-SPHERE", P, T, voxelSize, bandWidth, sphere, 1);
-        std::cout << "  big-sphere assertions:\n";
-        checkComponents("exactly 2 CC global components", r.globalComponents == 2);
-        if (r.openvdbChecked) check("0 confident-region OpenVDB sign mismatches", r.confidentSignMismatches == 0);
-        if (r.analyticChecked) check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
-        checkVsOracle("0 leaf invert-mask mismatches (inactive voxels)", r.invertChecked, r.invertMismatches == 0);
-        checkVsOracle("0 coarse invert-mask mismatches (childless tiles)", r.coarseInvertChecked, r.coarseInvertMismatches == 0);
-        checkVsOracle("0 full-domain sign query mismatches", r.fullDomainChecked, r.fullDomainMismatches == 0);
-        check("some interior upper tiles exist (test is exercising the upper ON path)", r.upperOnTiles > 0);
-    }
-
-    // Two well-separated spheres: the case that per-surface exterior seeding exists for. Labeling the
-    // UN-pruned band splits the input into one component per closed surface, and each surface gets its
-    // own min-x exterior seed, so the 2nd sphere's OUTER shell is signed exterior like the 1st. (A
-    // single global seed marks only ONE exterior component and mislabels that shell interior.)
-    if (which == "--two-spheres" || which == "--selftest") {
-        std::vector<nanovdb::Vec3f> P; std::vector<nanovdb::Vec3i> T;
-        const float  s   = 0.5f * voxelSize;                   // fractional-voxel offset
-        const float  R1  = 20.0f * voxelSize, R2 = 15.0f * voxelSize;      // distinct radii
-        const float  gap = 30.0f * voxelSize;                  // surface gap >> bandWidth (band ~3 vox)
-        const nanovdb::Vec3f C1(s, s, s);
-        const nanovdb::Vec3f C2(s + R1 + gap + R2, s, s);      // separated along +x
-        makeUVSphere(C1, R1, 128, 256, P, T);
-        makeUVSphere(C2, R2, 128, 256, P, T);                  // appended (composable indices)
-        const double spheres[8] = { double(C1[0]), double(C1[1]), double(C1[2]), double(R1),
-                                    double(C2[0]), double(C2[1]), double(C2[2]), double(R2) };
-        const SDFResult r = runPipeline("TWO-SPHERES", P, T, voxelSize, bandWidth, spheres, 2);
-
-        std::cout << "  two-spheres assertions:\n";
-        // One component per closed surface on the un-pruned band; the barrier-pruned grid still has
-        // two shells per sphere, hence 4 there.
-        check("exactly 2 closed surfaces", r.surfaceComponents == 2);
-        checkComponents("exactly 4 CC global components (2 shells x 2 spheres)", r.globalComponents == 4);
-        check("0 confident-region OpenVDB sign mismatches", r.confidentSignMismatches == 0);
-        check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
-        check("0 barrier-signing mismatches (CPU mirror)", r.barrierMismatches == 0 && r.barrierResidualZeros == 0);
-        check("0 surface-merge mismatches (per-surface signs vs composed)", r.mergeMismatches == 0);
-        check("0 leaf invert-mask mismatches (inactive voxels)", r.invertMismatches == 0);
-        check("0 coarse invert-mask mismatches (childless tiles)", r.coarseInvertMismatches == 0);
-        check("0 full-domain sign query mismatches", r.fullDomainMismatches == 0);
-    }
-
-    // Two spheres whose surfaces INTERSECT: the case Ken raised in the 2026-08-18 weekly. Everything
-    // is one connected band, so connectivity alone cannot tell the union's boundary from the two caps
-    // buried inside it, and OpenVDB spends a whole pass (ValidateIntersectingVoxels +
-    // RemoveSelfIntersectingSurface) deleting exactly those. REPORT ONLY: the analytic oracle here is
-    // even-odd, so it calls the lens-shaped intersection EXTERIOR, whereas the union solid calls it
-    // interior -- the two ground truths genuinely disagree on this input, which is half the point of
-    // running it. Read the numbers, do not assert on them.
-    if (which == "--overlapping-spheres") {
-        std::vector<nanovdb::Vec3f> P; std::vector<nanovdb::Vec3i> T;
-        const float s  = 0.5f * voxelSize;
-        const float R1 = 20.0f * voxelSize, R2 = 15.0f * voxelSize;
-        const float d  = 25.0f * voxelSize;            // |R1-R2| < d < R1+R2  =>  surfaces cross
-        const nanovdb::Vec3f C1(s, s, s);
-        const nanovdb::Vec3f C2(s + d, s, s);
-        makeUVSphere(C1, R1, 128, 256, P, T);
-        makeUVSphere(C2, R2, 128, 256, P, T);
-        const double spheres[8] = { double(C1[0]), double(C1[1]), double(C1[2]), double(R1),
-                                    double(C2[0]), double(C2[1]), double(C2[2]), double(R2) };
-        const SDFResult r = runPipeline("OVERLAPPING-SPHERES", P, T, voxelSize, bandWidth, spheres, 2,
-                                        nullptr, 0, /*analyticUnion=*/true);
-
-        std::cout << "  overlapping-spheres observations (REPORT ONLY, nothing asserted):\n";
-        std::cout << "    closed surfaces (un-pruned components) : " << r.surfaceComponents << "\n";
-        std::cout << "    CC global components                   : " << r.globalComponents << "\n";
-        std::cout << "    analytic (even-odd) sign mismatches     : " << r.analyticConfidentMismatches
-                  << "   <- expected non-zero: even-odd calls the lens exterior\n";
-        std::cout << "    OpenVDB sign mismatches                 : " << r.confidentSignMismatches
-                  << "   <- OpenVDB deletes the buried caps; we keep them\n";
-        std::cout << "    barrier-signing mismatches (CPU mirror) : " << r.barrierMismatches << "\n";
-        std::cout << "    surface-merge mismatches                : " << r.mergeMismatches << "\n";
-    }
-
-    // Five separated spheres of different radii, scattered over all three axes rather than strung
-    // along one. Only one of them owns the global min-x voxel, so every other sphere's outer shell is
-    // signed correctly only if each surface really gets its own exterior seed.
-    if (which == "--multi-spheres" || which == "--selftest") {
-        std::vector<nanovdb::Vec3f> P; std::vector<nanovdb::Vec3i> T;
-        const float s = 0.5f * voxelSize;                        // fractional-voxel offset
-        const float d = 70.0f * voxelSize;                       // center spacing (gaps >> band ~3 vox)
-        struct { nanovdb::Vec3f c; float r; } S[5] = {
-            { nanovdb::Vec3f(s,     s,     s    ), 20.0f * voxelSize },
-            { nanovdb::Vec3f(s + d, s,     s    ), 15.0f * voxelSize },
-            { nanovdb::Vec3f(s,     s + d, s    ), 12.0f * voxelSize },
-            { nanovdb::Vec3f(s,     s,     s + d), 10.0f * voxelSize },
-            { nanovdb::Vec3f(s + d, s + d, s + d), 18.0f * voxelSize },
-        };
-        double spheres[20];
-        for (int i = 0; i < 5; ++i) {
-            makeUVSphere(S[i].c, S[i].r, 128, 256, P, T);        // appended (composable indices)
-            spheres[4*i+0] = double(S[i].c[0]); spheres[4*i+1] = double(S[i].c[1]);
-            spheres[4*i+2] = double(S[i].c[2]); spheres[4*i+3] = double(S[i].r);
-        }
-        const SDFResult r = runPipeline("MULTI-SPHERES", P, T, voxelSize, bandWidth, spheres, 5);
-
-        std::cout << "  multi-spheres assertions:\n";
-        check("exactly 5 closed surfaces", r.surfaceComponents == 5);
-        checkComponents("exactly 10 CC global components (2 shells x 5 spheres)", r.globalComponents == 10);
-        check("0 confident-region OpenVDB sign mismatches", r.confidentSignMismatches == 0);
-        check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
-        check("0 barrier-signing mismatches (CPU mirror)", r.barrierMismatches == 0 && r.barrierResidualZeros == 0);
-        check("0 surface-merge mismatches (per-surface signs vs composed)", r.mergeMismatches == 0);
-        check("0 leaf invert-mask mismatches (inactive voxels)", r.invertMismatches == 0);
-        check("0 coarse invert-mask mismatches (childless tiles)", r.coarseInvertMismatches == 0);
-        check("0 full-domain sign query mismatches", r.fullDomainMismatches == 0);
-    }
-
-    // A sphere with a concentric spherical cavity: two nested closed surfaces. By the even-odd rule
-    // the shell between them is solid and the core is empty, so the INNER surface's band must carry
-    // the opposite sign from what it gets on its own — it sits one level deep, and only the inclusion
-    // test plus the depth-parity flip can know that. Per-surface seeding alone signs the core solid.
-    if (which == "--nested-spheres" || which == "--selftest") {
-        std::vector<nanovdb::Vec3f> P; std::vector<nanovdb::Vec3i> T;
-        const float s  = 0.5f * voxelSize;                      // fractional-voxel offset
-        const float Ro = 25.0f * voxelSize, Ri = 12.0f * voxelSize;  // surfaces 13 voxels apart >> band
-        const nanovdb::Vec3f C(s, s, s);
-        makeUVSphere(C, Ro, 128, 256, P, T);
-        makeUVSphere(C, Ri, 128, 256, P, T);                    // appended (composable indices)
-        const double spheres[8] = { double(C[0]), double(C[1]), double(C[2]), double(Ro),
-                                    double(C[0]), double(C[1]), double(C[2]), double(Ri) };
-        const SDFResult r = runPipeline("NESTED-SPHERES", P, T, voxelSize, bandWidth, spheres, 2);
-
-        std::cout << "  nested-spheres assertions:\n";
-        check("exactly 2 closed surfaces", r.surfaceComponents == 2);
-        check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
-        check("0 barrier-signing mismatches (CPU mirror)", r.barrierMismatches == 0 && r.barrierResidualZeros == 0);
-        check("0 surface-merge mismatches (per-surface signs vs composed)", r.mergeMismatches == 0);
-        check("0 leaf invert-mask mismatches (inactive voxels)", r.invertMismatches == 0);
-        check("0 coarse invert-mask mismatches (childless tiles)", r.coarseInvertMismatches == 0);
-        check("0 full-domain sign query mismatches", r.fullDomainMismatches == 0);
-    }
-
-    // Three concentric surfaces: solid shell, cavity, solid core. This is the case that needs the
-    // parity and not just "is it enclosed" — the innermost surface sits at depth 2, so its signs must
-    // be left ALONE, while the middle one at depth 1 is flipped.
-    if (which == "--triple-nested" || which == "--selftest") {
-        std::vector<nanovdb::Vec3f> P; std::vector<nanovdb::Vec3i> T;
-        const float s = 0.5f * voxelSize;                        // fractional-voxel offset
-        const float R[3] = { 36.0f * voxelSize, 24.0f * voxelSize, 12.0f * voxelSize };  // 12 voxels apart
-        const nanovdb::Vec3f C(s, s, s);
-        double spheres[12];
-        for (int i = 0; i < 3; ++i) {
-            makeUVSphere(C, R[i], 128, 256, P, T);               // appended (composable indices)
-            spheres[4*i+0] = double(C[0]); spheres[4*i+1] = double(C[1]);
-            spheres[4*i+2] = double(C[2]); spheres[4*i+3] = double(R[i]);
-        }
-        const SDFResult r = runPipeline("TRIPLE-NESTED", P, T, voxelSize, bandWidth, spheres, 3);
-
-        std::cout << "  triple-nested assertions:\n";
-        check("exactly 3 closed surfaces", r.surfaceComponents == 3);
-        check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
-        check("0 barrier-signing mismatches (CPU mirror)", r.barrierMismatches == 0 && r.barrierResidualZeros == 0);
-        check("0 surface-merge mismatches (per-surface signs vs composed)", r.mergeMismatches == 0);
-        check("0 leaf invert-mask mismatches (inactive voxels)", r.invertMismatches == 0);
-        check("0 coarse invert-mask mismatches (childless tiles)", r.coarseInvertMismatches == 0);
-        check("0 full-domain sign query mismatches", r.fullDomainMismatches == 0);
-    }
-
-    // Two separated clusters, each with its own nesting: a 3-deep one (shell, cavity, core) next to a
-    // 2-deep one (shell, cavity). The inclusion relation here is a forest with two roots rather than a
-    // single chain, so a surface's depth must be counted against its own enclosing surfaces only.
-    if (which == "--multi-nested" || which == "--selftest") {
-        std::vector<nanovdb::Vec3f> P; std::vector<nanovdb::Vec3i> T;
-        const float s = 0.5f * voxelSize;                     // fractional-voxel offset
-        const nanovdb::Vec3f CA(s, s, s);
-        const nanovdb::Vec3f CB(s + 120.0f * voxelSize, s, s);  // clusters ~54 voxels apart at the surface
-        const float RA[3] = { 36.0f * voxelSize, 24.0f * voxelSize, 12.0f * voxelSize };
-        const float RB[2] = { 30.0f * voxelSize, 18.0f * voxelSize };
-        double spheres[20];
-        int k = 0;
-        for (int i = 0; i < 3; ++i, ++k) {
-            makeUVSphere(CA, RA[i], 128, 256, P, T);
-            spheres[4*k+0] = double(CA[0]); spheres[4*k+1] = double(CA[1]);
-            spheres[4*k+2] = double(CA[2]); spheres[4*k+3] = double(RA[i]);
-        }
-        for (int i = 0; i < 2; ++i, ++k) {
-            makeUVSphere(CB, RB[i], 128, 256, P, T);
-            spheres[4*k+0] = double(CB[0]); spheres[4*k+1] = double(CB[1]);
-            spheres[4*k+2] = double(CB[2]); spheres[4*k+3] = double(RB[i]);
-        }
-        const SDFResult r = runPipeline("MULTI-NESTED", P, T, voxelSize, bandWidth, spheres, 5);
-
-        std::cout << "  multi-nested assertions:\n";
-        check("exactly 5 closed surfaces", r.surfaceComponents == 5);
-        check("0 confident-region analytic sign mismatches", r.analyticConfidentMismatches == 0);
-        check("0 barrier-signing mismatches (CPU mirror)", r.barrierMismatches == 0 && r.barrierResidualZeros == 0);
-        check("0 surface-merge mismatches (per-surface signs vs composed)", r.mergeMismatches == 0);
-        check("0 leaf invert-mask mismatches (inactive voxels)", r.invertMismatches == 0);
-        check("0 coarse invert-mask mismatches (childless tiles)", r.coarseInvertMismatches == 0);
-        check("0 full-domain sign query mismatches", r.fullDomainMismatches == 0);
-    }
-
-    std::cout << "\nSelf-tests: " << (failures == 0 ? "ALL PASS" : "FAILED")
-              << " (" << failures << " failed checks)\n";
-    return failures;
-}
-
-/// @brief Measure how many Shiloach-Vishkin rounds the per-leaf labeling needs: synthetic adversarial
-///        leaves, a randomized search, and -- when a mesh is given -- its real narrow band.
-int runSvConvergence(int trials,
-                     const std::vector<nanovdb::Vec3f>& points,
-                     const std::vector<nanovdb::Vec3i>& triangles,
-                     float voxelSize, float bandWidth);
-
-int main(int argc, char* argv[])
+int main(int argc, char** argv)
 {
     try {
-        if (argc < 2)
-            throw std::runtime_error("usage: " + std::string(argv[0]) +
-                                     " <input.obj | --cube | --sphere | --big-sphere | --selftest |"
-                                     " --two-spheres | --overlapping-spheres | --multi-spheres | --nested-spheres |"
-                                     " --triple-nested | --multi-nested> [voxelSize] [bandWidth]\n"
-                                     "   or: " + std::string(argv[0]) +
-                                     " <--nested-shells | --many-spheres> <n> [voxelSize] [bandWidth]\n"
-                                     "   or: " + std::string(argv[0]) +
-                                     " --sv-convergence [input.obj] [--trials N]"
-                                     " [--voxel-size S] [--band-width W]");
-
-        const std::string arg1 = argv[1];
-
-        // Convergence probe for the per-leaf union-find. Synthetic leaves always; an optional .obj
-        // adds the real narrow band it produces.
-        if (arg1 == "--sv-convergence") {
-            std::vector<nanovdb::Vec3f> points;
-            std::vector<nanovdb::Vec3i> triangles;
-            int   trials    = 2000;
-            float voxelSize = 0.01f, bandWidth = 3.0f;
-            for (int i = 2; i < argc; ++i) {
-                const std::string a = argv[i];
-                if (a == "--trials" && i + 1 < argc)          trials    = std::stoi(argv[++i]);
-                else if (a == "--voxel-size" && i + 1 < argc) voxelSize = std::stof(argv[++i]);
-                else if (a == "--band-width" && i + 1 < argc) bandWidth = std::stof(argv[++i]);
-                else {
-                    std::cout << "Reading " << a << "...\n";
-                    readOBJ(a, points, triangles);
-                }
-            }
-            return runSvConvergence(trials, points, triangles, voxelSize, bandWidth);
+        if (argc < 2) {
+            printUsage(argv[0]);
+            return 1;
         }
 
-        // Scalability probes: surface count is a parameter, so n comes before the voxel size.
-        if (arg1 == "--nested-shells" || arg1 == "--many-spheres") {
-            if (argc < 3) throw std::runtime_error(arg1 + " needs a surface count");
-            const int   n  = std::stoi(argv[2]);
-            const float vs = (argc > 3) ? std::stof(argv[3]) : 0.02f;
-            const float bw = (argc > 4) ? std::stof(argv[4]) : 3.0f;
-            const int failures = (arg1 == "--nested-shells") ? runNestedShells(n, vs, bw)
-                                                             : runManySpheres(n, vs, bw);
-            std::cout << "\nSelf-tests: " << (failures == 0 ? "ALL PASS" : "FAILED")
-                      << " (" << failures << " failed checks)\n";
-            return failures == 0 ? 0 : 1;
-        }
-
-        // In-code analytic self-tests / probes (no .obj). Default voxelSize 0.02.
-        if (arg1 == "--cube" || arg1 == "--sphere" || arg1 == "--big-sphere" ||
-            arg1 == "--selftest" || arg1 == "--two-spheres" || arg1 == "--overlapping-spheres" ||
-            arg1 == "--multi-spheres" ||
-            arg1 == "--nested-spheres" || arg1 == "--triple-nested" ||
-            arg1 == "--multi-nested") {
-            const float vs = (argc > 2) ? std::stof(argv[2]) : 0.02f;
-            const float bw = (argc > 3) ? std::stof(argv[3]) : 3.0f;
-            return runSelfTests(arg1, vs, bw) == 0 ? 0 : 1;
-        }
-
-        const std::string inputFile = arg1;
-        const float voxelSize = (argc > 2) ? std::stof(argv[2]) : 0.01f;
-        const float bandWidth = (argc > 3) ? std::stof(argv[3]) : 3.0f;
+        const float voxelSize = argc > 2 ? std::stof(argv[2]) : 0.01f;
+        const float bandWidth = argc > 3 ? std::stof(argv[3]) : 3.0f;
+        const float isoValue  = argc > 4 ? std::stof(argv[4]) : 0.0f;
+        const std::string output = argc > 5 ? argv[5] : "mesh_to_sdf.nvdb";
+        if (!(voxelSize > 0.0f)) throw std::runtime_error("voxel size must be positive");
+        if (!(bandWidth > 0.0f)) throw std::runtime_error("band width must be positive");
+        if (isoValue < 0.0f) throw std::runtime_error("iso value must be non-negative");
 
         std::vector<nanovdb::Vec3f> points;
         std::vector<nanovdb::Vec3i> triangles;
-        std::cout << "Reading " << inputFile << "...\n";
-        readOBJ(inputFile, points, triangles);
-        std::cout << "Loaded " << points.size() << " vertices, "
-                  << triangles.size() << " triangles.\n";
+        readObj(argv[1], points, triangles);
         if (points.empty() || triangles.empty())
             throw std::runtime_error("mesh has no triangles");
 
-        // Index<->world transform: uniform voxel size, no translation. (nanovdb::Map)
         nanovdb::Map map;
         map.set(double(voxelSize), nanovdb::Vec3d(0.0), 1.0);
 
-        // Build the full mesh->SDF pipeline (steps 1-6; buildMeshToSdf prints the grid diagnostics),
-        // optionally dump the visualization, then validate. No analytic ground truth for an arbitrary
-        // mesh, so validation runs the CPU oracles (+ the OpenVDB cross-check when built with OpenVDB).
-        // Validation is CPU-heavy (host oracles + OpenVDB meshToLevelSet); set CC_SKIP_VALIDATE=1 to
-        // skip it and time the GPU pipeline alone (e.g. for benchmarking).
-        SdfPipeline* pipeline = buildMeshToSdf(points, triangles, map, bandWidth);
-        if (const char* visPath = std::getenv("CC_EXPORT_VIS")) exportMeshToSdf(pipeline, visPath);
-        if (!std::getenv("CC_SKIP_VALIDATE")) validateMeshToSdf(pipeline, points, triangles);
-        freeSdfPipeline(pipeline);
+        auto handle = meshToSdf(points, triangles, map, bandWidth, isoValue);
+        handle.deviceDownload(nullptr, true);
+        const auto* grid = handle.grid<nanovdb::ValueOnIndex>();
+        if (!grid) throw std::runtime_error("MeshToSDF returned no grid");
 
+        nanovdb::io::writeGrid(output, handle);
+        std::cout << "Wrote " << output << " with " << grid->activeVoxelCount()
+                  << " active voxels and " << grid->blindDataCount()
+                  << " blind-data channels\n";
         return 0;
-    }
-    catch (const std::exception& e) {
-        std::cerr << "An exception occurred: \"" << e.what() << "\"\n";
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
         return 1;
     }
 }

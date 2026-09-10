@@ -204,6 +204,8 @@ set(NANOVDB_INCLUDE_CUDA_FILES
   cuda/DeviceResource.h
   cuda/DeviceStreamMap.h
   cuda/GridHandle.cuh
+  cuda/HandleStorage.h
+  cuda/ManagedResource.h
   cuda/NodeManager.cuh
   cuda/TempPool.h
   cuda/UnifiedBuffer.h

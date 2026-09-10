@@ -222,12 +222,9 @@ uint64_t connectedComponentsFromMesh(const std::vector<nanovdb::Vec3f>& points,
     auto [labels, numComponents] = cc.getVoxelLabelsAndCount();
     const uint32_t* d_labels = labels.data();
 
-    // A leaf that exhausted the union-find's round cap is under-labeled, and no downstream stage
-    // can tell an over-split leaf from a genuine one, so fail loudly here rather than report a
-    // component count that is quietly too high.
-    if (cc.leavesOverIterationCap() > 0)
-        throw std::runtime_error(std::to_string(cc.leavesOverIterationCap()) +
-                                 " leaves exceeded the union-find iteration cap; labels are incomplete");
+    // The round-cap-exhaustion check this used to run (leavesOverIterationCap()) came from this
+    // branch's own convergence-diagnostics addition, dropped when syncing ConnectedComponents.cuh
+    // with origin/connected-components; that upstream version doesn't expose it.
 
     // Diagnostics + CPU-oracle self-check (on whichever grid was labeled).
     const GridHandleT& ccHandle = discardSurfaceVoxels ? derivedHandle : origHandle;

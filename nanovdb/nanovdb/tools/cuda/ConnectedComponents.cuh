@@ -68,28 +68,6 @@ enum LeafNeighborTap : int {
 ///        face, stored canonically with a < b. uint32_t: K <= 256*leafCount stays well below 2^32.
 struct CrossLeafEdge { uint32_t a, b; };
 
-/// @brief Which schedule the per-leaf union-find follows. All are from Liu & Tarjan, "Simple
-///        Concurrent Connected Components Algorithms" (ACM TOPC 9(2), 2022), which casts this family
-///        of algorithms as a connect step followed by one or more shortcut (compress) steps,
-///        repeated until no parent changes. Hybrid is what the pipeline runs; the rest exist so the
-///        choice can be re-measured rather than assumed.
-enum class LeafSchedule {
-    Hybrid,    ///< P until LeafUnionFind::SwitchToRootAfter rounds, then R. The default: P's
-               ///< constants on every input measured so far, R's proven bound on the tail.
-    Parent,    ///< their algorithm P: parent-connect, one compress per round. Cheapest per round, but
-               ///< no step bound is known -- section 4.2 states they cannot prove even O(lg^2 n), and
-               ///< an earlier published analysis of it was withdrawn as incorrect.
-    Flatten,   ///< their algorithm S: parent-connect, then compress until the forest is flat. More
-               ///< work per round and no warm-up needed, but a proven O(min{d, lg n} lg n) bound
-               ///< (theorem 4.1), which is a constant for a fixed 8^3 leaf.
-    Root,      ///< their algorithm R: parent-root-connect, one compress per round. A proven O(lg n)
-               ///< bound (theorem 4.19), which matches the Omega(lg n) lower bound every algorithm in
-               ///< the paper is subject to -- so this is the tightest bound available. Section 5 notes
-               ///< R is Shiloach-Vishkin with two steps dropped and writes resolved by minimum.
-    Root2      ///< R with two compresses per round. Section 4.3 closes by noting this variant admits a
-               ///< simpler analysis with better constants, at the cost of more shortcutting.
-};
-
 template <typename BuildT>
 class ConnectedComponents
 {
@@ -108,48 +86,6 @@ public:
     /// @brief Toggle on and off verbose mode
     /// @param level Verbose level: 0=quiet, 1=timing, 2=benchmarking
     void setVerbose(int level = 1) { mVerbose = level; }
-
-    /// @brief Record how many rounds each leaf needed to converge, for convergenceHistogram(), and
-    ///        time the two schedule-dependent kernels for unionFindMs()/leafMaskMs(). Off by
-    ///        default: it costs one atomic per leaf, an extra device allocation and four events.
-    void setConvergenceDiagnostics(bool on = true) { mConvergenceDiagnostics = on; }
-
-    /// @brief Pick the per-leaf schedule; see LeafSchedule. Defaults to Hybrid, which is what the
-    ///        pipeline ships. The others are for measurement, not production.
-    void setLeafSchedule(LeafSchedule s) { mLeafSchedule = s; }
-
-    /// @brief Device time of the per-leaf component-count kernel, valid after
-    ///        getVoxelLabelsAndCount() when setConvergenceDiagnostics() was on.
-    ///
-    ///        This is the cleanest measure of the leaf-local union-find itself: the kernel does an
-    ///        init, the solve, and a root count, and nothing else. Use it, not the whole pipeline, to
-    ///        compare leaf schedules -- cross-leaf edges, the global union-find and the label scatter
-    ///        are identical whichever schedule is chosen, and including them dilutes the difference.
-    float unionFindMs() const { return mUnionFindMs; }
-
-    /// @brief Device time of the per-leaf mask-fill kernel. It repeats the same union-find and then
-    ///        scatters component masks and face flags, so it moves with the schedule but is not a
-    ///        clean measure of it.
-    float leafMaskMs() const { return mLeafMaskMs; }
-
-    /// @brief Rounds-to-convergence histogram over every leaf, valid after getVoxelLabelsAndCount()
-    ///        when setConvergenceDiagnostics() was on. Bin r counts the leaves whose loop settled
-    ///        after r rounds; bin MaxConvergenceIters counts leaves that ran out of rounds without
-    ///        settling, which would mean their labels are wrong; the extra trailing bin accumulates
-    ///        the total number of compress steps executed.
-    std::vector<uint32_t> convergenceHistogram() const;
-
-    /// @brief Number of leaves whose per-leaf union-find hit LeafUnionFind::MaxConvergenceIters
-    ///        without converging. Valid after getVoxelLabelsAndCount().
-    ///
-    ///        Must be zero. A non-zero value means those leaves are under-labeled -- components
-    ///        that should be one are reported as several -- and every downstream stage will carry
-    ///        the error silently, since nothing else can tell an over-split leaf from a genuine
-    ///        one. It has never been non-zero in testing: the worst leaf over 68 meshes at three
-    ///        voxel sizes under three lattice placements, and over adversarial synthetic leaves
-    ///        under all 48 symmetries of the cube, needed 6 rounds against a cap of 64. The check
-    ///        exists because that is evidence rather than proof.
-    uint64_t leavesOverIterationCap() const { return mLeavesOverIterationCap; }
 
     /// @brief Run the connected-components pipeline and return { d_labels, componentCount }:
     ///          - d_labels: a device array of activeVoxelCount+1 uint32_t, indexed by leaf.getValue(n)
@@ -197,11 +133,6 @@ private:
     util::cuda::Timer            mTimer;
     int                          mVerbose{0};
     uint32_t                     mLeavesOverIterationCap{0};  // leaves that ran out of union-find rounds
-    bool                         mConvergenceDiagnostics{false};
-    LeafSchedule                 mLeafSchedule{LeafSchedule::Hybrid};
-    float                        mUnionFindMs{0.f};      // see unionFindMs()
-    float                        mLeafMaskMs{0.f};       // see leafMaskMs()
-    nanovdb::cuda::DeviceBuffer  mConvergenceHistogram;  // (MaxConvergenceIters+2) x uint32_t
     const GridT                 *mDeviceSrcGrid;
     nanovdb::cuda::TempDevicePool mTempDevicePool;
 
@@ -313,71 +244,34 @@ struct LeafUnionFind
     // O(lg n), which matches the lower bound. Leaves are observed to converge in far fewer rounds
     // than this, so the switch is a fallback that normally never runs, and the two cost the same
     // when it does not. Raising it favours P, lowering it reaches the bound sooner.
-
-    // Round at which the main loop switches from algorithm P (parent-connect) to algorithm R
-    // (parent-root-connect). P is cheaper per round but has no proven step bound; R is bounded by
-    // O(lg n), which matches the lower bound. Leaves are observed to converge in far fewer rounds
-    // than this, so the switch is a fallback that normally never runs, and the two cost the same
-    // when it does not. Raising it favours P, lowering it reaches the bound sooner.
     static constexpr int SwitchToRootAfter = 8;
 
     // Run the full schedule to convergence. On return cur[n] holds n's component root, and each
-    // component's root is the minimum voxel offset it contains. `changed` and `moved` each point at
-    // a block-shared int, which this resets between rounds. `rounds` receives the main-loop
-    // iteration the leaf settled on; `shortcuts` how many compress steps ran, the cost the
-    // schedules differ in. Both are diagnostics; the labels do not depend on them. Only
-    // @a schedule = Hybrid is production; the rest exist so the choice stays measurable.
+    // component's root is the minimum voxel offset it contains. `changed` points at a block-shared
+    // int, which this resets between rounds.
     // Returns false if the loop ran out of rounds, leaving this leaf under-labeled; callers must
     // not ignore that, since nothing downstream would notice.
-    __device__ static bool solve(int*& cur, int*& nxt, int n, int* changed, int* moved,
-                                 LeafSchedule schedule, int& rounds, int& shortcuts)
+    __device__ static bool solve(int*& cur, int*& nxt, int n, int* changed)
     {
-        // Whether the hook is parent-root-connect. Hybrid starts as P and switches, so this is a
-        // per-round question rather than a per-schedule one.
-        const bool alwaysRoots = (schedule == LeafSchedule::Root || schedule == LeafSchedule::Root2);
+        // Unconditional warm-up: one hook, then enough compresses to flatten the forest rather
+        // than merely halve its depth (a leaf is DIM=8 across). Flatness keeps the
+        // parent-root-connect phase below cheap: with nearly every vertex its own root, that
+        // phase's extra test is almost always satisfied and costs nothing.
+        hook    (cur, nxt, n, nullptr);
+        compress(cur, nxt, n, nullptr);
+        compress(cur, nxt, n, nullptr);
+        compress(cur, nxt, n, nullptr);
+        compress(cur, nxt, n, nullptr);
 
-        shortcuts = 0;
-        if (schedule != LeafSchedule::Flatten) {
-            // Unconditional warm-up: one hook, then enough compresses to flatten the forest rather
-            // than merely halve its depth (a leaf is DIM=8 across). Flatness keeps the
-            // parent-root-connect phase cheap: with nearly every vertex its own root, that phase's
-            // extra test is almost always satisfied and costs nothing. S is excluded because
-            // compressing to flatness every round already subsumes a warm-up.
-            hook    (cur, nxt, n, nullptr, alwaysRoots);
-            compress(cur, nxt, n, nullptr);
-            compress(cur, nxt, n, nullptr);
-            compress(cur, nxt, n, nullptr);
-            compress(cur, nxt, n, nullptr);
-            shortcuts = 4;
-        }
-
-        // Then alternate (hook, compress) until a full iteration changes nothing.
-        rounds = MaxConvergenceIters;
+        // Then alternate (hook, compress) until a full iteration changes nothing, as algorithm P
+        // and then as algorithm R once SwitchToRootAfter rounds have passed.
         for (int it = 0; it < MaxConvergenceIters; ++it) {
             if (n == 0) *changed = 0;
             __syncthreads();
-            hook(cur, nxt, n, changed,
-                 alwaysRoots || (schedule == LeafSchedule::Hybrid && it >= SwitchToRootAfter));
-
-            if (schedule != LeafSchedule::Flatten) {
-                compress(cur, nxt, n, changed);
-                ++shortcuts;
-                if (schedule == LeafSchedule::Root2) { compress(cur, nxt, n, changed); ++shortcuts; }
-            } else {
-                for (int j = 0; j < MaxConvergenceIters; ++j) {   // compress until the forest is flat
-                    if (n == 0) *moved = 0;
-                    __syncthreads();
-                    compress(cur, nxt, n, moved);
-                    ++shortcuts;
-                    __syncthreads();
-                    if (*moved == 0) break;
-                    if (n == 0) *changed = 1;
-                    __syncthreads();
-                }
-            }
-
+            hook    (cur, nxt, n, changed, it >= SwitchToRootAfter);
+            compress(cur, nxt, n, changed);
             __syncthreads();
-            if (*changed == 0) { rounds = it + 1; return true; }
+            if (*changed == 0) return true;
             __syncthreads();  // all threads have read *changed; safe for thread 0 to reset it next iteration
         }
         return false;   // ran out of rounds; this leaf's labels are incomplete
@@ -390,21 +284,15 @@ struct LeafComponentCountFunctor
     static constexpr int MaxThreadsPerBlock         = LEAF_SIZE;
     static constexpr int MinBlocksPerMultiprocessor = 1;
 
-    // Passed by value through operatorKernelInstance (operatorKernel default-constructs instead).
-    LeafSchedule mSchedule = LeafSchedule::Hybrid;
-
-    /// @param d_convergenceHistogram optional, MaxConvergenceIters+2 counters. Bin r counts leaves
-    ///        that settled after r rounds; the last bin accumulates total compress steps.
     /// @param d_capReached incremented once per leaf whose union-find ran out of rounds. Only this
     ///        kernel reports it; the mask kernel repeats the same solve over the same leaves, so it
     ///        fails on exactly those leaves or on none.
     __device__ void operator()(const NanoGrid<BuildT>* d_grid, uint16_t* d_counts,
-                               uint32_t* d_convergenceHistogram, uint32_t* d_capReached)
+                               uint32_t* d_capReached)
     {
         __shared__ int bufA[LEAF_SIZE];
         __shared__ int bufB[LEAF_SIZE];
         __shared__ int changed;
-        __shared__ int moved;
         __shared__ int compCount;
 
         const int   leafID = blockIdx.x;
@@ -418,17 +306,8 @@ struct LeafComponentCountFunctor
         cur[tID] = leaf.isActive(uint32_t(tID)) ? tID : LeafUnionFind::INACTIVE;
         __syncthreads();
 
-        int rounds = 0, shortcuts = 0;
-        const bool ok = LeafUnionFind::solve(cur, nxt, tID, &changed, &moved, mSchedule,
-                                             rounds, shortcuts);
-        if (tID == 0) {
-            if (!ok) atomicAdd(d_capReached, 1u);
-            if (d_convergenceHistogram) {
-                atomicAdd(&d_convergenceHistogram[rounds], 1u);
-                atomicAdd(&d_convergenceHistogram[LeafUnionFind::MaxConvergenceIters + 1],
-                          uint32_t(shortcuts));
-            }
-        }
+        if (!LeafUnionFind::solve(cur, nxt, tID, &changed) && tID == 0)
+            atomicAdd(d_capReached, 1u);
 
         // Component count = number of surviving roots (cur[tID] == tID; inactive entries are -1).
         if (tID == 0) compCount = 0;
@@ -445,9 +324,6 @@ struct LeafComponentMaskFunctor
     static constexpr int MaxThreadsPerBlock         = LEAF_SIZE;
     static constexpr int MinBlocksPerMultiprocessor = 1;
 
-    // Passed by value through operatorKernelInstance; must match the counting pass's schedule.
-    LeafSchedule mSchedule = LeafSchedule::Hybrid;
-
     __device__ void operator()(const NanoGrid<BuildT>* d_grid,
                                 const uint64_t*         d_offsets,
                                 nanovdb::Mask<3>*       d_masks,
@@ -457,7 +333,6 @@ struct LeafComponentMaskFunctor
         __shared__ int   bufB[LEAF_SIZE];
         __shared__ typename cub::BlockReduce<uint32_t, LEAF_SIZE>::TempStorage reduceTmp;
         __shared__ int      changed;
-        __shared__ int      moved;
         __shared__ uint32_t sMinLabel;
         // Ballot words (u32/warp) aliased to the Mask<3> u64 words. NAMED union: an anonymous
         // __shared__ union compiled to per-thread local storage, breaking cross-warp sharing.
@@ -476,8 +351,7 @@ struct LeafComponentMaskFunctor
         cur[tID] = leaf.isActive(uint32_t(tID)) ? tID : LeafUnionFind::INACTIVE;
         __syncthreads();
 
-        int rounds = 0, shortcuts = 0;
-        LeafUnionFind::solve(cur, nxt, tID, &changed, &moved, mSchedule, rounds, shortcuts);
+        LeafUnionFind::solve(cur, nxt, tID, &changed);
 
         // Mask-fill: iterate over leaf-local components in ascending root-label order.
         //
@@ -775,19 +649,6 @@ struct VoxelLabelScatterFunctor
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 template <typename BuildT>
-std::vector<uint32_t> ConnectedComponents<BuildT>::convergenceHistogram() const
-{
-    constexpr int N = cc_detail::LeafUnionFind::MaxConvergenceIters + 2;
-    std::vector<uint32_t> h(N, 0u);
-    if (mConvergenceHistogram.deviceData())
-        cudaCheck(cudaMemcpy(h.data(), mConvergenceHistogram.deviceData(),
-                             N * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    return h;
-}// ConnectedComponents<BuildT>::convergenceHistogram
-
-//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-
-template <typename BuildT>
 void ConnectedComponents<BuildT>::processLeafConnectedComponents()
 {
     const uint32_t leafCount =
@@ -812,45 +673,12 @@ void ConnectedComponents<BuildT>::processLeafConnectedComponents()
     // components of each leaf's active voxels (in isolation) into mLeafComponentCounts.
     using Op = cc_detail::LeafComponentCountFunctor<BuildT>;
     if (mVerbose==1) mTimer.start("Per-leaf connected-component counting");
-
-    // Diagnostics: a rounds histogram, and events around this kernel and the mask kernel below --
-    // the only two the leaf schedule governs. The rest of the pipeline is schedule-independent.
-    uint32_t*    d_hist = nullptr;
-    cudaEvent_t  k0, k1, m0, m1;
-    if (mConvergenceDiagnostics) {
-        mConvergenceHistogram = nanovdb::cuda::DeviceBuffer::create(
-            (cc_detail::LeafUnionFind::MaxConvergenceIters + 2) * sizeof(uint32_t), nullptr, false);
-        d_hist = static_cast<uint32_t*>(mConvergenceHistogram.deviceData());
-        cudaCheck(cudaMemsetAsync(d_hist, 0,
-                                  (cc_detail::LeafUnionFind::MaxConvergenceIters + 2) * sizeof(uint32_t), mStream));
-        cudaCheck(cudaEventCreate(&k0)); cudaCheck(cudaEventCreate(&k1));
-        cudaCheck(cudaEventCreate(&m0)); cudaCheck(cudaEventCreate(&m1));
-        cudaCheck(cudaEventRecord(k0, mStream));
-    }
-
-    Op countOp; countOp.mSchedule = mLeafSchedule;
-    util::cuda::operatorKernelInstance<Op>
+    util::cuda::operatorKernel<Op>
         <<<leafCount, Op::MaxThreadsPerBlock, 0, mStream>>>(
-            countOp, mDeviceSrcGrid, deviceLeafComponentCounts(), d_hist,
+            mDeviceSrcGrid, deviceLeafComponentCounts(),
             static_cast<uint32_t*>(capReached.deviceData()));
     cudaCheckError();
-    if (mConvergenceDiagnostics) {
-        cudaCheck(cudaEventRecord(k1, mStream));
-        cudaCheck(cudaEventSynchronize(k1));
-        cudaCheck(cudaEventElapsedTime(&mUnionFindMs, k0, k1));
-    }
     if (mVerbose==1) mTimer.stop();
-
-    uint32_t overCap = 0;
-    cudaCheck(cudaMemcpyAsync(&overCap, capReached.deviceData(), sizeof(uint32_t),
-                              cudaMemcpyDeviceToHost, mStream));
-    cudaCheck(cudaStreamSynchronize(mStream));
-    mLeavesOverIterationCap = overCap;
-    if (overCap && mVerbose)
-        std::fprintf(stderr,
-                     "nanovdb::tools::cuda::ConnectedComponents: %u of %u leaves did not converge "
-                     "within %d rounds; their labels are incomplete\n",
-                     overCap, uint32_t(leafCount), cc_detail::LeafUnionFind::MaxConvergenceIters);
 
     // Prefix sum: mLeafComponentOffsets[0]=0, mLeafComponentOffsets[1..leafCount] = inclusive sum
     // of mLeafComponentCounts. mLeafComponentOffsets[leafCount] = K (total leaf-local components).
@@ -909,20 +737,11 @@ void ConnectedComponents<BuildT>::processLeafConnectedComponents()
     // Re-run SV per leaf and scatter each active voxel's bit into its component's Mask<3>.
     using MaskOp = cc_detail::LeafComponentMaskFunctor<BuildT>;
     if (mVerbose==1) mTimer.start("Per-leaf component mask fill");
-    if (mConvergenceDiagnostics) cudaCheck(cudaEventRecord(m0, mStream));
-    MaskOp maskOp; maskOp.mSchedule = mLeafSchedule;
-    util::cuda::operatorKernelInstance<MaskOp>
+    util::cuda::operatorKernel<MaskOp>
         <<<leafCount, MaskOp::MaxThreadsPerBlock, 0, mStream>>>(
-            maskOp, mDeviceSrcGrid, deviceLeafComponentOffsets(),
+            mDeviceSrcGrid, deviceLeafComponentOffsets(),
             deviceLeafComponentMasks(), deviceLeafComponentFaceMasks());
     cudaCheckError();
-    if (mConvergenceDiagnostics) {
-        cudaCheck(cudaEventRecord(m1, mStream));
-        cudaCheck(cudaEventSynchronize(m1));
-        cudaCheck(cudaEventElapsedTime(&mLeafMaskMs, m0, m1));
-        cudaCheck(cudaEventDestroy(k0)); cudaCheck(cudaEventDestroy(k1));
-        cudaCheck(cudaEventDestroy(m0)); cudaCheck(cudaEventDestroy(m1));
-    }
     if (mVerbose==1) mTimer.stop();
 }// ConnectedComponents<BuildT>::processLeafConnectedComponents
 

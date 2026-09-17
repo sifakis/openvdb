@@ -25,7 +25,6 @@
 #include <cstdint>
 #include <functional>
 #include <iostream>
-#include <stdexcept>
 #include <numeric>
 #include <unordered_map>
 #include <vector>
@@ -219,10 +218,6 @@ uint64_t connectedComponentsFromMesh(const std::vector<nanovdb::Vec3f>& points,
     nanovdb::tools::cuda::ConnectedComponents<BuildT> cc(d_cc, stream);
     auto [labels, numComponents] = cc.getVoxelLabelsAndCount();
     const uint32_t* d_labels = labels.data();
-
-    // The round-cap-exhaustion check this used to run (leavesOverIterationCap()) came from this
-    // branch's own convergence-diagnostics addition, dropped when syncing ConnectedComponents.cuh
-    // with origin/connected-components; that upstream version doesn't expose it.
 
     // Diagnostics + CPU-oracle self-check (on whichever grid was labeled).
     const GridHandleT& ccHandle = discardSurfaceVoxels ? derivedHandle : origHandle;

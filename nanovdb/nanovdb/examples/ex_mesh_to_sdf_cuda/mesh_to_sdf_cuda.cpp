@@ -6,7 +6,7 @@
 
 #include <nanovdb/NanoVDB.h>
 #include <nanovdb/GridHandle.h>
-#include <nanovdb/cuda/DeviceBuffer.h>
+#include <nanovdb/HostBuffer.h>
 #include <nanovdb/io/IO.h>
 
 #include <cstdint>
@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-using GridHandleT = nanovdb::GridHandle<nanovdb::cuda::DeviceBuffer>;
+using GridHandleT = nanovdb::GridHandle<nanovdb::HostBuffer>;
 
 GridHandleT meshToSdf(const std::vector<nanovdb::Vec3f>& points,
                       const std::vector<nanovdb::Vec3i>& triangles,
@@ -100,7 +100,6 @@ int main(int argc, char** argv)
         map.set(double(voxelSize), nanovdb::Vec3d(0.0), 1.0);
 
         auto handle = meshToSdf(points, triangles, map, bandWidth, isoValue);
-        handle.deviceDownload(nullptr, true);
         const auto* grid = handle.grid<nanovdb::ValueOnIndex>();
         if (!grid) throw std::runtime_error("MeshToSDF returned no grid");
 

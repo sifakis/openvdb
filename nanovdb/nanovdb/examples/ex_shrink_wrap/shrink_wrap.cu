@@ -26,6 +26,9 @@
 
 #include <nanovdb/NanoVDB.h>
 #include <nanovdb/GridHandle.h>
+#include <nanovdb/HostBuffer.h>
+#include <nanovdb/cuda/Buffer.h>
+#include <nanovdb/cuda/HandleStorage.h>   // cuda::copyTo
 #include <nanovdb/tools/cuda/MeshToSDF.cuh>
 #include <nanovdb/util/cuda/Util.h>
 #include <nanovdb/util/cuda/DeviceGridTraits.cuh>
@@ -38,6 +41,8 @@
 #include <openvdb/tools/Interpolation.h>  // BoxSampler
 #include <openvdb/tools/LevelSetFilter.h>
 #include <openvdb/tools/LevelSetMeasure.h> // levelSetVolume
+#include <openvdb/math/Proximity.h>       // closestPointOnTriangleToPoint
+#include <tbb/parallel_for.h>
 
 #include <algorithm>
 #include <chrono>
@@ -191,11 +196,43 @@ static openvdb::FloatGrid::Ptr toFloatGrid(const MeshToSDFT& sdf, const std::str
 }
 
 // ---------------------------------------------------------------------------------------------------
+/// @brief Wall-clock seconds since construction.
+///
+/// @details Wall clock rather than a CUDA event, because the question is what a caller waits for:
+///          the device work, the host work, and the hand-off between them all count. Device work is
+///          synchronised before each reading is taken.
+struct Stopwatch
+{
+    std::chrono::steady_clock::time_point t0{std::chrono::steady_clock::now()};
+    void   reset() { t0 = std::chrono::steady_clock::now(); }
+    double s() const {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+};
+
+/// Where the time inside nanovdbOffset() goes, accumulated over every call.
+///
+/// Only `build` is the offset algorithm. The other three exist because the mesh arrives in OpenVDB
+/// types on the host and the answer has to go back the same way, and they would all disappear if
+/// the caller already held its geometry on the device. Reported apart from the algorithm so that
+/// plumbing is not read as compute.
+struct OffsetProfile
+{
+    double upload  = 0.0;  ///< converting the soup to NanoVDB types and copying it to the device
+    double build   = 0.0;  ///< MeshToSDF::getHandle()
+    double verify  = 0.0;  ///< reading the baked grid back to check it travels on its own
+    double handOff = 0.0;  ///< toFloatGrid: NanoVDB result -> OpenVDB grid
+};
+static OffsetProfile sProfile;
+
+// ---------------------------------------------------------------------------------------------------
 /// @brief Run the NanoVDB pipeline for the same surface offset() is asked for: { udf == isoValue }.
 static openvdb::FloatGrid::Ptr nanovdbOffset(const std::vector<openvdb::Vec3s>& vtx,
                                              const std::vector<openvdb::Vec3I>& tri,
                                              float dx, float halfWidth)
 {
+    Stopwatch stage;
+
     // openvdb::Vec3s and nanovdb::Vec3f are both three floats, but reinterpreting one array as the
     // other is a promise about layout that neither header makes. Copy instead; it is once per run.
     std::vector<nanovdb::Vec3f> pts(vtx.size());
@@ -209,11 +246,14 @@ static openvdb::FloatGrid::Ptr nanovdbOffset(const std::vector<openvdb::Vec3s>& 
     cudaCheck(cudaMalloc(&d_tris, tris.size() * sizeof(nanovdb::Vec3i)));
     cudaCheck(cudaMemcpy(d_pts,  pts.data(),  pts.size()  * sizeof(nanovdb::Vec3f), cudaMemcpyHostToDevice));
     cudaCheck(cudaMemcpy(d_tris, tris.data(), tris.size() * sizeof(nanovdb::Vec3i), cudaMemcpyHostToDevice));
+    sProfile.upload += stage.s();
 
     // openvdb::math::Transform::createLinearTransform(dx) puts voxel CENTRES on the lattice, which is
     // what nanovdb::Map(dx) does too, so the two grids index the same points.
     MeshToSDFT sdf(d_pts, uint32_t(pts.size()), d_tris, uint32_t(tris.size()), nanovdb::Map(dx));
-    sdf.setVerbose(0);
+    // SW_PROFILE also turns on the library's own stage timers, which is the only way to see inside
+    // rasterization -- the phase that normally dominates -- without a external profiler.
+    sdf.setVerbose(std::getenv("SW_PROFILE") ? 1 : 0);
     sdf.setNarrowBandWidth(halfWidth);
     sdf.setIsoValue(dx);                 // the surface shrink wrap asks offset() for
 
@@ -233,13 +273,16 @@ static openvdb::FloatGrid::Ptr nanovdbOffset(const std::vector<openvdb::Vec3s>& 
         else if (rule == "evenodd") sdf.setNestingRule(MeshToSDFT::NestingRule::EvenOdd);
         else std::cerr << "SW_NESTING: unknown rule '" << rule << "' (want evenodd|solid)\n";
     }
-    auto baked = sdf.build();
+    stage.reset();
+    auto baked = sdf.getHandle();
+    sProfile.build += stage.s();
 
-    // build() hands back one grid with every sidecar folded in as blind data. Whether the field
+    stage.reset();
+    // getHandle() hands back one grid with every sidecar folded in as blind data. Whether the field
     // really travels on its own is the whole point of that, so read it back off the handle here
     // rather than assume it.
-    baked.deviceDownload();
-    if (const auto* g = baked.template grid<nanovdb::ValueOnIndex>()) {
+    const auto bakedHost = nanovdb::cuda::copyTo<nanovdb::HostBuffer>(baked);
+    if (const auto* g = bakedHost.template grid<nanovdb::ValueOnIndex>()) {
         std::cout << "baked grid: " << g->gridSize() << " bytes, "
                   << g->blindDataCount() << " blind channels\n";
         for (uint32_t i = 0; i < g->blindDataCount(); ++i) {
@@ -261,8 +304,24 @@ static openvdb::FloatGrid::Ptr nanovdbOffset(const std::vector<openvdb::Vec3s>& 
     } else {
         std::cout << "baked grid: host copy unavailable\n";
     }
+    sProfile.verify += stage.s();
 
+    stage.reset();
     auto grid = toFloatGrid(sdf, "nanovdb");
+    sProfile.handOff += stage.s();
+
+    // getHandle()'s own phase breakdown, so a slow offset can be pinned on a phase rather than guessed
+    // at. Phase 0 is rasterization, which normally dominates.
+    if (std::getenv("SW_PROFILE")) {
+        static const char* kPhase[5] = {"rasterize", "partition", "sign", "compose", "fill"};
+        const float* ms = sdf.phaseMs();
+        std::cout << "  [profile dx=" << dx << "] build phases";
+        for (int i = 0; i < 5; ++i)
+            std::cout << "  " << kPhase[i] << " " << std::fixed << std::setprecision(2)
+                      << ms[i] / 1000.0 << " s";
+        std::cout << "\n" << std::defaultfloat << std::setprecision(6);
+    }
+
     cudaCheck(cudaFree(d_pts));
     cudaCheck(cudaFree(d_tris));
     return grid;
@@ -328,19 +387,18 @@ static void compare(const openvdb::FloatGrid& a, const openvdb::FloatGrid& b, fl
 }
 
 // ---------------------------------------------------------------------------------------------------
-/// @brief Wall-clock seconds since construction.
+/// @brief Break an offset time down into algorithm and plumbing, if any NanoVDB offset ran.
 ///
-/// @details Wall clock rather than a CUDA event, because the question is what a caller waits for:
-///          the device work, the host work, and the hand-off between them all count. Device work is
-///          synchronised before each reading is taken.
-struct Stopwatch
+/// @details Prints nothing for the OpenVDB stage, which has no such split -- it never leaves the
+///          host, so there is nothing to upload, verify or hand back.
+static void reportProfile(const OffsetProfile& before, const OffsetProfile& after)
 {
-    std::chrono::steady_clock::time_point t0{std::chrono::steady_clock::now()};
-    void   reset() { t0 = std::chrono::steady_clock::now(); }
-    double s() const {
-        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    }
-};
+    const double up = after.upload - before.upload, bu = after.build - before.build;
+    const double ve = after.verify - before.verify, ho = after.handOff - before.handOff;
+    if (up + bu + ve + ho <= 0.0) return;
+    std::cout << " (build " << bu << ", upload " << up << ", verify " << ve
+              << ", hand-off " << ho << ")";
+}
 
 // ---------------------------------------------------------------------------------------------------
 /// @brief The shrink wrap loop, with the offset stage left as a parameter.
@@ -364,15 +422,20 @@ static openvdb::FloatGrid::Ptr shrinkWrapLoop(
 
     std::vector<GridT::Ptr> grids;
     double offsetSeconds = 0.0, wrapSeconds = 0.0;
+    const OffsetProfile profileAtEntry = sProfile;
     Stopwatch clock;
     for (float dx = minVoxelSize; dx <= maxVoxelSize; dx *= 2.0f) {
+        const OffsetProfile before = sProfile;
         clock.reset();
         grids.push_back(makeOffset(dx));
         const double dt = clock.s();
         offsetSeconds += dt;
-        if (verbose) std::cout << "  offset dx=" << dx << ": " << grids.back()->activeVoxelCount()
-                               << " active voxels, " << std::fixed << std::setprecision(2) << dt
-                               << " s\n" << std::defaultfloat;
+        if (verbose) {
+            std::cout << "  offset dx=" << dx << ": " << grids.back()->activeVoxelCount()
+                      << " active voxels, " << std::fixed << std::setprecision(2) << dt << " s";
+            reportProfile(before, sProfile);
+            std::cout << "\n" << std::defaultfloat << std::setprecision(6);
+        }
     }
     if (grids.empty()) throw std::runtime_error("no resolutions in the ladder");
 
@@ -412,7 +475,7 @@ static openvdb::FloatGrid::Ptr shrinkWrapLoop(
         if (verbose) std::cout << "  wrapped at dx=" << dx << ": " << grid->activeVoxelCount()
                                << " active voxels, volume " << vol[1]
                                << ", " << std::fixed << std::setprecision(2) << clock.s() - wrapSeconds
-                               << " s\n" << std::defaultfloat;
+                               << " s\n" << std::defaultfloat << std::setprecision(6);
         wrapSeconds = clock.s();
         // Contour the wrap as it stands so the shape can be inspected rung by rung. The loop erodes
         // and then unions the rung's target back in, so it does not simply simplify as it goes; where
@@ -432,11 +495,257 @@ static openvdb::FloatGrid::Ptr shrinkWrapLoop(
         }
         *iter = grid;
     }
-    if (verbose) std::cout << "  [time] offset stage " << std::fixed << std::setprecision(2)
-                           << offsetSeconds << " s, wrap loop " << wrapSeconds
-                           << " s, total " << offsetSeconds + wrapSeconds << " s\n"
-                           << std::defaultfloat;
+    if (verbose) {
+        std::cout << "  [time] offset stage " << std::fixed << std::setprecision(2) << offsetSeconds
+                  << " s";
+        reportProfile(profileAtEntry, sProfile);
+        std::cout << ", wrap loop " << wrapSeconds << " s, total " << offsetSeconds + wrapSeconds
+                  << " s\n" << std::defaultfloat << std::setprecision(6);
+    }
     return grid;
+}
+
+// ---------------------------------------------------------------------------------------------------
+/// @brief Replace a polygon soup with the zero isosurface of a level set.
+///
+/// @details This is the coarsening that OpenVDB's case 0 gets as a side effect: volumeToMesh writes
+///          its result back over the soup it was given, so the next, coarser resolution reads a mesh
+///          whose size is set by the grid it came from rather than by the original input. Doing it
+///          explicitly here gives the NanoVDB stage the same input sequence.
+///
+///          Contouring at zero, not at dx: the field handed in is already signed, so its own zero
+///          crossing IS the offset surface. That is also why this cannot fail the way contouring an
+///          unsigned field at dx does -- there is one wall to find, not two.
+static void contourIntoSoup(const openvdb::FloatGrid& grid,
+                            std::vector<openvdb::Vec3s>& vtx,
+                            std::vector<openvdb::Vec3I>& tri)
+{
+    std::vector<openvdb::Vec3s> pts;
+    std::vector<openvdb::Vec3I> tris;
+    std::vector<openvdb::Vec4I> quads;
+    openvdb::tools::volumeToMesh(grid, pts, tris, quads, 0.0, 0.0);
+
+    tris.reserve(tris.size() + 2 * quads.size());
+    for (const auto& q : quads) {           // MeshToSDF takes triangles only
+        tris.emplace_back(q[0], q[1], q[2]);
+        tris.emplace_back(q[0], q[2], q[3]);
+    }
+    if (tris.empty()) {                     // nothing to hand on; keep what we had
+        std::cerr << "  contour produced no polygons; soup left unchanged\n";
+        return;
+    }
+    vtx.swap(pts);
+    tri.swap(tris);
+}
+
+// ---------------------------------------------------------------------------------------------------
+/// @brief Time the two unsigned-distance rasterizers against each other on the same triangles.
+///
+/// @details The offset stages do more than rasterize -- OpenVDB contours and re-signs afterwards,
+///          MeshToSDF runs connected components and signs -- so comparing them end to end does not
+///          say which rasterizer is faster. This compares only the step both pipelines start from:
+///          triangles in, a narrow band of unsigned distance out.
+///
+///          Matched as closely as the two APIs allow. Both get the same band width in voxels and
+///          the same voxel size, and neither is asked for a sign. The remaining difference is that
+///          MeshToGrid also emits an index-space topology it can hand downstream, where OpenVDB
+///          returns a finished FloatGrid; getHandleAndUDF is used rather than the variant that also
+///          returns nearest-triangle ids, so that extra sidecar is not on the clock.
+static void benchmarkUDF(const std::vector<openvdb::Vec3s>& vtx,
+                         const std::vector<openvdb::Vec3I>& tri,
+                         float dx, float halfWidth)
+{
+    std::cout << "\n---- unsigned distance rasterizers, " << tri.size() << " triangles, dx " << dx
+              << ", band " << halfWidth << " voxels ----\n";
+
+    const std::vector<openvdb::Vec4I> noQuads;
+    auto xform = openvdb::math::Transform::createLinearTransform(dx);
+
+    // Each side is run twice. The first NanoVDB run pays for loading and, on a PTX-only build,
+    // compiling the kernel module, which is a one-off per process and not what a caller repeating
+    // the operation would see. Reporting both keeps that visible instead of buried in an average.
+    double tA = 0.0;
+    openvdb::FloatGrid::Ptr udfA;
+    for (int run = 0; run < 2; ++run) {
+        Stopwatch t;
+        udfA = openvdb::tools::meshToUnsignedDistanceField<openvdb::FloatGrid>(
+                   *xform, vtx, tri, noQuads, halfWidth);
+        tA = t.s();
+        std::cout << "  openvdb  meshToUnsignedDistanceField  run " << run + 1 << "  "
+                  << std::fixed << std::setprecision(2) << tA << " s, "
+                  << udfA->activeVoxelCount() << " active voxels\n" << std::defaultfloat << std::setprecision(6);
+    }
+
+    std::vector<nanovdb::Vec3f> pts(vtx.size());
+    std::vector<nanovdb::Vec3i> tris(tri.size());
+    for (std::size_t i = 0; i < vtx.size(); ++i) pts[i]  = nanovdb::Vec3f(vtx[i][0], vtx[i][1], vtx[i][2]);
+    for (std::size_t i = 0; i < tri.size(); ++i) tris[i] = nanovdb::Vec3i(int(tri[i][0]), int(tri[i][1]), int(tri[i][2]));
+
+    nanovdb::Vec3f* d_pts  = nullptr;
+    nanovdb::Vec3i* d_tris = nullptr;
+    cudaCheck(cudaMalloc(&d_pts,  pts.size()  * sizeof(nanovdb::Vec3f)));
+    cudaCheck(cudaMalloc(&d_tris, tris.size() * sizeof(nanovdb::Vec3i)));
+    cudaCheck(cudaMemcpy(d_pts,  pts.data(),  pts.size()  * sizeof(nanovdb::Vec3f), cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(d_tris, tris.data(), tris.size() * sizeof(nanovdb::Vec3i), cudaMemcpyHostToDevice));
+    cudaCheck(cudaDeviceSynchronize());   // the upload is not what is being timed
+
+    // Both sidecar variants, because they take different code paths and MeshToSDF uses the second.
+    using ByteBufferT = nanovdb::cuda::Buffer<std::byte>;
+    using TraitsT     = nanovdb::util::cuda::DeviceGridTraits<nanovdb::ValueOnIndex>;
+    double tB = 0.0;
+    for (int run = 0; run < 2; ++run) {
+        for (int withIndex = 0; withIndex < 2; ++withIndex) {
+            Stopwatch t;
+            nanovdb::tools::cuda::MeshToGrid<nanovdb::ValueOnIndex> converter(
+                d_pts, uint32_t(pts.size()), d_tris, uint32_t(tris.size()), nanovdb::Map(dx));
+            converter.setVerbose(std::getenv("SW_PROFILE") ? 1 : 0);
+            converter.setNarrowBandWidth(halfWidth);
+            uint64_t active = 0;
+            if (withIndex) {
+                auto [handle, udf, idx] = converter.getHandleAndUDFAndIndex<ByteBufferT, ByteBufferT>();
+                cudaCheck(cudaDeviceSynchronize());
+                tB = t.s();
+                if (const auto* g = handle.deviceGrid<nanovdb::ValueOnIndex>()) active = TraitsT::getActiveVoxelCount(g);
+            } else {
+                auto [handle, udf] = converter.getHandleAndUDF<ByteBufferT, ByteBufferT>();
+                cudaCheck(cudaDeviceSynchronize());
+                tB = t.s();
+                if (const auto* g = handle.deviceGrid<nanovdb::ValueOnIndex>()) active = TraitsT::getActiveVoxelCount(g);
+            }
+            std::cout << "  nanovdb  MeshToGrid " << (withIndex ? "+index          " : "                ")
+                      << "  run " << run + 1 << "  " << std::fixed << std::setprecision(2) << tB
+                      << " s, " << active << " active voxels";
+            if (tA > 0.0) std::cout << "   (" << tB / tA << "x openvdb)";
+            std::cout << "\n" << std::defaultfloat << std::setprecision(6);
+        }
+    }
+
+    // ---- are the two fields the same, or only the same shape? ----
+    //
+    // Our rasterizer tests every voxel of a leaf against every triangle whose dilated bounding box
+    // reaches that leaf, so within the band it finds the true nearest triangle by exhaustion.
+    // OpenVDB instead carries a nearest-triangle index outward from voxels it has already solved
+    // and re-evaluates against that inherited shortlist. Inheriting a shortlist can only MISS the
+    // true nearest triangle, never invent a closer one, so any disagreement is one-sided: OpenVDB
+    // over-estimates exactly where the propagation lost the right candidate. Measuring that is what
+    // says whether the cheaper traversal is exact or approximate.
+    {
+        MeshToSDFT sdf(d_pts, uint32_t(pts.size()), d_tris, uint32_t(tris.size()), nanovdb::Map(dx));
+        sdf.setVerbose(0);
+        sdf.setNarrowBandWidth(halfWidth);
+        sdf.setIsoValue(0.f);          // no isovalue: |value| is then the raw unsigned distance
+        sdf.getHandle();
+        auto exact = toFloatGrid(sdf, "exact");
+
+        auto accE = exact->getConstAccessor();
+        std::size_t both = 0, over = 0, under = 0;
+        double sumOver = 0.0;
+        float  maxOver = 0.f, maxUnder = 0.f;
+        openvdb::Coord worst;
+        const float eps = 1e-4f * dx;   // float32 noise on a distance of a few voxels
+
+        // Binned by true distance, because where the error sits decides whether it matters. The
+        // shrink wrap offset contours this field at one voxel out, so an error at 2-3 voxels is
+        // harmless to it while an error at 1 voxel moves the surface the wrap is built on.
+        constexpr int kBins = 6;                  // half a voxel each, out to 3
+        std::size_t binN[kBins] = {}, binOver[kBins] = {};
+        double      binSum[kBins] = {};
+        float       binMax[kBins] = {};
+
+        for (auto it = udfA->cbeginValueOn(); it; ++it) {
+            const openvdb::Coord c = it.getCoord();
+            if (!accE.isValueOn(c)) continue;
+            ++both;
+            const float truth = std::fabs(accE.getValue(c));
+            const float d = *it - truth;                          // openvdb minus exact
+            if (d > eps)  { ++over;  sumOver += d; if (d > maxOver)  { maxOver = d; worst = c; } }
+            if (d < -eps) { ++under; if (-d > maxUnder) maxUnder = -d; }
+
+            const int b = std::min(kBins - 1, int(truth / dx * 2.f));
+            ++binN[b];
+            if (d > eps) { ++binOver[b]; binSum[b] += d; if (d > binMax[b]) binMax[b] = d; }
+        }
+        std::cout << "  distance agreement over " << both << " shared band voxels\n"
+                  << "    openvdb over-estimates  " << over
+                  << (both ? " (" + std::to_string(100.0 * double(over) / double(both)) + "%)" : "")
+                  << ", mean " << std::fixed << std::setprecision(4)
+                  << (over ? sumOver / double(over) / dx : 0.0) << " vox, max "
+                  << maxOver / dx << " vox at " << worst << "\n"
+                  << "    openvdb under-estimates " << under << ", max " << maxUnder / dx << " vox\n"
+                  << std::defaultfloat << std::setprecision(6);
+
+        std::cout << "    where the over-estimate sits (true distance -> share of voxels wrong):\n";
+        for (int b = 0; b < kBins; ++b) {
+            if (!binN[b]) continue;
+            std::cout << "      " << std::fixed << std::setprecision(1) << 0.5 * b << "-"
+                      << 0.5 * (b + 1) << " vox: " << std::setprecision(2)
+                      << 100.0 * double(binOver[b]) / double(binN[b]) << "% of " << binN[b]
+                      << ", mean " << std::setprecision(4)
+                      << (binOver[b] ? binSum[b] / double(binOver[b]) / dx : 0.0)
+                      << " vox, max " << binMax[b] / dx << " vox\n";
+        }
+        std::cout << std::defaultfloat << std::setprecision(6);
+
+        // ---- SW_BRUTE=N: an independent reference, computed the dumbest way there is ----
+        //
+        // Every sampled band voxel against EVERY triangle, on the host, with OpenVDB's own
+        // point-triangle routine rather than the one the device kernels use. Nothing is culled, so
+        // the answer cannot depend on a bounding box being generous enough or a stencil being wide
+        // enough -- it is the definition of the distance, evaluated. That makes it the only thing
+        // here entitled to be called ground truth, and it is also what a rasterizer would cost if
+        // it refused to prune: N_voxels x N_triangles, which is why nobody ships this.
+        if (const char* bn = std::getenv("SW_BRUTE")) {
+            std::vector<openvdb::Coord> coords;
+            for (auto it = udfA->cbeginValueOn(); it; ++it)
+                if (accE.isValueOn(it.getCoord())) coords.push_back(it.getCoord());
+
+            const std::size_t want   = std::max<std::size_t>(1, std::size_t(std::atol(bn)));
+            const std::size_t stride = std::max<std::size_t>(1, coords.size() / want);
+            std::vector<openvdb::Coord> sample;
+            for (std::size_t i = 0; i < coords.size(); i += stride) sample.push_back(coords[i]);
+
+            std::vector<double> exactDist(sample.size());
+            Stopwatch bt;
+            tbb::parallel_for(tbb::blocked_range<std::size_t>(0, sample.size()),
+                [&](const tbb::blocked_range<std::size_t>& r) {
+                    openvdb::Vec3d uvw;
+                    for (std::size_t i = r.begin(); i != r.end(); ++i) {
+                        const openvdb::Coord& c = sample[i];
+                        const openvdb::Vec3d p(c[0] * dx, c[1] * dx, c[2] * dx);
+                        double best = std::numeric_limits<double>::max();
+                        for (const auto& t : tri) {
+                            const openvdb::Vec3d a(vtx[t[0]]), b(vtx[t[1]]), q(vtx[t[2]]);
+                            const double d2 = (p - openvdb::math::closestPointOnTriangleToPoint(
+                                                       a, b, q, p, uvw)).lengthSqr();
+                            if (d2 < best) best = d2;
+                        }
+                        exactDist[i] = std::sqrt(best);
+                    }
+                });
+            const double tBrute = bt.s();
+
+            double oursMax = 0.0, ovdbMax = 0.0, oursUnder = 0.0;
+            for (std::size_t i = 0; i < sample.size(); ++i) {
+                const double ref  = exactDist[i];
+                const double mine = std::fabs(accE.getValue(sample[i]));
+                const double theirs = udfA->getConstAccessor().getValue(sample[i]);
+                oursMax   = std::max(oursMax,   mine   - ref);   // >0 means we over-estimate
+                oursUnder = std::max(oursUnder, ref    - mine);  // >0 means we under-estimate
+                ovdbMax   = std::max(ovdbMax,   theirs - ref);
+            }
+            std::cout << "  brute force over " << sample.size() << " of " << coords.size()
+                      << " band voxels x " << tri.size() << " triangles: "
+                      << std::fixed << std::setprecision(2) << tBrute << " s on the host\n"
+                      << std::setprecision(6)
+                      << "    ours    vs truth: max over " << oursMax / dx
+                      << " vox, max under " << oursUnder / dx << " vox\n"
+                      << "    openvdb vs truth: max over " << ovdbMax / dx << " vox\n"
+                      << std::defaultfloat << std::setprecision(6);
+        }
+    }
+
+    cudaCheck(cudaFree(d_pts));
+    cudaCheck(cudaFree(d_tris));
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -458,6 +767,13 @@ int main(int argc, char* argv[])
         readOBJ(path, vtx, tri);
         std::cout << path << ": " << vtx.size() << " vertices, " << tri.size()
                   << " triangles, voxelSize " << voxelSize << ", halfWidth " << halfWidth << "\n";
+
+        // ---- SW_BENCH_UDF=1: just the two rasterizers, nothing downstream of them ----
+        if (std::getenv("SW_BENCH_UDF")) {
+            benchmarkUDF(vtx, tri, voxelSize, halfWidth);
+            openvdb::uninitialize();
+            return 0;
+        }
 
         // ---- OpenVDB: the stage shrink wrap actually calls, mode 0 (the published algorithm) ----
         // offset() reads only the soup and the half width, both set by the constructor, so it can be
@@ -508,7 +824,25 @@ int main(int argc, char* argv[])
                                         rungA ? (std::string(rungA) + "_openvdb").c_str() : nullptr);
             std::cout << "nanovdb offset stage:\n";
             const std::string rungBname = rungA ? std::string(rungA) + "_nanovdb" : std::string();
-            auto wrapB = shrinkWrapLoop([&](float dx) { return nanovdbOffset(vtx, tri, dx, halfWidth); },
+
+            // SW_ACCUMULATE makes the NanoVDB ladder read its own previous rung, the way case 0's
+            // ladder already reads its own. Without it every rung re-rasterizes the original soup,
+            // which is why our coarse rungs cost the same as the finest one. Note what the contour
+            // is and is not doing here: it no longer decides any sign -- the field it is cutting is
+            // already signed -- it only decimates the input for the next resolution.
+            const bool accumulate = std::getenv("SW_ACCUMULATE") != nullptr;
+            std::vector<openvdb::Vec3s> soupV = vtx;
+            std::vector<openvdb::Vec3I> soupT = tri;
+            auto wrapB = shrinkWrapLoop([&](float dx) {
+                                            auto g = nanovdbOffset(soupV, soupT, dx, halfWidth);
+                                            if (accumulate) {
+                                                contourIntoSoup(*g, soupV, soupT);
+                                                std::cout << "    soup for the next rung: "
+                                                          << soupV.size() << " verts, "
+                                                          << soupT.size() << " tris\n";
+                                            }
+                                            return g;
+                                        },
                                         voxelSize, maxVoxel, halfWidth, D, true,
                                         rungA ? rungBname.c_str() : nullptr);
             wrapA->setName("wrap_openvdb");

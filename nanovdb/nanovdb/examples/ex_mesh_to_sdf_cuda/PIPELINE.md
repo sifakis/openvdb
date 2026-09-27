@@ -18,10 +18,10 @@ using namespace nanovdb::tools::cuda;
 
 MeshToSDF<nanovdb::ValueOnIndex> sdf(d_points, pointCount, d_triangles, triangleCount, map);
 sdf.setNarrowBandWidth(3.f);
-sdf.build();
+sdf.getHandle();
 ```
 
-After `build()`, the result is a **narrow-band signed distance field**: exact distances near the
+After `getHandle()`, the result is a **narrow-band signed distance field**: exact distances near the
 surface, and a correct *sign* everywhere else. It is spread across a grid and a handful of parallel
 arrays ("sidecars"):
 
@@ -44,7 +44,7 @@ Two conventions worth internalising:
 
 ### Querying it
 
-`sdf_detail::signedSignAt()` folds all of the above into the sign at any coordinate — one tree
+`sdf_detail::signAt()` folds all of the above into the sign at any coordinate — one tree
 descent, stopping at the first level that has no child:
 
 ```
@@ -260,7 +260,7 @@ calling this production-ready.
 | `nanovdb/tools/cuda/MeshToSDF.cuh` | the whole pipeline |
 | ‣ `MeshToSDF` | the orchestrator — stages 1, 2, 4, 5 and the per-surface loop |
 | ‣ `sdf_detail::SurfaceSigner` | stage 3, the stages that sign one closed surface |
-| ‣ `sdf_detail::signedSignAt` | the query |
+| ‣ `sdf_detail::signAt` | the query |
 | `nanovdb/tools/cuda/MeshToGrid.cuh` | stage 1 |
 | `nanovdb/tools/cuda/ConnectedComponents.cuh` | stages 2 and 3c |
 | `nanovdb/tools/cuda/PruneGrid.cuh` | the carve and the barrier prune |

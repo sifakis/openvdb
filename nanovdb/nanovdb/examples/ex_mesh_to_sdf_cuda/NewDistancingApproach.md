@@ -290,6 +290,57 @@ intermediate voxel at all — a single pair can bridge a gap in one hop, using o
 endpoints' own UDF values. (Its reach is still bounded by what's actually materialized — it does
 not, by itself, solve the separated-far-apart-objects seeding problem; see Step 0's note.)
 
+### Property — every certified ball touches `∂O`, at exactly its own radius
+
+**Claim:** if every `dᵢ` is the **true** distance from `Vᵢ` to `Σ`, then for every certified point
+```
+dist(Vᵢ, ∂O)  =  dᵢ
+```
+— for *every* `i`, not just for the balls that visibly form part of `∂O`. No certified ball is
+redundant, however deeply it looks buried among its neighbours.
+
+**Proof.** (`≥`) The open ball `B(Vᵢ,dᵢ)` lies inside `O`, so no point of `∂O` is closer to `Vᵢ`
+than `dᵢ`. (`≤`) Because `dᵢ` is the true distance, there is a foot point `s ∈ Σ` with
+`|Vᵢ - s| = dᵢ`. Every ball is surface-free, so `s` lies in no open ball, and `s ∉ O`. But `s` lies
+on the closure of `Vᵢ`'s own ball, so `s ∈ closure(O)`. Hence `s ∈ ∂O`, at distance `dᵢ`. ∎
+
+**Closure is not needed.** The proof uses only that each certified `Vᵢ` is truly exterior and that
+its `dᵢ` is exact; it never uses that `O` is closed under the Step 1 rule. So the property holds for
+*any* set of certified points — the full closure, or an enrichment stopped early. The consequence
+is that **certified-outside values never need updating**: relative to `∂O`, the exterior half of
+the field is the input UDF itself, and only points outside `O` need new values (Step 3). On the
+lattice, with a complete stencil (one that reaches every overlapping pair), every lattice point
+inside `O` is itself certified, so "outside" and "keeps its input value" coincide exactly.
+
+**The claim hinges on the `dᵢ` being true distances to an actual `Σ`.** Only the `≥` half is
+structural; it holds for *any* positive radii. The `≤` half needs the foot point `s`: a point at
+distance exactly `dᵢ` that no ball covers. Assign the radii arbitrarily and the same `O` can arise
+with some `dᵢ` strictly smaller than `dist(Vᵢ, ∂O)`:
+
+- *Swallowed ball.* `V₁` at the origin with `d₁ = 0.5`, `V₂` at distance 1 with `d₂ = 2`. Then
+  `B(V₁,0.5) ⊂ B(V₂,2)`, so `O = B(V₂,2)` and `dist(V₁,∂O) = 1 > d₁`. No true `Σ` produces these
+  values: they violate the 1-Lipschitz bound `d₁ ≥ d₂ - |V₁-V₂| = 1`.
+- *Covered without being swallowed (Lipschitz is not enough).* In 2D, `V₁` at the origin with
+  `d₁ = 1`, surrounded by eight points on the circle of radius 1.5, each with radius 1. Every pair
+  satisfies the 1-Lipschitz bound, and no ball contains another, yet the eight ring balls cover the
+  whole unit circle around `V₁` (the worst gap point is at distance `√(3.25 - 3 cos 22.5°) ≈ 0.692 < 1`
+  from its nearest ring centre). So `O` is a scalloped disk and `dist(V₁, ∂O) ≈ 2.205 > d₁ = 1`.
+  No true `Σ` produces these values either: `V₁`'s foot point would have to sit on its unit circle,
+  which the surface-free ring balls cover entirely.
+
+So the property is a statement about *distance data from a surface*, not about a union of balls in
+the abstract: pairwise consistency (1-Lipschitz) does not imply it; the existence of an uncovered
+foot point for every `Vᵢ` does.
+
+**With under-estimated radii** (for example, distances clamped or rounded down), the foot point still
+exists at the true distance, and the segment from `Vᵢ` to it has to leave `O`. The equality relaxes
+to a sandwich:
+```
+dᵢ  ≤  dist(Vᵢ, ∂O)  ≤  dist(Vᵢ, Σ)
+```
+which collapses back to equality when the radii are exact. Over-estimated radii are a different
+matter: a ball can then contain part of `Σ`, which breaks soundness, not just this property.
+
 ### Step 3 — exact SDF values on the "inside," for free
 
 Everything not in `O` is labeled "inside" (the safe default — inclusion never required proving
@@ -332,18 +383,38 @@ Why commit to something provably non-smooth when better local reconstruction is 
 
 **The rebuttal — `∂O` is not merely sound, it is the *tightest possible* sound reconstruction given
 only the point-distance data.** What we actually know is a finite set of exact constraints,
-`dist(Vᵢ,Σ)=dᵢ`, nothing else about `Σ`'s shape. The hypothesis `Σ = ∂O` is **fully consistent with
-every one of those constraints** (each `Vᵢ` sits at distance exactly `dᵢ` from its own ball's
-boundary, and that closest point can't have been swallowed by an overlapping ball without
-contradicting some other `dⱼ` — same argument as the min-formula proof above). Since that hypothesis
-can't be excluded by the data, nothing tighter than `O` can be soundly claimed: any region reaching
-even one point past `O` would be wrong under this specific, evidence-consistent `Σ`.
+`dist(V,Σ) = d_V`, one per sample `V` — certified or not — and nothing else about `Σ`'s shape.
+Tightness means: for every `p ∉ O` there is a surface consistent with **all** of those constraints
+under which `p` is not exterior. Then no method, however clever, can soundly certify `p`.
 
-The converse direction completes the argument: for **any** `p ∉ O`, a legal `Σ` consistent with
-every `dᵢ` can be constructed that passes exactly through `p` — place a surface point at `p`, and
-separately saturate each `dist(Vᵢ,Σ)=dᵢ` constraint far away in some other direction (nothing in the
-data constrains `Σ` beyond the given point-distances). So no method, however clever, can soundly
-claim more than `O` from this information alone.
+**`∂O` alone is not that witness.** It reproduces the *certified* constraints exactly (see
+"Property — every certified ball touches `∂O`" above, which also shows why this needs the `dᵢ` to
+be true distances and not merely consistent ones). It does not, in general, reproduce the
+*uncertified* ones. An uncertified sample `q` has a ball that does not overlap `O` (otherwise the
+closure would have certified it), so `dist(q, ∂O) ≥ d_q` — and usually strictly, because `∂O`
+bulges outward between the foot points of the certified balls. So the hypothesis `Σ = ∂O` is
+consistent with the certified data only.
+
+**The witness that works** adds the true foot point `s_q` of every uncertified sample:
+```
+Σ″  =  ∂O  ∪  { s_q : q uncertified }
+```
+- *Certified `Vᵢ`:* `dist(Vᵢ, ∂O) = dᵢ`, and every `s_q` is a point of the true `Σ`, so
+  `|Vᵢ - s_q| ≥ dᵢ`. Hence `dist(Vᵢ, Σ″) = dᵢ`.
+- *Uncertified `q`:* `dist(q, ∂O) ≥ d_q`, its own foot point gives `|q - s_q| = d_q`, and every other
+  `s_q′` lies on the true `Σ`, so is at least `d_q` away. Hence `dist(q, Σ″) = d_q`.
+- *Any `p ∉ O`:* `∂O ⊆ Σ″` separates `p` from `O`, so `p` is not in the exterior that `O` belongs to.
+
+(If a surface rather than a closed point set is required, replace each `s_q` by a small patch of
+the true `Σ` around it; no ball contains any point of the true `Σ`, so the same checks go through.)
+
+So `O` is the **largest exterior consistent with all of the input data**. Note where the two
+results differ: the Property holds for any certified set, but tightness needs `O` to be the full
+closure — that is what guarantees no uncertified ball overlaps `O`.
+
+An earlier version of this argument tried to place a surface point directly at `p`. That fails
+whenever `p` lies inside an *uncertified* sample's ball, because those balls are surface-free too;
+the witness `Σ″` above avoids the problem by never putting surface anywhere a sample forbids it.
 
 This is precisely why "regress a plane through the samples" doesn't actually beat it: that isn't
 extracting more from the *same* information, it's importing an **extra, unproven assumption**

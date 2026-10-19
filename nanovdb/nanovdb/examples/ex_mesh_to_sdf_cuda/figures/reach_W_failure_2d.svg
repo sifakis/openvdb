@@ -1,0 +1,137 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="745" viewBox="0 0 920 745" font-family="Helvetica,Arial,sans-serif">
+<rect width="100%" height="100%" fill="white"/>
+<defs><clipPath id="dom"><rect x="40" y="70" width="840" height="420"/></clipPath></defs>
+<text x="40" y="30" font-size="18" font-weight="bold">Reach-W ball certification misses a truly-outside point, even at the fixpoint (2D, W = 3)</text>
+<text x="40" y="52" font-size="13" fill="#444">Exterior = tunnel ∪ B(n, 2.55) ∪ B(q, 0.65); the surface Σ is its boundary (black). All udf values are true distances to Σ.</text>
+<g clip-path="url(#dom)">
+<rect x="40" y="70" width="840" height="420" fill="#cfcfcf"/>
+<circle cx="530.00" cy="280.00" r="178.50" fill="white" stroke="black" stroke-width="3"/>
+<circle cx="740.00" cy="210.00" r="45.50" fill="white" stroke="black" stroke-width="3"/>
+<rect x="-30.00" y="189.00" width="427.44" height="182.00" fill="white" stroke="black" stroke-width="3"/>
+<circle cx="530.00" cy="280.00" r="178.50" fill="white" stroke="none"/>
+<circle cx="740.00" cy="210.00" r="45.50" fill="white" stroke="none"/>
+<rect x="-30.00" y="189.00" width="427.44" height="182.00" fill="white" stroke="none"/>
+<rect x="40" y="70" width="840" height="420" fill="none" stroke="#888" stroke-width="1"/>
+<ellipse cx="635.00" cy="245.00" rx="112.00" ry="17.15" transform="rotate(-18.435 635.00 245.00)" fill="#ff9800" fill-opacity="0.18" stroke="#e65100" stroke-width="1.5" stroke-dasharray="6,4"/>
+<circle cx="740.00" cy="210.00" r="210.00" fill="none" stroke="#1565c0" stroke-width="1.5" stroke-dasharray="2,4"/>
+</g>
+<circle cx="40.00" cy="490.00" r="2.5" fill="#777"/>
+<circle cx="40.00" cy="420.00" r="2.5" fill="#777"/>
+<circle cx="40.00" cy="350.00" r="6" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="40.00" cy="280.00" r="6" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="40.00" cy="210.00" r="6" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="40.00" cy="140.00" r="2.5" fill="#777"/>
+<circle cx="40.00" cy="70.00" r="2.5" fill="#777"/>
+<circle cx="110.00" cy="490.00" r="2.5" fill="#777"/>
+<circle cx="110.00" cy="420.00" r="2.5" fill="#777"/>
+<circle cx="110.00" cy="350.00" r="6" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="110.00" cy="280.00" r="6" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="110.00" cy="210.00" r="6" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="110.00" cy="140.00" r="2.5" fill="#777"/>
+<circle cx="110.00" cy="70.00" r="2.5" fill="#777"/>
+<circle cx="180.00" cy="490.00" r="2.5" fill="#777"/>
+<circle cx="180.00" cy="420.00" r="2.5" fill="#777"/>
+<circle cx="180.00" cy="350.00" r="6" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="180.00" cy="280.00" r="6" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="180.00" cy="210.00" r="6" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="180.00" cy="140.00" r="2.5" fill="#777"/>
+<circle cx="180.00" cy="70.00" r="2.5" fill="#777"/>
+<circle cx="250.00" cy="490.00" r="2.5" fill="#777"/>
+<circle cx="250.00" cy="420.00" r="2.5" fill="#777"/>
+<circle cx="250.00" cy="350.00" r="6" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="250.00" cy="280.00" r="6" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="250.00" cy="210.00" r="6" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="250.00" cy="140.00" r="2.5" fill="#777"/>
+<circle cx="250.00" cy="70.00" r="2.5" fill="#777"/>
+<circle cx="320.00" cy="490.00" r="2.5" fill="#777"/>
+<circle cx="320.00" cy="420.00" r="2.5" fill="#777"/>
+<circle cx="320.00" cy="350.00" r="6" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="320.00" cy="280.00" r="6" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="320.00" cy="210.00" r="6" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="320.00" cy="140.00" r="2.5" fill="#777"/>
+<circle cx="320.00" cy="70.00" r="2.5" fill="#777"/>
+<circle cx="390.00" cy="490.00" r="2.5" fill="#777"/>
+<circle cx="390.00" cy="420.00" r="2.5" fill="#777"/>
+<circle cx="390.00" cy="350.00" r="6" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="390.00" cy="280.00" r="6" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="390.00" cy="210.00" r="6" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="390.00" cy="140.00" r="2.5" fill="#777"/>
+<circle cx="390.00" cy="70.00" r="2.5" fill="#777"/>
+<circle cx="460.00" cy="490.00" r="2.5" fill="#777"/>
+<circle cx="460.00" cy="420.00" r="6" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="460.00" cy="350.00" r="6" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="460.00" cy="280.00" r="6" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="460.00" cy="210.00" r="6" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="460.00" cy="140.00" r="6" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="460.00" cy="70.00" r="2.5" fill="#777"/>
+<circle cx="530.00" cy="490.00" r="2.5" fill="#777"/>
+<circle cx="530.00" cy="420.00" r="6" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="530.00" cy="350.00" r="6" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="530.00" cy="280.00" r="6" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="530.00" cy="210.00" r="6" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="530.00" cy="140.00" r="6" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="530.00" cy="70.00" r="2.5" fill="#777"/>
+<circle cx="600.00" cy="490.00" r="2.5" fill="#777"/>
+<circle cx="600.00" cy="420.00" r="6" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="600.00" cy="350.00" r="6" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="600.00" cy="280.00" r="6" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="600.00" cy="210.00" r="6" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="600.00" cy="140.00" r="6" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="600.00" cy="70.00" r="2.5" fill="#777"/>
+<circle cx="670.00" cy="490.00" r="2.5" fill="#777"/>
+<circle cx="670.00" cy="420.00" r="2.5" fill="#777"/>
+<circle cx="670.00" cy="350.00" r="6" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="670.00" cy="280.00" r="6" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="670.00" cy="210.00" r="6" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="670.00" cy="140.00" r="2.5" fill="#777"/>
+<circle cx="670.00" cy="70.00" r="2.5" fill="#777"/>
+<circle cx="740.00" cy="490.00" r="2.5" fill="#777"/>
+<circle cx="740.00" cy="420.00" r="2.5" fill="#777"/>
+<circle cx="740.00" cy="350.00" r="2.5" fill="#777"/>
+<circle cx="740.00" cy="280.00" r="2.5" fill="#777"/>
+<circle cx="740.00" cy="210.00" r="7" fill="#d32f2f" stroke="black" stroke-width="1.2"/>
+<circle cx="740.00" cy="140.00" r="2.5" fill="#777"/>
+<circle cx="740.00" cy="70.00" r="2.5" fill="#777"/>
+<circle cx="810.00" cy="490.00" r="2.5" fill="#777"/>
+<circle cx="810.00" cy="420.00" r="2.5" fill="#777"/>
+<circle cx="810.00" cy="350.00" r="2.5" fill="#777"/>
+<circle cx="810.00" cy="280.00" r="2.5" fill="#777"/>
+<circle cx="810.00" cy="210.00" r="2.5" fill="#777"/>
+<circle cx="810.00" cy="140.00" r="2.5" fill="#777"/>
+<circle cx="810.00" cy="70.00" r="2.5" fill="#777"/>
+<circle cx="880.00" cy="490.00" r="2.5" fill="#777"/>
+<circle cx="880.00" cy="420.00" r="2.5" fill="#777"/>
+<circle cx="880.00" cy="350.00" r="2.5" fill="#777"/>
+<circle cx="880.00" cy="280.00" r="2.5" fill="#777"/>
+<circle cx="880.00" cy="210.00" r="2.5" fill="#777"/>
+<circle cx="880.00" cy="140.00" r="2.5" fill="#777"/>
+<circle cx="880.00" cy="70.00" r="2.5" fill="#777"/>
+<defs><marker id="ar" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 z" fill="#6a1b9a"/></marker></defs>
+<line x1="537.59" y1="277.47" x2="731.46" y2="212.85" stroke="#6a1b9a" stroke-width="2" marker-end="url(#ar)"/>
+<text x="516.0" y="270.0" font-size="15" fill="black" text-anchor="start" font-weight="bold">n</text>
+<text x="500.0" y="304.0" font-size="12" fill="black" text-anchor="start" font-weight="normal">udf = 2.55</text>
+<text x="750.0" y="200.0" font-size="15" fill="black" text-anchor="start" font-weight="bold">q</text>
+<text x="790.0" y="234.0" font-size="12" fill="black" text-anchor="start" font-weight="normal">udf = 0.65</text>
+<text x="604.0" y="226.0" font-size="13" fill="#6a1b9a" text-anchor="middle" font-weight="bold">|w| = √10 ≈ 3.162 &gt; W</text>
+<text x="488.0" y="157.5" font-size="12" fill="#333" text-anchor="middle" font-weight="normal">B(n, 2.55)</text>
+<line x1="698.8" y1="223.7" x2="728.8" y2="285.7" stroke="#333" stroke-width="1"/>
+<text x="731.8" y="299.7" font-size="12" fill="#333">window ≈ 0.39 voxel wide</text>
+<text x="662.0" y="196.0" font-size="11" fill="#333" text-anchor="end">(2,1): 0.314 + 0.65 &lt; 1</text>
+<text x="551.0" y="472.5" font-size="11" fill="#1565c0" text-anchor="start" font-weight="normal">reach-W disk around q (radius 3)</text>
+<text x="628.0" y="301.0" font-size="12" fill="#e65100" text-anchor="middle" font-weight="normal">ellipse E (lattice-free)</text>
+<text x="46.0" y="251.5" font-size="12" fill="#333" text-anchor="start" font-weight="normal">to the outside (seeds)</text>
+<text x="285.0" y="458.5" font-size="13" fill="#555" text-anchor="middle" font-weight="normal">solid (inside)</text>
+<circle cx="50" cy="516" r="6" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<text x="66" y="520" font-size="13">certified, non-barrier (udf ≥ √2/2)</text>
+<circle cx="50" cy="538" r="6" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<text x="66" y="542" font-size="13">certified, barrier (udf &lt; √2/2)</text>
+<circle cx="50" cy="560" r="7" fill="#d32f2f" stroke="black" stroke-width="1.2"/>
+<text x="66" y="564" font-size="13">q: truly outside, NOT certified at the reach-W fixpoint (certified with reach W+√2/2)</text>
+<circle cx="50" cy="582" r="2.5" fill="#777"/>
+<text x="66" y="586" font-size="13">lattice point inside the solid</text>
+<text x="40" y="626" font-size="12.5" fill="#222">Fixpoint, reach |w| ≤ W = 3: 36/37 exterior band points certified after 5 sweeps (last sweep changes nothing); q is never certified.</text>
+<text x="40" y="645" font-size="12.5" fill="#222">Fixpoint, reach |w| &lt; W+√2/2: 37/37 certified; q is certified directly from n (udf(n)+udf(q) = 3.20 &gt; |w| = 3.162).</text>
+<text x="40" y="664" font-size="12.5" fill="#222">Why no short chain: n's ball is the only ball that overlaps q's. Any lattice x in the orange ellipse E = {|x-n|+|x-q| &lt; 3.20} would bridge n→x→q</text>
+<text x="40" y="683" font-size="12.5" fill="#222">with both hops &lt; W, but E holds no lattice point except n and q (it would need udf(n)+udf(q) &gt; 1+√5 ≈ 3.236). Best short attempt: x = (2,1),</text>
+<text x="40" y="702" font-size="12.5" fill="#222">udf 0.314 + 0.65 = 0.964 vs |x-q| = 1, margin -0.036. The price: q sits in a sub-voxel bubble behind a 0.39-voxel window.</text>
+</svg>

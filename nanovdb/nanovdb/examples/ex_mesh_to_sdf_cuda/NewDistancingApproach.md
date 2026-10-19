@@ -225,6 +225,9 @@ plausible. It is — via the same circumradius argument used to define barrier v
   exterior.** Nothing in the domain can be "more extreme" than it — no shell, cavity, or nesting
   can enclose the single most extreme active point in the entire materialized grid.
 
+(The cube-cover argument is stronger than 6-connected seeding needs: a threshold just above `h/2`
+already makes every 6-connected step surface-free. See "Stencil reach of the closure sweep" below.)
+
 Combining the two: the CC component containing that voxel has one, provably-correct sign
 throughout, and that sign is exterior. This is how nanovdb's `MeshToSDF` seeds today (`signNonBarrier`)
 — the point is that this specific step was never the unsound part. What's unsound is the *next*
@@ -309,8 +312,9 @@ its `dᵢ` is exact; it never uses that `O` is closed under the Step 1 rule. So 
 *any* set of certified points — the full closure, or an enrichment stopped early. The consequence
 is that **certified-outside values never need updating**: relative to `∂O`, the exterior half of
 the field is the input UDF itself, and only points outside `O` need new values (Step 3). On the
-lattice, with a complete stencil (one that reaches every overlapping pair), every lattice point
-inside `O` is itself certified, so "outside" and "keeps its input value" coincide exactly.
+lattice, with a complete stencil (one that reaches every overlapping pair; see "Stencil reach of
+the closure sweep" for how far that is), every lattice point inside `O` is itself certified, so
+"outside" and "keeps its input value" coincide exactly.
 
 **The claim hinges on the `dᵢ` being true distances to an actual `Σ`.** Only the `≥` half is
 structural; it holds for *any* positive radii. The `≤` half needs the foot point `s`: a point at
@@ -424,6 +428,129 @@ moment it fails (a cusp, a thin feature, a corner: hazard 1's territory) the reg
 fallback and produces an unsound answer with no way to detect it. The union-of-balls construction
 needs no such assumption and is therefore unconditionally sound: the "cottage cheese" appearance is
 not sloppiness, it's the honest shape of exactly how much the raw data supports, no more and no less.
+
+## Stencil reach of the closure sweep
+
+On the GPU the Step 2 closure runs as repeated sweeps. In each sweep, every uncertified active voxel
+`q` tests the certified voxels `n = q + w` for offsets `w` in a fixed stencil, and the loop stops
+when a sweep certifies nothing new. Certification only ever adds points, so the result is the set
+reachable from the seeds in the ball-overlap graph restricted to the stencil, whatever the sweep
+order. The question here is how small the stencil can be without shrinking that set. Distances are
+in voxel units; `W = 3` throughout; `D` is the barrier threshold (barrier iff `udf < D`).
+
+**The bound is `W + D`, not `2W`.** Every active voxel has `udf ≤ W`, so no certifier can be farther
+than `r_q + W`, which is `2W` in general. But suppose the seeding has already certified every truly
+exterior non-barrier voxel (Step 0, plus promotion of whole non-barrier components). Then any
+non-barrier voxel the sweep could add is truly exterior, hence already certified, so the only
+remaining candidates are barrier voxels, with `r_q < D`. Every certifier needs
+`|w| < r_n + r_q < W + D`. On the lattice this is the offset set `|w|² < (W + D)²`.
+
+**Repeated sweeps let chains replace long hops.** Three facts, each an instance of the next:
+
+- *Ball interior.* Every active lattice point `p` inside a certified ball `B(n, r_n)` is certified
+  directly from `n`: the open ball is surface-free, so `r_p > 0` and `|p - n| < r_n < r_n + r_p`. The
+  hop is shorter than `r_n ≤ W`.
+- *Lens.* If the lens `B(n, r_n) ∩ B(q, r_q)` contains an active lattice point `p`, then `n` certifies
+  `p` (ball interior) and `p` certifies `q` (same argument from `q`'s side).
+- *Ellipse.* Let `E = { x : |x - n| + |x - q| < r_n + r_q }`, which contains the lens and is much
+  fatter (minor semi-axis `½·sqrt((r_n + r_q)² - |w|²)`). If `E` contains an active lattice point
+  `x ∉ {n, q}`, then `n → x → q`. Proof: `E ⊂ B(n) ∪ B(q)`; take `x ∈ B(n)` (for a barrier `q`,
+  `B(q)` holds no other lattice point). Then `n` certifies `x`, and `r_x ≥ r_n - |x - n|` gives
+  `r_x + r_q > |x - q|` exactly when `x ∈ E`. Both hops are short: `|x - n| < r_n ≤ W`, and
+  `|x - q| < r_n + r_q - 1 < W + D - 1 ≤ W`. ∎ With `D ≤ 1/2`, the bridge is automatically in band
+  too: `udf(x) ≤ r_q + |x - q| < W + 2D - 1 ≤ W`.
+
+So a hop longer than `W` matters only when `E` contains no active lattice point other than `n` and
+`q`.
+
+**Planar `Σ`: reach `W` loses nothing.** Write `|w| = w·n̂ + 2g`, where `g` is the misalignment cost
+of `LatticeCertificationGap3D.md`. A witness at depth `ε + w·n̂ ≤ W` certifying a target at depth
+`ε > g` has `|w| < W + ε`, so a witness longer than `W` certifies only depths
+`ε > |w| - W ≥ √10 - 3 ≈ 0.162`. Section 2.7 there shows the 74 vectors with `|w| ≤ √6` already
+cover every depth in `(A(n), r_d]`, with `A(n) ≤ 0.0384`. Long witnesses never certify anything new.
+
+**Curved `Σ`: reach `W` can fail, and repeated sweeps do not help.** The *bubble* construction: the
+exterior near `q` is `B(n, r_n) ∪ B(q, r_q)`, a pocket joined to the rest of the exterior by a tunnel
+on the far side, with `q` in a small bubble behind a narrow window. Choose `r_n + r_q` above `|w|`
+but at most `m(w) = min_x |x| + |x - w|`, so `E` is lattice-free. Every lattice point inside
+`B(n)` whose radial foot point on `n`'s sphere lies outside the window (all of them, in every case
+below) then has `udf = r_n - |x - n|` exactly, and fails to reach `q`. `n`'s ball is the only one
+that overlaps `q`'s, so `q` stays uncertified at the fixpoint of any stencil that omits `w`.
+
+![Reach-W certification misses a truly-outside point at the fixpoint](figures/reach_W_failure_2d.svg)
+
+*2D, `W = 3`, `D = √2/2` (the 2D analogue of `√3/2`). The tunnel, pocket and bubble are white; the
+solid is grey. The hop `n → q` has `|w| = √10 > W`. At reach `|w| ≤ 3` the sweep stops after 5
+passes with 36 of 37 exterior band points certified; `q` never is. At full reach `q` is certified
+directly from `n`. The orange ellipse `E` holds no lattice point other than `n` and `q`; the closest
+miss is `(2,1)`, with `0.314 + 0.65 = 0.964 < 1`. Generated by
+`scripts/distancing_experiments/reach_W_failure_2d.py`.*
+
+Every hop class between `W` and `W + D`, enumerated by
+`scripts/distancing_experiments/reach_bubble_check.py`:
+
+| class | `\|w\|` | `E` lattice-free iff `r_n + r_q ≤` | max window radius | max lens thickness | forced (simulated) |
+|---|---|---|---|---|---|
+| 2D `(3,1)` | 3.162 | 3.236 | 0.28 | 0.073 | yes, `udf(q) = 0.65` and `0.45` |
+| 2D `(3,2)` | 3.606 | 3.650 | 0.22 | 0.045 | yes, `udf(q) = 0.68` |
+| 3D `(3,1,0)` | 3.162 | 3.236 | 0.30 | 0.074 | |
+| 3D `(3,1,1)` | 3.317 | 3.449 | 0.41 | 0.133 | yes, `udf(q) = 0.45` |
+| 3D `(2,2,2)` | 3.464 | never: `(1,1,1)` is always in `E` | — | — | no |
+| 3D `(3,2,0)` | 3.606 | 3.650 | 0.24 | 0.044 | |
+| 3D `(3,2,1)` | 3.742 | 3.864 | 0.40 | 0.122 | yes, `udf(q) = 0.82` |
+
+(Window and lens figures are for `D = √3/2` in 3D and `√2/2` in 2D; at `D = 1/2` they are smaller.)
+In each simulated case `q` is certified at exactly the class's `|w|²` and not before. So **for
+`W = 3` the lattice-rounded bound is attained**: the reach is the longest lattice length below
+`W + D` (or the next one down, when that class is unforceable like `(2,2,2)`), and it is needed,
+not just allowed. What reach `W` gives up is exactly these bubbles: exterior voxels behind a window
+less than about 0.8 voxels across, with a lens at most 0.13 voxels thick — the regime where lattice
+resolution runs out anyway. Dropping them costs completeness, never soundness.
+
+**The seeding threshold can drop to `D = 1/2` under 6-connectivity.** Step 0 justifies seeding with
+the cube-cover argument, which needs `D = √3/2`. Six-connected seeding needs less. If the segment
+between face neighbours `a`, `b` crossed `Σ` at `s`, then `udf(a) + udf(b) ≤ |a - s| + |s - b| = 1`;
+so with both above `1/2` every flood edge is a surface-free segment. The same argument keeps every
+non-barrier component sign-pure, so promotion stays sound.
+
+It looks backwards that the more restrictive connectivity allows voxels closer to `Σ`, but each step
+must prove its own segment surface-free, and the clearance needed is half the step length:
+6-connected steps (length 1) need `udf > 1/2`, 26-connected steps (up to `√3`) need `udf > √3/2`.
+Neither dominates: 26-connectivity takes diagonal steps that 6-connectivity cannot, and
+6-connectivity uses voxels with `udf ∈ (1/2, √3/2)` that 26-connectivity cannot. The ball test has no
+global threshold; it applies `udf(a) + udf(b) > |a - b|` pair by pair with the actual radii, and both
+connected-components variants are special cases of it. Hence **the seeding choice does not change
+the final certified set** (both seed sets lie in the ball-reachable set of the extreme voxel); it
+only moves work between the cheap connected-components pass and the sweep.
+
+Lowering `D` to `1/2` has one hazard: exact ties. An axis-aligned plane at a half-integer offset
+puts `udf = 0.5` on whole voxel layers, where `udf(a) + udf(b) = |a - b|` and the segment touches
+`Σ`. The test must be strict with a guard, roughly `barrier iff udf ≤ (1/2 + τ)·h` with
+`τ ≈ 1e-3`. Today's `√3/2` leaves 0.73 voxels of slack (sum `≥ 1.73` against the `1` required),
+while `1/2 + τ` leaves only `τ`; but the sweep already relies on exact distances with a tolerance of
+`1e-5·h`, so the pipeline as a whole was never more robust than that.
+
+**Summary, `W = 3`.**
+
+| | longest needed hop | offsets | taps | halo |
+|---|---|---|---|---|
+| 3D, `D = √3/2` | `(3,2,1)`, `√14 ≈ 3.742` | `\|w\|² ≤ 14` | 250 | 3 |
+| 3D, `D = 1/2` | `(3,1,1)`, `√11 ≈ 3.317` | `\|w\|² ≤ 11` | 170 | 3 |
+| 2D, `D = √2/2` | `(3,2)`, `√13 ≈ 3.606` | `\|w\|² ≤ 13` | 44 | 3 |
+| 2D, `D = 1/2` | `(3,1)`, `√10 ≈ 3.162` | `\|w\|² ≤ 10` | 36 | 3 |
+| any, giving up the bubbles | — | `\|w\|² ≤ 9` | 122 (3D), 28 (2D) | 3 |
+
+Every needed offset has all components `≤ 3` (a component of 4 already gives `|w|² ≥ 16`), so **the
+`L∞` box of radius 3 always suffices**: 342 offsets in 3D, 48 in 2D. The box's extra corner taps can
+never pass the test; an integer pre-check (`dx² + dy² + dz² ≤ 11`) skips them before any shared
+memory is read. The halo, and hence the shared-memory tile, is the same in every row (`14³` per 8³
+leaf); only the arithmetic changes.
+
+**Open.** The premise that every exterior non-barrier voxel is certified before the sweep is what
+caps the reach at `W + D`. A non-barrier pocket whose only link to the seed component is a single
+long hop between two *non-barrier* voxels is outside this analysis: the ellipse lemma still bridges
+it when `E` holds an active lattice point, but the hop lengths are then bounded only by
+`r_n + r_q - 1`.
 
 ## Quantifying the planar-interface case
 

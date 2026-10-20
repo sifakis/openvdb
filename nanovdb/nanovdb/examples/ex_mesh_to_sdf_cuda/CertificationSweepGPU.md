@@ -330,7 +330,8 @@ round (an estimate to confirm by profiling).
 
 Items 1–5 of the review are settled: scope (section 11), rounds and termination (section 9),
 the tolerance (`NewDistancingApproach.md`), promotion and pocket entry (sections 9 and 10), and
-validation (below). Items 4b and 6 are open.
+validation (below). Item 6 is decided in part: inside magnitudes will be recomputed (design
+open); the isovalue is deferred. Item 4b is open.
 
 **#4 — Component promotion and pocket entry: settled** (sections 9 and 10). Promotion is left out
 of version 1 and planned as the `promote` option afterwards, sized by S5. Pockets whose entry needs
@@ -379,7 +380,20 @@ mismatch clusters or in the sphere test; add it if a cluster cannot be explained
 numbers (OpenVDB stands in).
 
 **#6 — Follow-ons that share this infrastructure.**
-- *Inside magnitudes:* keep the input UDF, or recompute distances to `∂O` (Step 3 of
-  `NewDistancingApproach.md`)? The recompute would reuse the tiles and the neighbour table.
-- *The isovalue (deferred):* with an offset the radius becomes `|udf - iso|`, inside radii can
-  exceed `W`, and the needed reach grows, which interacts with the choice of `H`.
+- *Inside magnitudes: decided, recompute; design open.* Uncertified voxels get
+  `φ(p) = -minᵢ(|p - Vᵢ| - dᵢ)` over certified `Vᵢ`, the exact signed distance to `∂O` (Step 3 of
+  `NewDistancingApproach.md`), rather than `-udf`. Reasons: the field is self-consistent everywhere
+  (keeping `-udf` puts large negative values next to large positive ones across the neck of a missed
+  pocket), inclusion holds by construction, and it can be evaluated between lattice points. For a
+  truly inside `p` it is never below `udf(p)`, so it departs from the mesh distance only where `∂O`
+  comes loose from `Σ`. Starting points for the design discussion, none settled: one pass, no
+  iteration; reach up to `2W` with all offsets (the primitive reduction does not apply to a min);
+  taps sorted by `|w|` with a cut once `|w| - W ≥` the best so far; the leaf tile infrastructure,
+  `H = 5` at `W = 3` (the clipped offsets only produce values `≥ W`). The mode of parallelism and the
+  remaining details are to be discussed.
+- *The isovalue: deferred until after the inside recompute.* Notes so far: `iso > 0` (dilation) is
+  the same sweep on `udf - iso` over voxels with `udf > iso` (radius `udf - iso`, barrier
+  `udf - iso < D`, reach `W + D` in those terms; the input band must widen to `W + iso` to keep an
+  effective `W`, which feeds the choice of `H`; necks narrower than about `2·iso` close, correctly).
+  `iso < 0` (erosion) cannot use unsigned data; it is a post-pass `φ + |iso|` on the signed result
+  and needs inside magnitudes valid to `|iso|`, so it depends on the recompute above.

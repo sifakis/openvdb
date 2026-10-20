@@ -13,8 +13,10 @@
   already prunes each surface into its own grid before signing). Values are exact distances to the
   mesh, in band `udf ≤ W`.
 - **Seeds:** the 6-connected component of non-barrier voxels (`udf ≥ D`, with `D = 0.55`)
-  containing the voxel with the smallest coordinate along some axis. Whole non-barrier components
-  are promoted when any of their voxels is certified (section 9).
+  containing the voxel with the smallest coordinate along some axis. Barrier voxels and
+  non-barrier components matter only here; the certification itself treats every active voxel
+  alike. (Reusing the seeding labels to promote whole components is an optional acceleration, still
+  unresolved: section 10.)
 - **Rule:** certify `q` from a certified `n = q + w` iff `r_n + r_q > |w| + τ`, where `r = udf`
   (voxel units) and `τ` is the overlap tolerance.
 - **Outside-only.** Certification only ever adds voxels, so the result is the set reachable from the
@@ -72,7 +74,7 @@ The isovalue (deferred) will interact with this choice: with an offset the radiu
 | certified | leaf | `Mask<3>` (512 bits) | the owning CTA only |
 | state | leaf | `uint32_t`: bit 0 dirty, bit 1 has candidates; double-buffered | dirty: any CTA (push); candidates: owner |
 | neighbours | leaf | `uint32_t[27]`, leaf indices, `UINT32_MAX` if absent | setup kernel |
-| components | active slot | label, plus `rootOutside[N]` | promotion pass |
+| components | active slot | label, plus `rootOutside[N]` | promotion pass (only if adopted; section 10) |
 
 - **Why not keep the flag in the UDF's sign bit:** it would halve gather loads, but the UDF would no
   longer be read-only (re-runs and other consumers see a mutated buffer), and the output would be
@@ -213,13 +215,46 @@ The isovalue (deferred) will interact with this choice: with an offset the radiu
 3. **A compacted leaf list** (`cub::DeviceSelect::Flagged`), only if profiling at scale (millions of
    leaves, many rounds) shows the flag scan matters.
 
-## 10. Component promotion (outer loop)
+## 10. Unresolved (#4): component promotion, and how many non-barrier pieces to expect
 
-Sweep until nothing changes → for each newly certified non-barrier voxel set `rootOutside[label]`
-→ inherit pass (every non-barrier voxel whose component is marked becomes certified) → mark the
-affected leaves dirty → sweep again; stop when promotion adds nothing. Labels come from
-`ConnectedComponents` on the pruned grid (dense ids, so `find()` is a plain lookup), rerun at
-`D = 0.55`. Still to settle: whether cross-leaf push goes into the first version.
+*Status: discussed, not settled; to revisit.*
+
+**What promotion is.** Seeding runs `ConnectedComponents` on the non-barrier voxels (`udf ≥ D`) of
+the surface's grid and keeps the piece containing the extreme voxel. That pass labels every
+non-barrier piece, and each piece is provably entirely inside or entirely outside (a 6-connected
+step between non-barrier voxels cannot cross `Σ`). Promotion reuses the labels: once the sweep
+certifies any voxel of a piece, certify the whole piece.
+
+**It is optional.** The certification itself has no barrier voxels and no components: every active
+voxel is a candidate, and face neighbours in one piece already pass the ball test
+(`udf(a) + udf(b) > 1.1 > 1`). So promotion never changes the result or the reach analysis; it only
+saves rounds. Without it, certification crosses a large piece about one leaf per round (a pocket
+spreading 500 voxels along the surface takes about 60 rounds); with it, one.
+
+**A possible shape, if adopted.** Seeding becomes the first promotion: clear `rootOutside[N]`, mark
+the extreme voxel's label, run the inherit pass. Then: sweep round, during which the owning CTA
+marks `rootOutside[label]` for each newly certified non-barrier voxel (`atomicExch` on a `uint32_t`
+to detect new labels) → if a new label appeared, inherit pass over leaves with uncertified
+non-barrier voxels (certify, push dirty flags) → repeat until neither changes anything. Labels come
+from `ConnectedComponents` on the pruned grid at the same `D` as the barrier test (dense ids, so
+`find()` is a plain lookup). Promotion on and off must give identical certified sets (add to S3).
+
+**Current lean:** leave it out of version 1, so the sweep is exactly the method as stated, and use
+experiment S1 to count rounds on pocket-heavy meshes before deciding.
+
+**Open sub-question: how many non-barrier pieces, and what they are.** For one closed connected
+surface there is exactly one outside region in the continuum, but after removing the barrier voxels
+it can split into several pieces:
+- *Narrow necks.* A passage narrower than about `2D` is all barrier, so a bottle's inner air, or the
+  region behind a slot between parts of one mesh, becomes a separate outside piece. On the lattice,
+  6-connectivity also cuts somewhat wider (especially diagonal) necks. These pockets are what the
+  ball sweep exists to reach.
+- *Several surfaces in one UDF component.* A UDF component is one connected band, not one closed
+  surface: surfaces closer than about `2W` share a band. A thin-walled hollow sphere modelled as an
+  outer and an inner surface has a third region, the cavity, whose band is its own piece. Nothing
+  can certify it (it is not connected to the outside), so it ends up "inside". Whether that is right
+  depends on what the mesh means (a solid with a void, or nested objects): the within-cluster
+  nesting question, not yet addressed by the sweep or anything else in the pipeline.
 
 ## 11. Scope: one surface at a time
 
@@ -237,7 +272,7 @@ many components a grid holds.
 |---|---|
 | thread per voxel; `(2r+1)³` box, default `r = 1` | primitive stencil from `W + D`; 146 taps at `W = 3` |
 | out-of-leaf taps through `ReadAccessor`, two scattered loads each | one gather per leaf into shared memory |
-| `sqrtf` per tap | `|w|` from the tap table |
+| `sqrtf` per tap | `\|w\|` from the tap table |
 | two-sided (inside balls certify inside), no early exit | outside-only, first success wins |
 | double-buffered labels, one hop per round | in place, local fixpoint per tile |
 | every leaf every round | dirty leaves only |
@@ -249,10 +284,27 @@ matches today's few taps. At the reach the analysis requires (`r = 3`), today's 
 is 342 accessor-based taps, and the tiled design should win by roughly an order of magnitude per
 round (an estimate to confirm by profiling).
 
-## 13. Still open
+## 13. Unresolved questions (to revisit)
 
-- Component promotion details (section 10).
-- Validation: the queued experiments in `NewDistancingApproach.md` (T1–T3 for the tolerance, S1–S4
-  for the sweep).
-- Follow-ons sharing this infrastructure: whether inside magnitudes keep the input UDF or are
-  recomputed as distances to `∂O`; the isovalue.
+Items 1–3 of the review are settled above: scope (section 11), rounds and termination (section 9),
+and the tolerance (`NewDistancingApproach.md`). Items 4–6 are open.
+
+**#4 — Component promotion and non-barrier pieces.** See section 10: whether promotion goes into
+version 1, and what to do with pieces that are neither the outside nor solid (cavities when one UDF
+component holds several surfaces).
+
+**#5 — Validation strategy.** Queued so far: T1–T3 (tolerance) and S1–S4 (sweep) in
+`NewDistancingApproach.md`. Points raised but not settled:
+- the Python scripts in `scripts/distancing_experiments/` (bubbles, planes, wedges) as the CPU
+  reference, which the GPU sweep must match exactly;
+- equivalence between modes (one pass per launch, local fixpoint, dirty-leaf skipping, promotion on
+  and off);
+- soundness against winding numbers on closed meshes;
+- restoring a diagnostic count (certifications per round, undecided barrier voxels at the end),
+  since today's contradiction tally is gone.
+
+**#6 — Follow-ons that share this infrastructure.**
+- *Inside magnitudes:* keep the input UDF, or recompute distances to `∂O` (Step 3 of
+  `NewDistancingApproach.md`)? The recompute would reuse the tiles and the neighbour table.
+- *The isovalue (deferred):* with an offset the radius becomes `|udf - iso|`, inside radii can
+  exceed `W`, and the needed reach grows, which interacts with the choice of `H`.

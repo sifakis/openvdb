@@ -4,7 +4,7 @@
 """How far must the ball-certification sweep look?  Reproduces the numbers in the
 "Stencil reach of the closure sweep" section of NewDistancingApproach.md.
 
-1. Bubble simulations.  The exterior near the configuration is U = B(n, rn) u B(q, rq), with n at
+1. Bubble simulations (including one past the H = 3 box limit, at W = 3.7).  The exterior near the configuration is U = B(n, rn) u B(q, rq), with n at
    the origin and q a lattice point; Sigma is the boundary of U (a tunnel joining B(n, rn) to the
    rest of the exterior is assumed on the far side, so n is a valid seed).  All UDF values are true
    distances to Sigma.  The closure is run to its fixpoint with stencils |w|^2 <= k for increasing
@@ -16,7 +16,7 @@
    min_x |x| + |x-w|; the script reports it, and the largest lens thickness and window radius
    achievable with rn <= W, rq < D.
 
-3. Stencil tap counts.
+3. Stencil tap counts, all and primitive (multiples on a line are never needed).
 
 Pure Python, no numpy.  Runs in a few minutes (the 3D UDF evaluation dominates).
 """
@@ -40,7 +40,7 @@ def circle(N):
         yield (math.cos(t), math.sin(t))
 
 
-def bubble(q, rn, rq):
+def bubble(q, rn, rq, W=W):
     """Smallest k such that the closure with stencil |w|^2 <= k certifies q (None if > 20)."""
     dim = len(q)
     n = (0.0,) * dim
@@ -114,8 +114,10 @@ def ellipse_table(D, dim):
         print("    %-10s |w| = %.4f : %s" % (w, L, status))
 
 
-def taps(k, dim):
-    return sum(1 for w in itertools.product(range(-4, 5), repeat=dim) if 0 < sum(v * v for v in w) <= k)
+def taps(k, dim, primitive=False):
+    def ok(w):
+        return 0 < sum(v * v for v in w) <= k and (not primitive or math.gcd(*map(abs, w)) == 1)
+    return sum(1 for w in itertools.product(range(-4, 5), repeat=dim) if ok(w))
 
 
 if __name__ == "__main__":
@@ -125,11 +127,16 @@ if __name__ == "__main__":
         k, npts = bubble(q, rn, rq)
         print("  %dD q=%-15s udf(n)=%.2f udf(q)=%.2f : needs |w|^2 >= %s  (%d exterior band points)"
               % (len(q), q, rn, rq, k, npts))
+    # Past the H = 3 box limit (W + D > sqrt17): a (4,1,0) bubble at W = 3.7.
+    k, npts = bubble((4.0, 1.0, 0.0), 3.69, 0.45, W=3.7)
+    print("  3D q=(4.0, 1.0, 0.0)  udf(n)=3.69 udf(q)=0.45, W=3.7 : needs |w|^2 >= %s  (%d points)"
+          % (k, npts))
     for D, name in [(0.5, "1/2"), (math.sqrt(2) / 2, "sqrt2/2"), (math.sqrt(3) / 2, "sqrt3/2")]:
         for dim in (2, 3):
             if (dim == 2 and name == "sqrt3/2") or (dim == 3 and name == "sqrt2/2"):
                 continue
             print("Ellipse enumeration, %dD, D = %s (W + D = %.4f):" % (dim, name, W + D))
             ellipse_table(D, dim)
-    print("Taps: 2D |w|^2<=10: %d, <=13: %d, box: %d;  3D |w|^2<=9: %d, <=11: %d, <=14: %d, box: %d"
-          % (taps(10, 2), taps(13, 2), 7 ** 2 - 1, taps(9, 3), taps(11, 3), taps(14, 3), 7 ** 3 - 1))
+    for dim, ks in ((2, (9, 10, 13)), (3, (9, 11, 14))):
+        print("Taps %dD: " % dim + ", ".join("|w|^2<=%d: %d (%d primitive)" % (k, taps(k, dim), taps(k, dim, True))
+                                            for k in ks) + ", box: %d" % (7 ** dim - 1))

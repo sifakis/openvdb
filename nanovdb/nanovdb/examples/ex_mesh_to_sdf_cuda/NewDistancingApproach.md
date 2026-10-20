@@ -523,34 +523,147 @@ connected-components variants are special cases of it. Hence **the seeding choic
 the final certified set** (both seed sets lie in the ball-reachable set of the extreme voxel); it
 only moves work between the cheap connected-components pass and the sweep.
 
-Lowering `D` to `1/2` has one hazard: exact ties. An axis-aligned plane at a half-integer offset
-puts `udf = 0.5` on whole voxel layers, where `udf(a) + udf(b) = |a - b|` and the segment touches
-`Σ`. The test must be strict with a guard, roughly `barrier iff udf ≤ (1/2 + τ)·h` with
-`τ ≈ 1e-3`. Today's `√3/2` leaves 0.73 voxels of slack (sum `≥ 1.73` against the `1` required),
-while `1/2 + τ` leaves only `τ`; but the sweep already relies on exact distances with a tolerance of
-`1e-5·h`, so the pipeline as a whole was never more robust than that.
+**Choose `D = 0.55`, not exactly `1/2`.** At exactly `1/2` there are exact ties: an axis-aligned
+plane at a half-integer offset puts `udf = 0.5` on whole voxel layers, where
+`udf(a) + udf(b) = |a - b|` and the segment touches `Σ`. With `D = 0.55` face neighbours need
+`udf(a) + udf(b) > 1.1` against the `1` required, so those layers fall solidly in the barrier and no
+separate guard is needed. The stencil does not change: it is the same for every
+`D ∈ [1/2, √13 - 3 ≈ 0.606]`, because in that range the only lattice length between `√11` and
+`3 + D` is `√12`, the unforceable `(2,2,2)`.
+
+**Multiples on a line are never needed, for any surface.** The planar proofs reduce to primitive
+offsets; that reduction survives curvature. Suppose `n₂ = q + 2w` certifies `q`, so
+`r₂ + r_q > 2|w|`, and let `n₁ = q + w`.
+- `n₁` certifies `q`: by 1-Lipschitz, `r₁ ≥ r₂ - |w|`, so `r₁ + r_q > |w|`.
+- `n₁` gets certified: `q` is a barrier voxel, so `r_q < D ≤ 1 ≤ |w|` and `r₂ > |w|`, which puts
+  `n₁` inside `n₂`'s ball.
+- `n₁` is in band: `udf(n₁) ≤ r_q + |w| < D + (W + D)/2 ≤ W` whenever `W ≥ 3D`.
+
+The same chain handles any multiple `kw`, one hop of `w` at a time. Unlike the planar case, `n₁` may
+need its own sweep before it certifies `q`, but the fixpoint is the same. What does *not* carry over
+is the planar result that five classes suffice: curved surfaces need every primitive direction up to
+the bound (the bubbles above).
 
 **Summary, `W = 3`.**
 
-| | longest needed hop | offsets | taps | halo |
-|---|---|---|---|---|
-| 3D, `D = √3/2` | `(3,2,1)`, `√14 ≈ 3.742` | `\|w\|² ≤ 14` | 250 | 3 |
-| 3D, `D = 1/2` | `(3,1,1)`, `√11 ≈ 3.317` | `\|w\|² ≤ 11` | 170 | 3 |
-| 2D, `D = √2/2` | `(3,2)`, `√13 ≈ 3.606` | `\|w\|² ≤ 13` | 44 | 3 |
-| 2D, `D = 1/2` | `(3,1)`, `√10 ≈ 3.162` | `\|w\|² ≤ 10` | 36 | 3 |
-| any, giving up the bubbles | — | `\|w\|² ≤ 9` | 122 (3D), 28 (2D) | 3 |
+| | longest needed hop | offsets | taps | primitive taps | halo |
+|---|---|---|---|---|---|
+| 3D, `D = √3/2` | `(3,2,1)`, `√14 ≈ 3.742` | `\|w\|² ≤ 14` | 250 | 218 | 3 |
+| 3D, `D ∈ [1/2, 0.606]` (e.g. `0.55`) | `(3,1,1)`, `√11 ≈ 3.317` | `\|w\|² ≤ 11` | 170 | **146** | 3 |
+| 2D, `D = √2/2` | `(3,2)`, `√13 ≈ 3.606` | `\|w\|² ≤ 13` | 44 | 32 | 3 |
+| 2D, `D ∈ [1/2, 0.606]` | `(3,1)`, `√10 ≈ 3.162` | `\|w\|² ≤ 10` | 36 | 24 | 3 |
+| any, giving up the bubbles | — | `\|w\|² ≤ 9` | 122 (3D), 28 (2D) | 98, 16 | 3 |
 
 Every needed offset has all components `≤ 3` (a component of 4 already gives `|w|² ≥ 16`), so **the
 `L∞` box of radius 3 always suffices**: 342 offsets in 3D, 48 in 2D. The box's extra corner taps can
-never pass the test; an integer pre-check (`dx² + dy² + dz² ≤ 11`) skips them before any shared
-memory is read. The halo, and hence the shared-memory tile, is the same in every row (`14³` per 8³
-leaf); only the arithmetic changes.
+never pass the test. The halo, and hence the shared-memory tile, is the same in every row (`14³` per
+8³ leaf); only the arithmetic changes.
+
+**How wide a band a halo supports.** The box `[-H, H]³` is complete as long as every needed
+primitive offset fits in it. The shortest primitive offset with a component of `H + 1` is
+`(H + 1, 1, 0)` (`(H + 1, 0, 0)` is a multiple), so
+
+```
+box H suffices  ⟺  W + D ≤ √((H + 1)² + 1)
+```
+
+For `H = 3` that is `W ≤ √17 - D`: `3.57` at `D = 0.55`, `3.26` at `D = √3/2`. The limit is reached:
+at `W = 3.7`, `D = 1/2`, a `(4,1,0)` bubble (`udf(n) = 3.69`, `udf(q) = 0.45`) is certified only once
+the stencil includes `|w|² = 17`. Beyond the limit, a clipped stencil loses only bubbles, never
+soundness. The GPU design that uses these numbers is in `CertificationSweepGPU.md`.
 
 **Open.** The premise that every exterior non-barrier voxel is certified before the sweep is what
 caps the reach at `W + D`. A non-barrier pocket whose only link to the seed component is a single
 long hop between two *non-barrier* voxels is outside this analysis: the ellipse lemma still bridges
 it when `E` holds an active lattice point, but the hop lengths are then bounded only by
 `r_n + r_q - 1`.
+
+## Overlap tolerance of the certification test
+
+The implemented test is `r_n + r_q > |w| + τ`: the balls must overlap, along the line between their
+centres, by more than `τ`. `τ` absorbs floating-point error in the radii. The exact test is sound
+only for true distances; if both radii come out slightly too large, an exactly tangent pair (which
+proves nothing) can pass. All quantities below are in voxel units; the world-unit kernel uses
+`τ·h`.
+
+**Only inconsistent overestimates count.**
+- *Underestimates are harmless*: they shrink balls and can only cost completeness.
+- *Consistent perturbations are harmless*: rounding the triangle vertices into index space
+  (`applyInverseMap`, float) moves the mesh by about an ulp of the coordinate, but every voxel sees
+  the same moved mesh, so the UDF is exact for it. This is the only place the distance from the
+  origin enters.
+- *What counts* is the per-voxel arithmetic error of `pointToTriangleDistSqr` (float, index space)
+  and of the final `sqrtf`. Differences `p - a` between a voxel centre and a nearby vertex are exact
+  or nearly so (Sterbenz), but the edge vectors, plane projection and barycentric clamping work with
+  vectors as long as the triangle. So the overestimate is roughly `δ ≈ C·ε·(L + W)`, with
+  `ε = 2⁻²⁴`, `L` the triangle extent in voxels and `C ≈ 10` (an estimate, not yet measured).
+
+**Policy (settled pending experiment T1):**
+- Parameterise the UDF accuracy `δ`, the largest per-voxel overestimate relative to one consistent
+  surface, and derive `τ = 2δ` plus a few ulps for the test's own arithmetic.
+- Default `δ = 5e-4`, so `τ ≈ 1e-3`. By the estimate this covers float-rasterised triangles up to
+  roughly 800 voxels across. A generous default is cheap: a tolerance `τ` shifts the guaranteed
+  capture depth by `τ/2` (0.0384 → 0.0389 at `τ = 1e-3`).
+- `MeshToSDF` produces its own UDF, so it uses `max(default, C·ε·(L_max + W))`, with `L_max` from
+  one reduction over triangle extents; a setter overrides it.
+- A standalone certification API that takes an arbitrary UDF states `δ` as a caller precondition
+  (absolute, in voxels — not in ulps of the value, which a float rasteriser cannot meet for large
+  triangles).
+- Today's `eps = 1e-5·h` in `BallCertifyFunctor` is too small for triangles beyond about 10
+  voxels, and large planar faces with lattice-aligned normals are exactly where exact ties occur
+  (`LatticeCertificationGap3D.md`, section 8: with zero tolerance, whole families of points are
+  wrongly certified).
+
+## Queued certification experiments
+
+To run once the design discussion is complete. T1–T3 can run against the existing pipeline; S1–S4
+need the tiled sweep.
+
+**T1 — measure the float UDF overestimate `δ`.**
+- *Question:* what is `C` in `δ ≈ C·ε·(L + W)`, and is triangle extent the right predictor?
+- *Setup:* run `pointToTriangleDistSqr` and the `sqrtf` finalisation **on the GPU, with the
+  production flags** (`-use_fast_math`, so division and `sqrtf` are approximate; a CPU or
+  IEEE-strict run would underestimate `δ`). Compare against a double-precision reference computed
+  from the *same float-rounded vertices*, so consistent vertex rounding is excluded by
+  construction.
+- *Sweep:* triangle extent `L ∈ {10, 100, 1e3, 1e4}` voxels; normals parallel to `(1,0,0)`,
+  `(1,1,0)`, `(1,1,1)`, `(2,1,0)`, `(2,1,1)`, `(2,2,1)`, plus random normals; offsets from the origin
+  `M ∈ {0, 1e3, 1e5}` voxels (expected not to matter); every voxel in the band.
+- *Record:* the largest overestimate (computed minus reference), its location (near a vertex,
+  edge, or face interior), and the fitted `C`. If `δ` varies widely within a triangle, revisit the
+  per-voxel option (bound from the nearest triangle, whose index is already recorded).
+
+**T2 — end-to-end tie battery.**
+- *Question:* does `τ` actually prevent wrong certifications through the float pipeline?
+- *Setup:* closed meshes made of very large planar faces with the lattice-aligned normals above, at
+  many sub-voxel offsets including half-integer ones. Ground-truth signs from the exact geometry
+  (plane side tests, no floating point in the decision).
+- *Sweep:* `τ ∈ {0, 1e-5, 1e-4, 1e-3, 1e-2}` voxels; `L` up to `1e4`.
+- *Record:* number of voxels certified outside that are truly inside, per `τ` and `L`. Expected: zero
+  for `τ ≥ 2δ` from T1, failures below. Mirrors the double-precision battery of
+  `LatticeCertificationGap3D.md` section 8, now through the float rasteriser.
+
+**T3 — completeness cost of `τ`.**
+- *Question:* is the `τ/2` depth shift the whole cost?
+- *Setup:* random planar interfaces and the bubble configurations of `reach_bubble_check.py`.
+- *Record:* barrier capture rate and smallest guaranteed depth versus `τ`; whether any bubble with
+  lens thickness above `τ` is lost.
+
+**S1 — the seeding choice does not change the result.** Seed with 6-connected components at
+`D = √3/2` and at `D = 0.55`, sweep to the fixpoint with the full stencil, and require identical
+certified sets on test meshes. Also record how much work moves from the sweep to the
+connected-components pass.
+
+**S2 — stencil sufficiency on real meshes.** Compare the 146-tap primitive stencil
+(`|w|² ≤ 11`, `D = 0.55`) against a `2W` reference stencil, both run to the fixpoint. Differences
+are expected only for sub-voxel bubbles; record how often they occur in practice.
+
+**S3 — schedule independence.** Require identical certified sets from: one pass per launch
+(`maxLocalIters = 1`) with double-buffered flags; the default local fixpoint; dirty-leaf skipping on
+and off; and, once implemented, the fixed-grid loop and push from newly certified voxels.
+
+**S4 — soundness against winding numbers.** On closed meshes (and nested shells, processed one
+component at a time), no voxel certified outside may have a nonzero winding number.
 
 ## Quantifying the planar-interface case
 

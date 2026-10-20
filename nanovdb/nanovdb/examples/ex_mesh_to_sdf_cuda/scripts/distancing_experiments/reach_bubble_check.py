@@ -18,6 +18,10 @@
 
 3. Stencil tap counts, all and primitive (multiples on a line are never needed).
 
+4. Pocket entry: bubbles with both radii above D (a non-barrier pocket behind a sub-voxel window),
+   which need hops beyond W + D, and the largest window any lattice-free ellipse allows for
+   W + D <= |w| < 2W; plus the size of the pedantic-mode shell stencil.
+
 Pure Python, no numpy.  Runs in a few minutes (the 3D UDF evaluation dominates).
 """
 import itertools
@@ -137,6 +141,22 @@ if __name__ == "__main__":
                 continue
             print("Ellipse enumeration, %dD, D = %s (W + D = %.4f):" % (dim, name, W + D))
             ellipse_table(D, dim)
+    print("Pocket entry (both radii above D; smallest |w|^2 whose stencil certifies q):")
+    for q, rn, rq in [((3.0, 2.0, 0.0), 2.0, 1.64), ((3.0, 2.0, 1.0), 2.2, 1.6), ((4.0, 1.0, 1.0), 2.9, 1.4)]:
+        k, npts = bubble(q, rn, rq)
+        print("  3D q=%-15s udf(n)=%.2f udf(q)=%.2f : needs |w|^2 >= %s  (%d points)" % (q, rn, rq, k, npts))
+    zero, worst = (0, 0, 0), (0.0, None)
+    for w in itertools.product(range(7), repeat=3):
+        L = math.hypot(*w)
+        if not (w[0] >= w[1] >= w[2] and math.gcd(*w) == 1 and W + 0.55 <= L < 2 * W):
+            continue
+        m = min(math.dist(x, zero) + math.dist(x, w)
+                for x in itertools.product(range(-1, 8), repeat=3) if x not in (zero, w))
+        worst = max(worst, (0.5 * math.sqrt(max(0.0, m * m - L * L)), w))
+    print("  largest window radius for W + D <= |w| < 2W (D = 0.55): %.3f at %s" % worst)
+    shell = sum(1 for w in itertools.product(range(-6, 7), repeat=3)
+                if (W + 0.55) ** 2 <= sum(v * v for v in w) < 4 * W * W and math.gcd(*map(abs, w)) == 1)
+    print("  pedantic shell stencil (primitive, W + D <= |w| < 2W): %d taps" % shell)
     for dim, ks in ((2, (9, 10, 13)), (3, (9, 11, 14))):
         print("Taps %dD: " % dim + ", ".join("|w|^2<=%d: %d (%d primitive)" % (k, taps(k, dim), taps(k, dim, True))
                                             for k in ks) + ", box: %d" % (7 ** dim - 1))

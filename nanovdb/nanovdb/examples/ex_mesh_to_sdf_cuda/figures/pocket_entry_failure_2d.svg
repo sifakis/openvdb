@@ -1,0 +1,225 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1190" height="828" viewBox="0 0 1190 828" font-family="Helvetica,Arial,sans-serif">
+<rect width="100%" height="100%" fill="white"/>
+<defs><clipPath id="dom"><rect x="40" y="70" width="780" height="468"/></clipPath>
+<marker id="ar" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 z" fill="#6a1b9a"/></marker></defs>
+<text x="40" y="30" font-size="18" font-weight="bold">A whole non-barrier pocket that only a hop of |w| = √34 ≈ 5.83 can enter (2D, W = 3, D = 0.55, so W + D = 3.55, 2W = 6)</text>
+<text x="40" y="52" font-size="13" fill="#444">Exterior = tunnel ∪ B(n, 2.99) ∪ B(q, 2.85); the surface Σ is its boundary (black). All udf values are true distances to Σ.</text>
+<g clip-path="url(#dom)">
+<rect x="40" y="70" width="780" height="468" fill="#cfcfcf"/>
+<circle cx="404.00" cy="382.00" r="155.48" fill="white" stroke="black" stroke-width="3"/>
+<circle cx="664.00" cy="226.00" r="148.20" fill="white" stroke="black" stroke-width="3"/>
+<rect x="-12.00" y="314.40" width="291.58" height="135.20" fill="white" stroke="black" stroke-width="3"/>
+<circle cx="404.00" cy="382.00" r="155.48" fill="white" stroke="none"/>
+<circle cx="664.00" cy="226.00" r="148.20" fill="white" stroke="none"/>
+<rect x="-12.00" y="314.40" width="291.58" height="135.20" fill="white" stroke="none"/>
+<rect x="40" y="70" width="780" height="468" fill="none" stroke="#888" stroke-width="1"/>
+<ellipse cx="534.00" cy="304.00" rx="151.84" ry="8.45" transform="rotate(-30.964 534.00 304.00)" fill="#ff9800" fill-opacity="0.25" stroke="#e65100" stroke-width="1.2" stroke-dasharray="5,3"/>
+<circle cx="664.00" cy="226.00" r="184.60" fill="none" stroke="#1565c0" stroke-width="1.5" stroke-dasharray="2,4"/>
+</g>
+<circle cx="40.00" cy="538.00" r="2.3" fill="#777"/>
+<circle cx="40.00" cy="486.00" r="2.3" fill="#777"/>
+<circle cx="40.00" cy="434.00" r="5.5" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="40.00" cy="382.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="40.00" cy="330.00" r="5.5" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="40.00" cy="278.00" r="2.3" fill="#777"/>
+<circle cx="40.00" cy="226.00" r="2.3" fill="#777"/>
+<circle cx="40.00" cy="174.00" r="2.3" fill="#777"/>
+<circle cx="40.00" cy="122.00" r="2.3" fill="#777"/>
+<circle cx="40.00" cy="70.00" r="2.3" fill="#777"/>
+<circle cx="92.00" cy="538.00" r="2.3" fill="#777"/>
+<circle cx="92.00" cy="486.00" r="2.3" fill="#777"/>
+<circle cx="92.00" cy="434.00" r="5.5" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="92.00" cy="382.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="92.00" cy="330.00" r="5.5" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="92.00" cy="278.00" r="2.3" fill="#777"/>
+<circle cx="92.00" cy="226.00" r="2.3" fill="#777"/>
+<circle cx="92.00" cy="174.00" r="2.3" fill="#777"/>
+<circle cx="92.00" cy="122.00" r="2.3" fill="#777"/>
+<circle cx="92.00" cy="70.00" r="2.3" fill="#777"/>
+<circle cx="144.00" cy="538.00" r="2.3" fill="#777"/>
+<circle cx="144.00" cy="486.00" r="2.3" fill="#777"/>
+<circle cx="144.00" cy="434.00" r="5.5" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="144.00" cy="382.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="144.00" cy="330.00" r="5.5" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="144.00" cy="278.00" r="2.3" fill="#777"/>
+<circle cx="144.00" cy="226.00" r="2.3" fill="#777"/>
+<circle cx="144.00" cy="174.00" r="2.3" fill="#777"/>
+<circle cx="144.00" cy="122.00" r="2.3" fill="#777"/>
+<circle cx="144.00" cy="70.00" r="2.3" fill="#777"/>
+<circle cx="196.00" cy="538.00" r="2.3" fill="#777"/>
+<circle cx="196.00" cy="486.00" r="2.3" fill="#777"/>
+<circle cx="196.00" cy="434.00" r="5.5" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="196.00" cy="382.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="196.00" cy="330.00" r="5.5" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="196.00" cy="278.00" r="2.3" fill="#777"/>
+<circle cx="196.00" cy="226.00" r="2.3" fill="#777"/>
+<circle cx="196.00" cy="174.00" r="2.3" fill="#777"/>
+<circle cx="196.00" cy="122.00" r="2.3" fill="#777"/>
+<circle cx="196.00" cy="70.00" r="2.3" fill="#777"/>
+<circle cx="248.00" cy="538.00" r="2.3" fill="#777"/>
+<circle cx="248.00" cy="486.00" r="2.3" fill="#777"/>
+<circle cx="248.00" cy="434.00" r="5.5" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="248.00" cy="382.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="248.00" cy="330.00" r="5.5" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="248.00" cy="278.00" r="2.3" fill="#777"/>
+<circle cx="248.00" cy="226.00" r="2.3" fill="#777"/>
+<circle cx="248.00" cy="174.00" r="2.3" fill="#777"/>
+<circle cx="248.00" cy="122.00" r="2.3" fill="#777"/>
+<circle cx="248.00" cy="70.00" r="2.3" fill="#777"/>
+<circle cx="300.00" cy="538.00" r="2.3" fill="#777"/>
+<circle cx="300.00" cy="486.00" r="5.5" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="300.00" cy="434.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="300.00" cy="382.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="300.00" cy="330.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="300.00" cy="278.00" r="5.5" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="300.00" cy="226.00" r="2.3" fill="#777"/>
+<circle cx="300.00" cy="174.00" r="2.3" fill="#777"/>
+<circle cx="300.00" cy="122.00" r="2.3" fill="#777"/>
+<circle cx="300.00" cy="70.00" r="2.3" fill="#777"/>
+<circle cx="352.00" cy="538.00" r="2.3" fill="#777"/>
+<circle cx="352.00" cy="486.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="352.00" cy="434.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="352.00" cy="382.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="352.00" cy="330.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="352.00" cy="278.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="352.00" cy="226.00" r="2.3" fill="#777"/>
+<circle cx="352.00" cy="174.00" r="2.3" fill="#777"/>
+<circle cx="352.00" cy="122.00" r="2.3" fill="#777"/>
+<circle cx="352.00" cy="70.00" r="2.3" fill="#777"/>
+<circle cx="404.00" cy="538.00" r="2.3" fill="#777"/>
+<circle cx="404.00" cy="486.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="404.00" cy="434.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="404.00" cy="382.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="404.00" cy="330.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="404.00" cy="278.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="404.00" cy="226.00" r="2.3" fill="#777"/>
+<circle cx="404.00" cy="174.00" r="2.3" fill="#777"/>
+<circle cx="404.00" cy="122.00" r="2.3" fill="#777"/>
+<circle cx="404.00" cy="70.00" r="2.3" fill="#777"/>
+<circle cx="456.00" cy="538.00" r="2.3" fill="#777"/>
+<circle cx="456.00" cy="486.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="456.00" cy="434.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="456.00" cy="382.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="456.00" cy="330.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="456.00" cy="278.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="456.00" cy="226.00" r="2.3" fill="#777"/>
+<circle cx="456.00" cy="174.00" r="2.3" fill="#777"/>
+<circle cx="456.00" cy="122.00" r="2.3" fill="#777"/>
+<circle cx="456.00" cy="70.00" r="2.3" fill="#777"/>
+<circle cx="508.00" cy="538.00" r="2.3" fill="#777"/>
+<circle cx="508.00" cy="486.00" r="5.5" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="508.00" cy="434.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="508.00" cy="382.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="508.00" cy="330.00" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<circle cx="508.00" cy="278.00" r="5.5" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<circle cx="508.00" cy="226.00" r="2.3" fill="#777"/>
+<circle cx="508.00" cy="174.00" r="2.3" fill="#777"/>
+<circle cx="508.00" cy="122.00" r="2.3" fill="#777"/>
+<circle cx="508.00" cy="70.00" r="2.3" fill="#777"/>
+<circle cx="560.00" cy="538.00" r="2.3" fill="#777"/>
+<circle cx="560.00" cy="486.00" r="2.3" fill="#777"/>
+<circle cx="560.00" cy="434.00" r="2.3" fill="#777"/>
+<circle cx="560.00" cy="382.00" r="2.3" fill="#777"/>
+<circle cx="560.00" cy="330.00" r="5.5" fill="white" stroke="#d32f2f" stroke-width="2"/>
+<circle cx="560.00" cy="278.00" r="5.5" fill="white" stroke="#d32f2f" stroke-width="2"/>
+<circle cx="560.00" cy="226.00" r="5.5" fill="white" stroke="#d32f2f" stroke-width="2"/>
+<circle cx="560.00" cy="174.00" r="5.5" fill="white" stroke="#d32f2f" stroke-width="2"/>
+<circle cx="560.00" cy="122.00" r="5.5" fill="white" stroke="#d32f2f" stroke-width="2"/>
+<circle cx="560.00" cy="70.00" r="2.3" fill="#777"/>
+<circle cx="612.00" cy="538.00" r="2.3" fill="#777"/>
+<circle cx="612.00" cy="486.00" r="2.3" fill="#777"/>
+<circle cx="612.00" cy="434.00" r="2.3" fill="#777"/>
+<circle cx="612.00" cy="382.00" r="2.3" fill="#777"/>
+<circle cx="612.00" cy="330.00" r="5.5" fill="white" stroke="#d32f2f" stroke-width="2"/>
+<circle cx="612.00" cy="278.00" r="5.5" fill="white" stroke="#d32f2f" stroke-width="2"/>
+<circle cx="612.00" cy="226.00" r="5.5" fill="white" stroke="#d32f2f" stroke-width="2"/>
+<circle cx="612.00" cy="174.00" r="5.5" fill="white" stroke="#d32f2f" stroke-width="2"/>
+<circle cx="612.00" cy="122.00" r="5.5" fill="white" stroke="#d32f2f" stroke-width="2"/>
+<circle cx="612.00" cy="70.00" r="2.3" fill="#777"/>
+<circle cx="664.00" cy="538.00" r="2.3" fill="#777"/>
+<circle cx="664.00" cy="486.00" r="2.3" fill="#777"/>
+<circle cx="664.00" cy="434.00" r="2.3" fill="#777"/>
+<circle cx="664.00" cy="382.00" r="2.3" fill="#777"/>
+<circle cx="664.00" cy="330.00" r="5.5" fill="white" stroke="#d32f2f" stroke-width="2"/>
+<circle cx="664.00" cy="278.00" r="5.5" fill="white" stroke="#d32f2f" stroke-width="2"/>
+<circle cx="664.00" cy="226.00" r="7" fill="#d32f2f" stroke="black" stroke-width="1.2"/>
+<circle cx="664.00" cy="174.00" r="5.5" fill="white" stroke="#d32f2f" stroke-width="2"/>
+<circle cx="664.00" cy="122.00" r="5.5" fill="white" stroke="#d32f2f" stroke-width="2"/>
+<circle cx="664.00" cy="70.00" r="2.3" fill="#777"/>
+<circle cx="716.00" cy="538.00" r="2.3" fill="#777"/>
+<circle cx="716.00" cy="486.00" r="2.3" fill="#777"/>
+<circle cx="716.00" cy="434.00" r="2.3" fill="#777"/>
+<circle cx="716.00" cy="382.00" r="2.3" fill="#777"/>
+<circle cx="716.00" cy="330.00" r="5.5" fill="white" stroke="#d32f2f" stroke-width="2"/>
+<circle cx="716.00" cy="278.00" r="5.5" fill="white" stroke="#d32f2f" stroke-width="2"/>
+<circle cx="716.00" cy="226.00" r="5.5" fill="white" stroke="#d32f2f" stroke-width="2"/>
+<circle cx="716.00" cy="174.00" r="5.5" fill="white" stroke="#d32f2f" stroke-width="2"/>
+<circle cx="716.00" cy="122.00" r="5.5" fill="white" stroke="#d32f2f" stroke-width="2"/>
+<circle cx="716.00" cy="70.00" r="2.3" fill="#777"/>
+<circle cx="768.00" cy="538.00" r="2.3" fill="#777"/>
+<circle cx="768.00" cy="486.00" r="2.3" fill="#777"/>
+<circle cx="768.00" cy="434.00" r="2.3" fill="#777"/>
+<circle cx="768.00" cy="382.00" r="2.3" fill="#777"/>
+<circle cx="768.00" cy="330.00" r="5.5" fill="white" stroke="#d32f2f" stroke-width="2"/>
+<circle cx="768.00" cy="278.00" r="5.5" fill="white" stroke="#d32f2f" stroke-width="2"/>
+<circle cx="768.00" cy="226.00" r="5.5" fill="white" stroke="#d32f2f" stroke-width="2"/>
+<circle cx="768.00" cy="174.00" r="5.5" fill="white" stroke="#d32f2f" stroke-width="2"/>
+<circle cx="768.00" cy="122.00" r="5.5" fill="white" stroke="#d32f2f" stroke-width="2"/>
+<circle cx="768.00" cy="70.00" r="2.3" fill="#777"/>
+<circle cx="820.00" cy="538.00" r="2.3" fill="#777"/>
+<circle cx="820.00" cy="486.00" r="2.3" fill="#777"/>
+<circle cx="820.00" cy="434.00" r="2.3" fill="#777"/>
+<circle cx="820.00" cy="382.00" r="2.3" fill="#777"/>
+<circle cx="820.00" cy="330.00" r="2.3" fill="#777"/>
+<circle cx="820.00" cy="278.00" r="2.3" fill="#777"/>
+<circle cx="820.00" cy="226.00" r="2.3" fill="#777"/>
+<circle cx="820.00" cy="174.00" r="2.3" fill="#777"/>
+<circle cx="820.00" cy="122.00" r="2.3" fill="#777"/>
+<circle cx="820.00" cy="70.00" r="2.3" fill="#777"/>
+<line x1="410.86" y1="377.88" x2="656.28" y2="230.63" stroke="#6a1b9a" stroke-width="2" marker-end="url(#ar)"/>
+<text x="388.0" y="374.0" font-size="15" fill="black" text-anchor="start" font-weight="bold">n</text>
+<text x="376.0" y="404.0" font-size="12" fill="black" text-anchor="start" font-weight="normal">udf = 2.99</text>
+<text x="675.0" y="217.0" font-size="15" fill="black" text-anchor="start" font-weight="bold">q</text>
+<text x="692.0" y="217.0" font-size="12" fill="black" text-anchor="start" font-weight="normal">udf = 2.85</text>
+<text x="414.4" y="257.2" font-size="13" fill="#6a1b9a" text-anchor="middle" font-weight="bold">|w| = √34 ≈ 5.83</text>
+<text x="326.0" y="462.6" font-size="12" fill="#333" text-anchor="middle" font-weight="normal">B(n, 2.99)</text>
+<text x="664.0" y="98.6" font-size="12" fill="#333" text-anchor="middle" font-weight="normal">pocket B(q, 2.85)</text>
+<text x="393.6" y="153.2" font-size="11" fill="#1565c0" text-anchor="middle" font-weight="normal">W + D disk around q</text>
+<text x="46.0" y="359.8" font-size="12" fill="#333" text-anchor="start" font-weight="normal">to the outside (seeds)</text>
+<text x="170.0" y="506.8" font-size="13" fill="#555" text-anchor="middle" font-weight="normal">solid (inside)</text>
+<text x="632.8" y="506.8" font-size="13" fill="#555" text-anchor="middle" font-weight="normal">solid (inside)</text>
+<circle cx="537.1" cy="302.1" r="11" fill="none" stroke="#333" stroke-width="1.2"/>
+<defs><clipPath id="zoom"><rect x="860" y="70" width="280" height="280"/></clipPath></defs>
+<line x1="545.1" y1="310.1" x2="860.0" y2="350.0" stroke="#333" stroke-width="1" stroke-dasharray="3,3"/>
+<g clip-path="url(#zoom)">
+<rect x="860" y="70" width="280" height="280" fill="#cfcfcf"/>
+<circle cx="104.0" cy="747.6" r="1046.5" fill="white" stroke="black" stroke-width="3"/>
+<circle cx="1854.0" cy="-302.4" r="997.5" fill="white" stroke="black" stroke-width="3"/>
+<circle cx="104.0" cy="747.6" r="1046.5" fill="white" stroke="none"/>
+<circle cx="1854.0" cy="-302.4" r="997.5" fill="white" stroke="none"/>
+<ellipse cx="979.0" cy="222.6" rx="1022.0" ry="56.9" transform="rotate(-30.964 979.0 222.6)" fill="#ff9800" fill-opacity="0.25" stroke="#e65100" stroke-width="1.2" stroke-dasharray="5,3"/>
+<line x1="970.7" y1="161.2" x2="1029.3" y2="258.8" stroke="#d32f2f" stroke-width="2.5"/>
+<line x1="964.0" y1="231.6" x2="1036.0" y2="188.4" stroke="#6a1b9a" stroke-width="2" marker-end="url(#ar)"/>
+</g>
+<rect x="860" y="70" width="280" height="280" fill="none" stroke="#333" stroke-width="1.2"/>
+<text x="860" y="370" font-size="12" fill="#222">Zoom ×6.7 on the window (square is 0.80 voxel wide).</text>
+<text x="860" y="387" font-size="12" fill="#222">Window (red) 0.32 voxel wide; lens 0.009 voxel thick.</text>
+<text x="860" y="404" font-size="12" fill="#222">Orange: ellipse E, here only 0.32 voxel</text>
+<text x="860" y="421" font-size="12" fill="#222">across and free of lattice points.</text>
+<circle cx="50" cy="564" r="5.5" fill="#2e7d32" stroke="black" stroke-width="0.8"/>
+<text x="66" y="568" font-size="13">certified, non-barrier (udf ≥ 0.55): the 4-connected seed component</text>
+<circle cx="50" cy="586" r="5.5" fill="#81c784" stroke="black" stroke-width="0.8"/>
+<text x="66" y="590" font-size="13">certified by the sweep, barrier (udf &lt; 0.55)</text>
+<circle cx="50" cy="608" r="5.5" fill="white" stroke="#d32f2f" stroke-width="2"/>
+<text x="66" y="612" font-size="13">truly outside, NOT certified at the fixpoint of any stencil shorter than |w|² = 34 (the pocket)</text>
+<circle cx="50" cy="630" r="7" fill="#d32f2f" stroke="black" stroke-width="1.2"/>
+<text x="66" y="634" font-size="13">q: the only pocket point any certified ball overlaps</text>
+<circle cx="50" cy="652" r="2.3" fill="#777"/>
+<text x="66" y="656" font-size="13">lattice point inside the solid</text>
+<text x="40" y="696" font-size="12.5" fill="#222">Fixpoint, stencil |w| &lt; W + D (|w|² ≤ 10, the 2D analogue of the 146-tap stencil), or any stencil up to |w|² ≤ 32: 40/65 certified after 2 sweeps;</text>
+<text x="40" y="715" font-size="12.5" fill="#222">none of the 25 pocket points, a whole non-barrier component, is ever entered. With |w|² ≥ 34: n certifies q (2.99+2.85 = 5.84 &gt; 5.831), then the pocket floods (65/65).</text>
+<text x="40" y="734" font-size="12.5" fill="#222">Why nothing shorter works: (n, q) is the only ball pair that overlaps through the window. Any lattice x in E = {|x-n|+|x-q| &lt; 5.84} would bridge</text>
+<text x="40" y="753" font-size="12.5" fill="#222">n→x→q with shorter hops, but E holds no lattice point other than n and q (that needs udf(n)+udf(q) &gt; 5.8416, via (2,1) or (3,2)).</text>
+<text x="40" y="772" font-size="12.5" fill="#222">Why the W + D bound does not apply: it assumes every exterior non-barrier point is certified before the sweep; the pocket's are not, and promotion cannot help</text>
+<text x="40" y="791" font-size="12.5" fill="#222">before one of them is certified. The price: the pocket hangs on a 0.32-voxel window, a sub-voxel neck.</text>
+</svg>

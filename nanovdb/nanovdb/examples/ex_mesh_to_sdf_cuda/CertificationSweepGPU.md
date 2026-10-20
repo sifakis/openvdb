@@ -15,8 +15,13 @@
 - **Seeds:** the 6-connected component of non-barrier voxels (`udf ≥ D`, with `D = 0.55`)
   containing the voxel with the smallest coordinate along some axis. Barrier voxels and
   non-barrier components matter only here; the certification itself treats every active voxel
-  alike. (Reusing the seeding labels to promote whole components is an optional acceleration, still
-  unresolved: section 10.)
+  alike. (Reusing the seeding labels to promote whole components is an acceleration: not in
+  version 1, planned for later; section 10.)
+- **Two independent options.** `pedantic` changes *which* voxels end up certified: off, the sweep
+  uses the `W + D` stencil only; on, it alternates the sweep with a `2W` shell pass until neither
+  adds anything, which yields exactly the reachability set of the ball method (section 9).
+  `promote` changes only *how fast* the fixpoint is reached (section 10). Pedantic mode turns
+  promotion on by default.
 - **Rule:** certify `q` from a certified `n = q + w` iff `r_n + r_q > |w| + τ`, where `r = udf`
   (voxel units) and `τ` is the overlap tolerance.
 - **Outside-only.** Certification only ever adds voxels, so the result is the set reachable from the
@@ -50,6 +55,10 @@ with that `H` can use. Residency assumes about 100 KB of shared memory and 48 wa
 every row up to `H = 5` keeps all 48 warp slots busy. Compile `H ∈ {3, 4, 5, 8}` and choose at runtime the smallest that covers
 `W + D`. `H = 3` covers the default; `H = 8` is a slow catch-all.
 
+**Shell stencil (pedantic mode only).** Primitive `w` with `W + D ≤ |w| < 2W`: 624 taps at `W = 3`.
+It needs the box with `2W ≤ √((H + 1)² + 1)`, so `H = 5` at `W = 3`; the cap `H ≤ 8` allows
+`W ≤ 4.53`. Beyond that the shell is clipped and pedantic mode is no longer exact (still sound).
+
 The isovalue (deferred) will interact with this choice: with an offset the radius becomes
 `|udf - iso|`, inside radii can exceed `W`, and the needed reach grows.
 
@@ -74,7 +83,7 @@ The isovalue (deferred) will interact with this choice: with an offset the radiu
 | certified | leaf | `Mask<3>` (512 bits) | the owning CTA only |
 | state | leaf | `uint32_t`: bit 0 dirty, bit 1 has candidates; double-buffered | dirty: any CTA (push); candidates: owner |
 | neighbours | leaf | `uint32_t[27]`, leaf indices, `UINT32_MAX` if absent | setup kernel |
-| components | active slot | label, plus `rootOutside[N]` | promotion pass (only if adopted; section 10) |
+| components | active slot | label, plus `rootOutside[N]` | promotion pass (planned, not in v1; section 10) |
 
 - **Why not keep the flag in the UDF's sign bit:** it would halve gather loads, but the UDF would no
   longer be read-only (re-runs and other consumers see a mutated buffer), and the output would be
@@ -203,6 +212,22 @@ The isovalue (deferred) will interact with this choice: with an offset the radiu
 - Keep a mode that ignores dirty flags and processes every leaf with candidates every round; all
   modes must agree.
 
+**Pedantic mode: the shell pass (in version 1).** After the `W + D` sweep reaches its fixpoint, run
+one pass of the same kernel with the shell stencil (section 2) and `H = 5` at `W = 3`, over leaves
+with uncertified non-barrier voxels:
+- *candidates:* uncertified non-barrier voxels only (a hop of `|w| ≥ W + D` needs
+  `r_n + r_q > W + D`, so both ends have `r > D`);
+- *taps:* the shell, sorted by `|w|`, cut at `|w| < r_q + W`; first success wins as usual;
+- *then:* if it certified anything, push dirty flags and resume the `W + D` rounds; repeat until a
+  shell pass certifies nothing.
+
+Usually the first shell pass finds nothing, so pedantic mode costs one pass. That pass is
+expensive: its candidates are mostly interior non-barrier voxels (roughly 40% of the band), which
+never succeed and so scan their whole prefix, up to 624 taps against 146. Expect a few rounds'
+worth of work. It goes into version 1 because it is the same kernel with another tap table and a
+candidate filter, and because it is the GPU reference for the default stencil (S2 in
+`NewDistancingApproach.md`).
+
 **Later, in order:**
 1. **A fixed grid looping over every leaf** (about SM count × occupancy CTAs, each striding over
    leaf indices and skipping clean ones). A CTA reserves its shared memory at launch even if it exits
@@ -215,9 +240,11 @@ The isovalue (deferred) will interact with this choice: with an offset the radiu
 3. **A compacted leaf list** (`cub::DeviceSelect::Flagged`), only if profiling at scale (millions of
    leaves, many rounds) shows the flag scan matters.
 
-## 10. Unresolved (#4): component promotion, and how many non-barrier pieces to expect
+## 10. Component promotion (#4): not in version 1, a planned optimization
 
-*Status: discussed, not settled; to revisit.*
+*Status: decided for version 1 (leave it out); to be added once the plain sweep is validated, as
+the `promote` option (on by default in pedantic mode; the default otherwise to be set by S5). It is
+expected to matter on meshes with slots and enclosed pockets, so it should not be dropped.*
 
 **What promotion is.** Seeding runs `ConnectedComponents` on the non-barrier voxels (`udf ≥ D`) of
 the surface's grid and keeps the piece containing the extreme voxel. That pass labels every
@@ -225,36 +252,51 @@ non-barrier piece, and each piece is provably entirely inside or entirely outsid
 step between non-barrier voxels cannot cross `Σ`). Promotion reuses the labels: once the sweep
 certifies any voxel of a piece, certify the whole piece.
 
-**It is optional.** The certification itself has no barrier voxels and no components: every active
-voxel is a candidate, and face neighbours in one piece already pass the ball test
-(`udf(a) + udf(b) > 1.1 > 1`). So promotion never changes the result or the reach analysis; it only
-saves rounds. Without it, certification crosses a large piece about one leaf per round (a pocket
-spreading 500 voxels along the surface takes about 60 rounds); with it, one.
+**What it can change: only the number of rounds.** The certification itself has no barrier voxels
+and no components: every active voxel is a candidate, and face neighbours in one piece already pass
+the ball test (`udf(a) + udf(b) ≥ 2D = 1.1 > 1 + τ`). So once the sweep certifies one voxel of a
+piece, it certifies the whole piece by itself, and promotion never changes the fixpoint or the reach
+analysis. Equivalently: remove the barrier voxels from the final certified set `C`, and what remains
+is a union of *whole* non-barrier pieces, the seed piece plus any others `C` entered. Promotion
+helps only when there are others.
 
-**A possible shape, if adopted.** Seeding becomes the first promotion: clear `rootOutside[N]`, mark
-the extreme voxel's label, run the inherit pass. Then: sweep round, during which the owning CTA
-marks `rootOutside[label]` for each newly certified non-barrier voxel (`atomicExch` on a `uint32_t`
-to detect new labels) → if a new label appeared, inherit pass over leaves with uncertified
-non-barrier voxels (certify, push dirty flags) → repeat until neither changes anything. Labels come
-from `ConnectedComponents` on the pruned grid at the same `D` as the barrier test (dense ids, so
-`find()` is a plain lookup). Promotion on and off must give identical certified sets (add to S3).
+- *One piece (the common case):* `C` is the seed piece plus the barrier shell next to it, and the
+  sweep should need only a few rounds (to be measured, S5).
+- *More pieces:* each extra piece is flooded at about one leaf per round, since a CTA writes only its
+  own leaf and sees its neighbours' results a round later. A pocket whose band runs 500 voxels along
+  the surface takes about 60 extra rounds; a long slot through a large model, hundreds. With
+  promotion, each extra piece costs the round that enters it plus one promotion step.
 
-**Current lean:** leave it out of version 1, so the sweep is exactly the method as stated, and use
-experiment S1 to count rounds on pocket-heavy meshes before deciding.
+**Where extra pieces come from: narrow passages, only.** `C` never leaves the seed's side of `Σ`, so
+an extra piece is always part of the one true exterior, cut off from the seed piece after the
+barrier voxels are removed. That happens at a passage too thin to hold a 6-connected chain of voxels
+all at least `D` from `Σ`: a gap of about `2D` plus up to about a voxel of slack depending on
+orientation (diagonal passages are cut sooner). Typical shapes: the air pocket between two lobes of a
+mesh that nearly touch at two necks, the inside of a bottle, the region behind a slot between parts.
+The sweep enters such a piece through barrier voxels in the neck (lattice points there have
+`udf ≈ g/2` for a gap `g`, so a gap of about a voxel suffices), or by one longer hop across a short
+pinch. Behind a sub-voxel neck the entering hop can be as long as `2W`, beyond the default stencil
+(figure `pocket_entry_failure_2d.svg` in `NewDistancingApproach.md`): the default mode then leaves
+the pocket uncertified, labelled inside, and pedantic mode (section 9) certifies it. Promotion does
+not change which pockets are entered, only how fast an entered one fills.
 
-**Open sub-question: how many non-barrier pieces, and what they are.** For one closed connected
-surface there is exactly one outside region in the continuum, but after removing the barrier voxels
-it can split into several pieces:
-- *Narrow necks.* A passage narrower than about `2D` is all barrier, so a bottle's inner air, or the
-  region behind a slot between parts of one mesh, becomes a separate outside piece. On the lattice,
-  6-connectivity also cuts somewhat wider (especially diagonal) necks. These pockets are what the
-  ball sweep exists to reach.
-- *Several surfaces in one UDF component.* A UDF component is one connected band, not one closed
-  surface: surfaces closer than about `2W` share a band. A thin-walled hollow sphere modelled as an
-  outer and an inner surface has a third region, the cavity, whose band is its own piece. Nothing
-  can certify it (it is not connected to the outside), so it ends up "inside". Whether that is right
-  depends on what the mesh means (a solid with a void, or nested objects): the within-cluster
-  nesting question, not yet addressed by the sweep or anything else in the pipeline.
+A sealed cavity (two lobes that actually touch, or a hollow shell modelled as two surfaces) is a
+different region of the complement of `Σ`; `C` never reaches it, with or without promotion. That
+belongs to the nesting question in section 13, not here.
+
+**Cost of promotion.** It keeps the per-voxel labels from seeding alive, adds a pass that flags the
+pieces holding a certified voxel and a pass that certifies their voxels, and must repeat (a promoted
+pocket may have necks into further pockets). Against that, the rounds it saves are cheap ones:
+with dirty-leaf early exit a round does real work only on the frontier, so the saving is mostly
+launch and termination-check overhead, which the later items of section 9 also reduce.
+
+**A possible shape.** Seeding becomes the first promotion: clear `rootOutside[N]`, mark the extreme
+voxel's label, run the inherit pass. Then: sweep round, during which the owning CTA marks
+`rootOutside[label]` for each newly certified non-barrier voxel (`atomicExch` on a `uint32_t` to
+detect new labels) → if a new label appeared, inherit pass over leaves with uncertified non-barrier
+voxels (certify, push dirty flags) → repeat until neither changes anything. Labels come from
+`ConnectedComponents` on the pruned grid at the same `D` as the barrier test (dense ids, so `find()`
+is a plain lookup). Promotion on and off must give identical certified sets (S3).
 
 ## 11. Scope: one surface at a time
 
@@ -286,22 +328,55 @@ round (an estimate to confirm by profiling).
 
 ## 13. Unresolved questions (to revisit)
 
-Items 1–3 of the review are settled above: scope (section 11), rounds and termination (section 9),
-and the tolerance (`NewDistancingApproach.md`). Items 4–6 are open.
+Items 1–5 of the review are settled: scope (section 11), rounds and termination (section 9),
+the tolerance (`NewDistancingApproach.md`), promotion and pocket entry (sections 9 and 10), and
+validation (below). Items 4b and 6 are open.
 
-**#4 — Component promotion and non-barrier pieces.** See section 10: whether promotion goes into
-version 1, and what to do with pieces that are neither the outside nor solid (cavities when one UDF
-component holds several surfaces).
+**#4 — Component promotion and pocket entry: settled** (sections 9 and 10). Promotion is left out
+of version 1 and planned as the `promote` option afterwards, sized by S5. Pockets whose entry needs
+a hop beyond `W + D` (sub-voxel necks) are recovered by the `pedantic` option's shell pass, which is
+in version 1.
 
-**#5 — Validation strategy.** Queued so far: T1–T3 (tolerance) and S1–S4 (sweep) in
-`NewDistancingApproach.md`. Points raised but not settled:
-- the Python scripts in `scripts/distancing_experiments/` (bubbles, planes, wedges) as the CPU
-  reference, which the GPU sweep must match exactly;
-- equivalence between modes (one pass per launch, local fixpoint, dirty-leaf skipping, promotion on
-  and off);
-- soundness against winding numbers on closed meshes;
-- restoring a diagnostic count (certifications per round, undecided barrier voxels at the end),
-  since today's contradiction tally is gone.
+**#4b — Sealed cavities (within-cluster nesting), open.** A UDF component is one connected band, not
+one closed surface: surfaces closer than about `2W` share a band. A thin-walled hollow sphere
+modelled as an outer and an inner surface, or two lobes that touch and enclose an air pocket, has a
+region that is not connected to the outside, so nothing certifies it and it ends up "inside". Whether
+that is right depends on what the mesh means (a solid with a void, or nested objects, where a
+winding number of 0 says outside). Not yet addressed by the sweep or anything else in the pipeline.
+
+**#5 — Validation: settled, deliberately frugal.** Two layers, plus the experiments T1–T3 and
+S1–S5 in `NewDistancingApproach.md`.
+
+*Unit test (`TestNanoVDB.cu`), minimal:* one sphere with an analytic UDF,
+`udf = ||x - c| - R|` in float (no mesh, so distance error is float rounding, far below `τ`, and
+inside/outside is exact), `R` about 20–30 voxels, centre at a non-lattice offset such as
+`(0.37, 0.21, 0.64)`, `W = 3`. Assert:
+- *completeness:* every outside voxel with `udf > 0.1` voxel is certified. Convexity makes the
+  overlap test at least as easy as for the tangent plane (`udf_sphere(V) ≥ dist(V, H)`), but the
+  same curvature can push a deep planar witness just out of the band (about `6ε/R`, roughly 0.01
+  voxel at `R = 20`), and `τ` costs `τ/2`; hence the margin over the planar gap of 0.0384. On
+  failure, print the smallest uncertified outside `udf`;
+- *soundness:* no inside voxel is certified;
+- *modes agree:* default and pedantic give identical sets (a sphere has no pockets).
+
+*Example (`mesh_to_sdf_cuda`):* retune the existing OpenVDB `meshToLevelSet` sign cross-check
+(`mesh_to_sdf_cuda_kernels.cu`, under `NANOVDB_USE_OPENVDB`) to report and characterise mismatches
+rather than fail. OpenVDB is a reference with its own sign method, not ground truth.
+- Classify by direction and `udf`: *we inside / OpenVDB outside* is expected below 0.1 (the
+  certification gap), unexpected between 0.1 and `D` on smooth surfaces, and at `udf ≥ D` means a
+  pocket not entered or a bubble; *we outside / OpenVDB inside* is the only class that could mean
+  unsoundness, so each case is examined (with the existing `CC_EXPORT_VIS` viewer export).
+- Report 6-connected clusters of mismatches (count, size, `udf` range) rather than voxels, and for
+  `udf ≥ D` clusters whether pedantic mode recovers them.
+- Behind an environment flag, rerun with `maxLocalIters = 1`, without dirty-leaf skipping, and in
+  pedantic mode, and report differences in the certified set (the first two must be none).
+- Counters: rounds, shell passes, non-seed components entered, near misses
+  (`|r_n + r_q - |w|| ≤ τ`).
+
+*Dropped:* an exact-match CPU reference (what it alone would catch, a bug shared by every GPU mode
+such as a wrong tap table or a halo gather error, would also show up as unexplained OpenVDB
+mismatch clusters or in the sphere test; add it if a cluster cannot be explained), and winding
+numbers (OpenVDB stands in).
 
 **#6 — Follow-ons that share this infrastructure.**
 - *Inside magnitudes:* keep the input UDF, or recompute distances to `∂O` (Step 3 of

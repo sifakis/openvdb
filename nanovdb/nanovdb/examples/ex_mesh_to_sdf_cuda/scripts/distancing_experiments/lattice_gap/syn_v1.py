@@ -43,7 +43,7 @@ alpha = D(180)/D(str(math.pi)) # placeholder
 # high-prec atan2 via arctan series on sn/cs
 def arctan(z, terms=400):
     # z small enough? z ~ 0.2854 -> series converges ok at prec 70 (0.2854^k)
-    s = D(0); zp = z; 
+    s = D(0); zp = z;
     for k in range(0, terms):
         s += (D(-1)**k) * zp/(2*k+1)
         zp *= z*z

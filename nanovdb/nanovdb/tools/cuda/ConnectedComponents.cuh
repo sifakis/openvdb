@@ -21,19 +21,21 @@
 
 #include <nanovdb/NanoVDB.h>
 #include <nanovdb/GridHandle.h>
-#include <nanovdb/cuda/DeviceBuffer.h>
+#include <nanovdb/cuda/Buffer.h>
+#include <nanovdb/cuda/DeviceResource.h>
 #include <nanovdb/cuda/TempPool.h>
 #include <nanovdb/util/cuda/DeviceGridTraits.cuh>
 #include <nanovdb/util/cuda/Timer.h>
-#include <vector>
 #include <nanovdb/util/cuda/Util.h> // for operatorKernel
 
 #include <cub/cub.cuh>
 
-#include <utility>  // std::pair
+#include <utility>      // std::pair
+#include <limits>       // std::numeric_limits
+#include <stdexcept>    // std::runtime_error
+#include <type_traits>  // std::is_unsigned
 
-// Define utility macro used to call CUB functions that use dynamic temporary storage.
-// Uses mTempDevicePool (a TempDevicePool member) and mStream from the enclosing class.
+// Define utility macro used to call cub functions that use dynamic temporary storage
 #ifndef CALL_CUBS
 #ifdef _WIN32
 #define CALL_CUBS(func, ...) \
@@ -52,89 +54,94 @@ namespace nanovdb {
 
 namespace tools::cuda {
 
-/// @brief Index of each of the 6 leaf faces into a component's face-mask array. Each face is a
-///        uint64_t bitmask over the 8x8 boundary plane; cross-leaf adjacency is one AND of the
-///        touching faces (faceMasks[I][plusX] & faceMasks[J][minusX]). Bit index per axis:
-///          ±X: y*8+z    ±Y: x*8+z    ±Z: y*8+x
-enum LeafNeighborTap : int {
-    minusX = 0,
-    plusX  = 1,
-    minusY = 2,
-    plusY  = 3,
-    minusZ = 4,
-    plusZ  = 5
-};
-
-/// @brief Undirected edge between two leaf-local components (global slots) touching across a leaf
-///        face, stored canonically with a < b. uint32_t: K <= 256*leafCount stays well below 2^32.
-struct CrossLeafEdge { uint32_t a, b; };
-
-/// @brief Which schedule the per-leaf union-find follows. Both are from Liu & Tarjan, "Simple
-///        Concurrent Connected Components Algorithms" (ACM TOPC 9(2), 2022), which casts this family
-///        of algorithms as a connect step followed by one or more shortcut steps, repeated until no
-///        parent changes.
-enum class LeafSchedule {
-    Parent,    ///< their algorithm P: one hook, one compress per round. Cheapest per round, but no
-               ///< step bound is known -- section 4.2 states they cannot prove even O(lg^2 n), and an
-               ///< earlier published analysis of it was withdrawn as incorrect.
-    Flatten    ///< their algorithm S: one hook, then compress until the forest is flat. More work per
-               ///< round and no warm-up needed, but a proven O(min{d, lg n} lg n) step bound
-               ///< (theorem 4.1), which is a constant for a fixed 8^3 leaf.
-};
-
-template <typename BuildT>
-class ConnectedComponents
+/// @brief Vocabulary shared by ConnectedComponents and the device code implementing it.
+struct ConnectedComponentsBase
 {
+    /// @brief Identifies a connected component. Must accommodate the total number of per-leaf
+    ///        components created across the grid; enforced by MaxComponentCount.
+    using ComponentLabelT = uint32_t;
+    static_assert(std::is_unsigned<ComponentLabelT>::value,
+                  "ComponentLabelT must be unsigned: the background sentinel is its all-ones value");
+
+    /// @brief Undirected edge between two leaf-local components (global slots) touching across a
+    ///        leaf face, stored canonically with a < b.
+    struct CrossLeafEdge { ComponentLabelT a, b; };
+
+    /// @brief Index of each of the 6 leaf faces into a component's face-mask array.
+    enum LeafNeighborTap : int {
+        minusX = 0,
+        plusX  = 1,
+        minusY = 2,
+        plusY  = 3,
+        minusZ = 4,
+        plusZ  = 5
+    };
+
+    /// @brief Maximum number of components, across the whole grid, this operator can label.
+    static constexpr uint64_t MaxComponentCount =
+        uint64_t(std::numeric_limits<ComponentLabelT>::max());
+};// tools::cuda::ConnectedComponentsBase
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+template <typename BuildT, typename ResourceT = nanovdb::cuda::DeviceResource>
+class ConnectedComponents : public ConnectedComponentsBase
+{
+    static_assert(nanovdb::cuda::is_async_resource<ResourceT>::value,
+                  "ConnectedComponents allocates stream-ordered scratch and requires an AsyncResource");
+    static_assert(ResourceT::DEFAULT_ALIGNMENT >= alignof(uint64_t),
+                  "ConnectedComponents stores scratch up to uint64_t width and requires word-aligned allocations");
+
     using GridT = NanoGrid<BuildT>;
     using TreeT = NanoTree<BuildT>;
     using RootT = NanoRoot<BuildT>;
+
+    /// @brief Stream-ordered, device-only scratch storage borrowed from the injected resource.
+    template <typename T>
+    using BufT = nanovdb::cuda::Buffer<T, nanovdb::cuda::ResourceRef<ResourceT>>;
 
 public:
 
     /// @brief Constructor
     /// @param d_srcGrid source device indexGrid whose active voxels are to be labeled
     /// @param stream optional CUDA stream (defaults to CUDA stream 0)
-    ConnectedComponents(const GridT* d_srcGrid, cudaStream_t stream = 0)
-        : mStream(stream), mTimer(stream), mDeviceSrcGrid(d_srcGrid) {}
+    /// @param resource resource instance all device scratch is allocated from;
+    ///        must outlive this operator (defaults to the per-type default resource)
+    ConnectedComponents(const GridT* d_srcGrid, cudaStream_t stream = 0,
+                        ResourceT& resource = nanovdb::cuda::default_resource<ResourceT>())
+        : mStream(stream), mTimer(stream), mDeviceSrcGrid(d_srcGrid)
+        , mResource(&resource)
+        , mTempDevicePool(resource)
+        , mLeafComponentCounts(stream, resource, 0, nanovdb::cuda::noInit)
+        , mLeafComponentOffsets(stream, resource, 0, nanovdb::cuda::noInit)
+        , mLeafComponentMasks(stream, resource, 0, nanovdb::cuda::noInit)
+        , mLeafComponentFaceMasks(stream, resource, 0, nanovdb::cuda::noInit)
+        , mCrossLeafEdgeOffsets(stream, resource, 0, nanovdb::cuda::noInit)
+        , mCrossLeafEdges(stream, resource, 0, nanovdb::cuda::noInit)
+        , mComponentParent(stream, resource, 0, nanovdb::cuda::noInit)
+        , mVoxelLabel(stream, resource, 0, nanovdb::cuda::noInit) {}
 
     /// @brief Toggle on and off verbose mode
     /// @param level Verbose level: 0=quiet, 1=timing, 2=benchmarking
     void setVerbose(int level = 1) { mVerbose = level; }
 
-    /// @brief Record how many SV rounds each leaf needed to converge, for the histogram below.
-    ///        Off by default: it costs one atomic per leaf and an extra device allocation.
-    void setConvergenceDiagnostics(bool on = true) { mConvergenceDiagnostics = on; }
-
-    /// @brief Pick the per-leaf schedule. Both are from Liu & Tarjan, "Simple Concurrent Connected
-    ///        Components Algorithms" (ACM TOPC 9(2), 2022):
-    ///        - LeafSchedule::Parent  their algorithm P, one hook and one compress per round. Cheaper
-    ///          per round, but no step bound is known -- section 4.2 states they cannot prove even
-    ///          O(lg^2 n), and an earlier published analysis of it was withdrawn as incorrect.
-    ///        - LeafSchedule::Flatten their algorithm S, one hook then compress until the forest is
-    ///          flat. More work per round, needs no warm-up, and has a proven O(min{d, lg n} lg n)
-    ///          bound (theorem 4.1) -- a constant for a fixed 8^3 leaf.
-    void setLeafSchedule(LeafSchedule s) { mLeafSchedule = s; }
-
-    /// @brief Rounds-to-convergence histogram over every leaf, valid after
-    ///        getVoxelLabelsAndCount() when setConvergenceDiagnostics() was on. Bin r counts the
-    ///        leaves whose per-leaf SV loop settled after r rounds; the last bin
-    ///        (LeafComponentCountFunctor::MaxConvergenceIters) counts leaves that ran out of
-    ///        rounds without settling, which would mean their labels are wrong.
-    std::vector<uint32_t> convergenceHistogram() const;
-
-    /// @brief Run the connected-components pipeline and return { d_labels, componentCount }:
-    ///          - d_labels: a device array of activeVoxelCount+1 uint32_t, indexed by leaf.getValue(n)
-    ///            (slot 0 = background, sentinel 0xFFFFFFFF). Each active voxel holds its component's
-    ///            dense id in [0, N), so two active voxels share a value iff they are in the same
-    ///            connected component. This is a non-owning view valid for this object's lifetime.
+    /// @brief Run the connected-components pipeline and return { labels, componentCount }:
+    ///          - labels: an owning per-voxel label sidecar. Each active voxel holds its
+    ///            component's dense id in [0, N), so two active voxels share a value iff they are
+    ///            in the same connected component; slot 0, the background, holds the all-ones
+    ///            sentinel. Ownership passes to the caller: the buffer outlives this operator and
+    ///            frees itself on the stream it was allocated on. Only that free needs the
+    ///            resource, which by default has program lifetime.
     ///          - componentCount: the number of connected components N.
-    std::pair<uint32_t*, uint64_t> getVoxelLabelsAndCount()
+    /// @note The returned contents are complete: the stream is synchronized before returning.
+    std::pair<BufT<ComponentLabelT>, ComponentLabelT> getVoxelLabelsAndCount()
     {
         processLeafConnectedComponents();
         processCrossLeafEdges();
         processComponentLabels();
         processVoxelLabels();
-        return { static_cast<uint32_t*>(mVoxelLabel.deviceData()), mGlobalComponentCount };
+        cudaCheck(cudaStreamSynchronize(mStream));
+        return { std::move(mVoxelLabel), mGlobalComponentCount };
     }
 
 private:
@@ -156,187 +163,175 @@ private:
     // Build the per-voxel label sidecar + component count N from the parent array.
     void processVoxelLabels();
 
+    /// @brief Borrowed handle to the injected resource, for the scratch allocated after construction.
+    nanovdb::cuda::ResourceRef<ResourceT> ref() { return nanovdb::cuda::ResourceRef<ResourceT>(*mResource); }
+
     // --- Internal device-array accessors (each valid after the stage that fills it). ---
-    auto deviceLeafComponentCounts()    { return static_cast<uint16_t*>(mLeafComponentCounts.deviceData()); }
-    auto deviceLeafComponentOffsets()   { return static_cast<uint64_t*>(mLeafComponentOffsets.deviceData()); }
-    auto deviceLeafComponentMasks()     { return static_cast<nanovdb::Mask<3>*>(mLeafComponentMasks.deviceData()); }
-    auto deviceLeafComponentFaceMasks() { return reinterpret_cast<uint64_t(*)[6]>(mLeafComponentFaceMasks.deviceData()); }
-    auto deviceCrossLeafEdges()         { return static_cast<CrossLeafEdge*>(mCrossLeafEdges.deviceData()); }
-    auto deviceComponentParent()        { return static_cast<uint64_t*>(mComponentParent.deviceData()); }
+    auto deviceLeafComponentCounts()    { return mLeafComponentCounts.data(); }
+    auto deviceLeafComponentOffsets()   { return mLeafComponentOffsets.data(); }
+    auto deviceLeafComponentMasks()     { return mLeafComponentMasks.data(); }
+    auto deviceLeafComponentFaceMasks() { return mLeafComponentFaceMasks.data(); }
+    auto deviceCrossLeafEdges()         { return mCrossLeafEdges.data(); }
+    auto deviceComponentParent()        { return mComponentParent.data(); }
 
     cudaStream_t                 mStream{0};
     util::cuda::Timer            mTimer;
     int                          mVerbose{0};
-    bool                         mConvergenceDiagnostics{false};
-    LeafSchedule                 mLeafSchedule{LeafSchedule::Parent};
-    nanovdb::cuda::DeviceBuffer  mConvergenceHistogram;   // MaxConvergenceIters+1 × uint32
     const GridT                 *mDeviceSrcGrid;
-    nanovdb::cuda::TempDevicePool mTempDevicePool;
+    ResourceT                   *mResource;                   // non-owning; all device scratch routes through this instance
+    nanovdb::cuda::TempPool<ResourceT> mTempDevicePool;
 
     uint64_t                     mLeafComponentAggregateCount{0}; // total leaf-local components across all leaves (= K = offsets[leafCount])
 
-    nanovdb::cuda::DeviceBuffer  mLeafComponentCounts;      // leafCount                    × uint16_t:      per-leaf component count
-    nanovdb::cuda::DeviceBuffer  mLeafComponentOffsets;     // (leafCount+1)                × uint64_t:      exclusive+inclusive prefix sums
-    nanovdb::cuda::DeviceBuffer  mLeafComponentMasks;       // mLeafComponentAggregateCount × Mask<3>:       per-component active-voxel footprint
-    nanovdb::cuda::DeviceBuffer  mLeafComponentFaceMasks;   // mLeafComponentAggregateCount × uint64_t[6]:   per-component face bitmasks (0=-X,1=+X,2=-Y,3=+Y,4=-Z,5=+Z)
+    // TODO: none of these is released before this operator is destroyed, though two die early:
+    // mLeafComponentFaceMasks after processCrossLeafEdges (48 B per leaf-local component) and
+    // mCrossLeafEdges after processComponentLabels (8 B per edge). Releasing each at its last use
+    // -- a move-assign of an empty buffer, stream-ordered, no host sync -- would cut peak memory.
+    BufT<uint16_t>               mLeafComponentCounts;      // leafCount                    x uint16_t:      per-leaf component count
+    BufT<uint64_t>               mLeafComponentOffsets;     // (leafCount+1)                x uint64_t:      exclusive+inclusive prefix sums
+    BufT<nanovdb::Mask<3>>       mLeafComponentMasks;       // mLeafComponentAggregateCount x Mask<3>:       per-component active-voxel footprint
+    BufT<uint64_t[6]>            mLeafComponentFaceMasks;   // mLeafComponentAggregateCount x uint64_t[6]:   per-component face bitmasks (0=-X,1=+X,2=-Y,3=+Y,4=-Z,5=+Z)
 
     uint64_t                     mCrossLeafEdgeCount{0};    // total cross-leaf edges (E)
-    nanovdb::cuda::DeviceBuffer  mCrossLeafEdgeOffsets;     // (leafCount+1) × uint64_t:  per-leaf edge prefix sums
-    nanovdb::cuda::DeviceBuffer  mCrossLeafEdges;           // E × CrossLeafEdge (a<b)
+    BufT<uint64_t>               mCrossLeafEdgeOffsets;     // (leafCount+1) x uint64_t:  per-leaf edge prefix sums
+    BufT<CrossLeafEdge>          mCrossLeafEdges;           // E x CrossLeafEdge (a<b)
 
-    nanovdb::cuda::DeviceBuffer  mComponentParent;          // K × uint64_t: per-component global representative
+    BufT<uint64_t>               mComponentParent;          // K x uint64_t: per-component global representative
 
-    nanovdb::cuda::DeviceBuffer  mVoxelLabel;               // (activeVoxelCount+1) × uint32_t: per-active-voxel dense component id in [0,N) (index by leaf.getValue(n); slot 0 = background)
-    uint64_t                     mGlobalComponentCount{0};  // number of connected components N (distinct representatives)
+    BufT<ComponentLabelT>        mVoxelLabel;               // (activeVoxelCount+1) x ComponentLabelT: per-active-voxel dense component id in [0,N) (index by leaf.getValue(n); slot 0 = background)
+    ComponentLabelT              mGlobalComponentCount{0};  // number of connected components N (distinct representatives)
 
-}; // tools::cuda::ConnectedComponents<BuildT>
+}; // tools::cuda::ConnectedComponents<BuildT, ResourceT>
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-namespace cc_detail {
+namespace components::detail {
 
-// Per-leaf connected-components via a Shiloach-Vishkin union-find run in shared memory,
-// one CUDA block per leaf, one thread per voxel offset n in [0, 512). The forest is stored
-// as a parent array of leaf-local voxel offsets: parent[n] = n for active roots, a smaller
-// active offset for non-roots, and -1 for inactive voxels. Connectivity is 6-connected and
-// strictly intra-leaf (cross-leaf edges are ignored at this stage).
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Stage 1: leaf-local connected components.
+
+// Leaf-local connected components in shared memory, one CUDA block per leaf and one thread per
+// voxel offset, over a parent array of leaf-local offsets (INACTIVE marks an inactive voxel).
+// Connectivity is 6-connected and strictly intra-leaf. The primitives are algorithm P of S. C. Liu
+// and R. E. Tarjan, "Simple Concurrent Connected Components Algorithms", ACM Transactions on
+// Parallel Computing 9(2), 2022, becoming their algorithm R once solve() restricts hooking to roots.
 //
-// The three primitives are double-buffered (Jacobi): they read the "cur" buffer and write
-// the "nxt" buffer, then swap. Inactive entries (-1) are carried through unchanged. The
-// pointer swap is performed identically by every thread, so the register copies stay in sync.
-
-constexpr int LEAF_DIM  = 8;            // NanoLeaf DIM
-constexpr int LEAF_SIZE = 512;          // 8^3
-constexpr int CC_INACTIVE = -1;         // parent sentinel for inactive voxels
-
-// 3D view over a 512-entry parent buffer. The voxel offset is x-major
-// (n = (x<<6)|(y<<3)|z), so a row-major int[8][8][8] indexed [x][y][z] aliases the flat
-// buffer exactly: element [x][y][z] sits at linear offset x*64 + y*8 + z == n. Accessing
-// individual int elements through this view is well-defined (the storage really is int).
-using ParentsT = int[LEAF_DIM][LEAF_DIM][LEAF_DIM];
-
-// Smallest parent among the (up to 6) active in-leaf face neighbors of offset n, floored at
-// the supplied current value. Offset layout is x-major: n = (x<<6)|(y<<3)|z.
-__device__ inline int ccNeighborMin(const int* parentsPtr, int n, int current)
+// They are double-buffered (Jacobi): read "cur", write "nxt", then swap -- identically in every
+// thread, so the per-thread pointer copies stay in sync. Every thread must call each of them, as
+// each contains __syncthreads(). Their `changed` flag is a caller-owned __shared__ int; concurrent
+// raisers write the same value, so no atomic is needed.
+struct LeafUnionFind
 {
-    const auto& p = reinterpret_cast<const ParentsT&>(*parentsPtr);
-    const int x =  n >> 6       ;
-    const int y = (n >> 3) & 0x7;
-    const int z =       n  & 0x7;
-    int m = current;
-    if (x > 0 && p[x-1][y][z] != CC_INACTIVE) m = ::min(m, p[x-1][y][z]);   // -X
-    if (x < 7 && p[x+1][y][z] != CC_INACTIVE) m = ::min(m, p[x+1][y][z]);   // +X
-    if (y > 0 && p[x][y-1][z] != CC_INACTIVE) m = ::min(m, p[x][y-1][z]);   // -Y
-    if (y < 7 && p[x][y+1][z] != CC_INACTIVE) m = ::min(m, p[x][y+1][z]);   // +Y
-    if (z > 0 && p[x][y][z-1] != CC_INACTIVE) m = ::min(m, p[x][y][z-1]);   // -Z
-    if (z < 7 && p[x][y][z+1] != CC_INACTIVE) m = ::min(m, p[x][y][z+1]);   // +Z
-    return m;
-}
+    static constexpr int INACTIVE = -1;  // parent sentinel for inactive voxels
 
-// SV root hook: every vertex v whose smallest active neighbor label m is below parent[v]
-// lowers the slot of v's *parent* (its tree root, once flattened) toward m, via atomicMin.
-// Sets *changed (when non-null) iff some root slot was actually lowered.
-__device__ inline void ccHook(int*& cur, int*& nxt, int n, int* changed)
-{
-    const int pn = cur[n];
-    nxt[n] = pn;                                  // Phase A: seed nxt = cur (own slot, no race)
-    __syncthreads();
-    if (pn != CC_INACTIVE) {                      // active voxel
-        const int m = ccNeighborMin(cur, n, pn);
-        if (m < pn) {                             // root slot is data-dependent -> atomicMin
-            const int old = atomicMin_block(&nxt[pn], m);  // block scope: nxt[] is shared
-            if (changed && old > m) *changed = 1;
-        }
-    }
-    __syncthreads();
-    int* t = cur; cur = nxt; nxt = t;             // swap (identical on every thread)
-}
-
-// Pointer-jumping compress: parent[v] <- parent[parent[v]]. Halves tree depth per call.
-// Sets *changed (when non-null) iff some entry actually moved.
-__device__ inline void ccCompress(int*& cur, int*& nxt, int n, int* changed)
-{
-    const int pn = cur[n];
-    int v = CC_INACTIVE;
-    if (pn != CC_INACTIVE) {                      // active: grandparent (cur[pn] is valid)
-        v = cur[pn];
-        if (changed && v != pn) *changed = 1;
-    }
-    nxt[n] = v;                                   // own slot, no race
-    __syncthreads();
-    int* t = cur; cur = nxt; nxt = t;             // swap
-}
-
-// Run one leaf's union-find to convergence under @a schedule.
-//
-// @param rounds     receives the outer iteration the leaf settled on, or MaxIters if it ran out.
-// @param shortcuts  receives how many compress steps were executed, the cost the two schedules
-//                   actually differ in.
-template <int MaxIters>
-__device__ inline void ccSolveLeaf(int*& cur, int*& nxt, int n, LeafSchedule schedule,
-                                   int* changed, int* moved, int& rounds, int& shortcuts)
-{
-    shortcuts = 0;
-    if (schedule == LeafSchedule::Parent) {
-        // Warm-up: one hook plus log2(8) compresses, cheap enough to always be worth it.
-        ccHook    (cur, nxt, n, nullptr);
-        ccCompress(cur, nxt, n, nullptr);
-        ccCompress(cur, nxt, n, nullptr);
-        ccCompress(cur, nxt, n, nullptr);
-        shortcuts = 3;
+    // Minimum parent label over offset n and its (up to 6) active in-leaf face neighbors.
+    __device__ static int neighborMin(const int* parentsPtr, int n)
+    {
+        const auto& p = reinterpret_cast<const int(&)[8][8][8]>(*parentsPtr);  // 3D view of the 512-entry parent buffer
+        const int x =  n >> 6       ;
+        const int y = (n >> 3) & 0x7;
+        const int z =       n  & 0x7;
+        int m = p[x][y][z];
+        if (x > 0 && p[x-1][y][z] != INACTIVE) m = ::min(m, p[x-1][y][z]);   // -X
+        if (x < 7 && p[x+1][y][z] != INACTIVE) m = ::min(m, p[x+1][y][z]);   // +X
+        if (y > 0 && p[x][y-1][z] != INACTIVE) m = ::min(m, p[x][y-1][z]);   // -Y
+        if (y < 7 && p[x][y+1][z] != INACTIVE) m = ::min(m, p[x][y+1][z]);   // +Y
+        if (z > 0 && p[x][y][z-1] != INACTIVE) m = ::min(m, p[x][y][z-1]);   // -Z
+        if (z < 7 && p[x][y][z+1] != INACTIVE) m = ::min(m, p[x][y][z+1]);   // +Z
+        return m;
     }
 
-    rounds = MaxIters;
-    for (int it = 0; it < MaxIters; ++it) {
-        if (n == 0) *changed = 0;
+    // Union-find hook: if the smallest parent m among v's active neighbors is below v's own parent
+    // p, lower the parent of p toward m via atomicMin (many vertices can target the same slot p).
+    // Sets *changed -- the caller's block-shared flag, when non-null -- iff some slot was lowered.
+    //
+    // @param rootsOnly picks which of Liu & Tarjan's connect operations this performs:
+    //        parent-connect when false, parent-root-connect when true, which hooks only through
+    //        parents that are themselves roots. That restriction cannot move a subtree between
+    //        trees, making the algorithm monotone -- the property their O(lg n) bound rests on.
+    __device__ static void hook(int*& cur, int*& nxt, int n, int* changed, bool rootsOnly = false)
+    {
+        const int pn = cur[n];
+        nxt[n] = pn;                                  // seed nxt = cur (own slot, no race)
         __syncthreads();
-        ccHook(cur, nxt, n, changed);
-
-        if (schedule == LeafSchedule::Parent) {
-            ccCompress(cur, nxt, n, changed);
-            ++shortcuts;
-        } else {
-            for (int j = 0; j < MaxIters; ++j) {          // compress until the forest is flat
-                if (n == 0) *moved = 0;
-                __syncthreads();
-                ccCompress(cur, nxt, n, moved);
-                ++shortcuts;
-                __syncthreads();
-                if (*moved == 0) break;
-                if (n == 0) *changed = 1;
-                __syncthreads();
+        if (pn != INACTIVE && (!rootsOnly || cur[pn] == pn)) {   // active, and a root if required
+            const int m = neighborMin(cur, n);
+            if (m < pn) {                             // root slot is data-dependent -> atomicMin
+                const int old = atomicMin_block(&nxt[pn], m);  // block scope: nxt[] is shared
+                if (changed && old > m) *changed = 1;
             }
         }
-
         __syncthreads();
-        if (*changed == 0) { rounds = it + 1; break; }
-        __syncthreads();   // all threads have read *changed before thread 0 resets it
+        int* t = cur; cur = nxt; nxt = t;             // swap (identical on every thread)
     }
-}
+
+    // Union-find compress: parent[v] <- parent[parent[v]], one round of pointer jumping applied to
+    // every node at once, halving tree depth per call. This is shortcut in Liu & Tarjan.
+    // Sets *changed -- the caller's block-shared flag, when non-null -- iff some entry moved.
+    __device__ static void compress(int*& cur, int*& nxt, int n, int* changed)
+    {
+        const int pn = cur[n];
+        int v = INACTIVE;
+        if (pn != INACTIVE) {                         // n is active
+            v = cur[pn];                              // n's grandparent (parents are always active)
+            if (changed && v != pn) *changed = 1;
+        }
+        nxt[n] = v;                                   // own slot, no race
+        __syncthreads();
+        int* t = cur; cur = nxt; nxt = t;             // swap
+    }
+
+    // Round at which the main loop switches from algorithm P (parent-connect) to algorithm R
+    // (parent-root-connect). P is cheaper per round but has no proven step bound; R is bounded by
+    // O(lg n), which matches the lower bound. Leaves are observed to converge in far fewer rounds
+    // than this, so the switch is a fallback that normally never runs, and the two cost the same
+    // when it does not. Raising it favours P, lowering it reaches the bound sooner.
+    static constexpr int SwitchToRootAfter = 8;
+
+    // Run the full schedule to convergence. On return cur[n] holds n's component root, and each
+    // component's root is the minimum voxel offset it contains. `changed` points at a block-shared
+    // int, which this resets between rounds.
+    __device__ static void solve(int*& cur, int*& nxt, int n, int* changed)
+    {
+        // Unconditional warm-up: one hook, then enough compresses to flatten the forest rather
+        // than merely halve its depth (a leaf is DIM=8 across). Flatness keeps the
+        // parent-root-connect phase below cheap: with nearly every vertex its own root, that
+        // phase's extra test is almost always satisfied and costs nothing.
+        hook    (cur, nxt, n, nullptr);
+        compress(cur, nxt, n, nullptr);
+        compress(cur, nxt, n, nullptr);
+        compress(cur, nxt, n, nullptr);
+        compress(cur, nxt, n, nullptr);
+
+        // Then alternate (hook, compress) until a full iteration changes nothing, as algorithm P
+        // and then as algorithm R once SwitchToRootAfter rounds have passed. The bound is a
+        // backstop, not the mechanism that ends the loop: algorithm R converges within its O(lg n)
+        // step bound, so only a bug could exhaust it.
+        constexpr int MaxConvergenceIters = 64;
+        for (int it = 0; it < MaxConvergenceIters; ++it) {
+            if (n == 0) *changed = 0;
+            __syncthreads();
+            hook    (cur, nxt, n, changed, it >= SwitchToRootAfter);
+            compress(cur, nxt, n, changed);
+            __syncthreads();
+            if (*changed == 0) return;
+            __syncthreads();  // all threads have read *changed; safe for thread 0 to reset it next iteration
+        }
+        NANOVDB_ASSERT(false);  // exhausted the backstop: algorithm R's bound was not met
+    }
+}; // LeafUnionFind
 
 template <typename BuildT>
 struct LeafComponentCountFunctor
 {
-    static constexpr int MaxThreadsPerBlock         = LEAF_SIZE;
+    static constexpr int MaxThreadsPerBlock         = NanoLeaf<BuildT>::SIZE;
     static constexpr int MinBlocksPerMultiprocessor = 1;
 
-    // Safety cap on the convergence loop, well above the worst case for an 8^3 leaf
-    // (~log2(depth) + log2(#local minima) <= ~18); guards against a non-terminating bug
-    // rather than limiting any legitimate input.
-    static constexpr int MaxConvergenceIters = 64;
-
-    /// @param d_convergenceHistogram optional, MaxConvergenceIters+1 counters; bin r is incremented
-    ///        by every leaf whose SV loop settled after r rounds. Bin MaxConvergenceIters means the
-    ///        leaf ran out of rounds, i.e. its labels may not have converged. Pass nullptr to skip.
-    LeafSchedule mSchedule = LeafSchedule::Parent;
-
-    __device__ void operator()(const NanoGrid<BuildT>* d_grid, uint16_t* d_counts,
-                               uint32_t* d_convergenceHistogram)
+    __device__ void operator()(const NanoGrid<BuildT>* d_grid, uint16_t* d_counts)
     {
-        __shared__ int bufA[LEAF_SIZE];
-        __shared__ int bufB[LEAF_SIZE];
+        __shared__ int bufA[NanoLeaf<BuildT>::SIZE];
+        __shared__ int bufB[NanoLeaf<BuildT>::SIZE];
         __shared__ int changed;
-        __shared__ int moved;
         __shared__ int compCount;
 
         const int   leafID = blockIdx.x;
@@ -346,16 +341,11 @@ struct LeafComponentCountFunctor
         int* cur = bufA;
         int* nxt = bufB;
 
-        // Init: active voxels label themselves, inactive get the sentinel.
-        cur[tID] = leaf.isActive(uint32_t(tID)) ? tID : CC_INACTIVE;
+        // Init: every active voxel starts as its own root, inactive ones get the sentinel.
+        cur[tID] = leaf.isActive(uint32_t(tID)) ? tID : LeafUnionFind::INACTIVE;
         __syncthreads();
 
-        int rounds = 0, shortcuts = 0;
-        ccSolveLeaf<MaxConvergenceIters>(cur, nxt, tID, mSchedule, &changed, &moved, rounds, shortcuts);
-        if (d_convergenceHistogram && tID == 0) {
-            atomicAdd(&d_convergenceHistogram[rounds], 1u);
-            atomicAdd(&d_convergenceHistogram[MaxConvergenceIters + 1], uint32_t(shortcuts));
-        }
+        LeafUnionFind::solve(cur, nxt, tID, &changed);
 
         // Component count = number of surviving roots (cur[tID] == tID; inactive entries are -1).
         if (tID == 0) compCount = 0;
@@ -369,22 +359,20 @@ struct LeafComponentCountFunctor
 template <typename BuildT>
 struct LeafComponentMaskFunctor
 {
-    static constexpr int MaxThreadsPerBlock         = LEAF_SIZE;
-    static constexpr int MinBlocksPerMultiprocessor = 1;
-    static constexpr int MaxConvergenceIters        = 64;
+    using LeafNeighborTap = ConnectedComponentsBase::LeafNeighborTap;
 
-    LeafSchedule mSchedule = LeafSchedule::Parent;
+    static constexpr int MaxThreadsPerBlock         = NanoLeaf<BuildT>::SIZE;
+    static constexpr int MinBlocksPerMultiprocessor = 1;
 
     __device__ void operator()(const NanoGrid<BuildT>* d_grid,
                                 const uint64_t*         d_offsets,
                                 nanovdb::Mask<3>*       d_masks,
                                 uint64_t              (*d_faces)[6])
     {
-        __shared__ int   bufA[LEAF_SIZE];
-        __shared__ int   bufB[LEAF_SIZE];
-        __shared__ typename cub::BlockReduce<uint32_t, LEAF_SIZE>::TempStorage reduceTmp;
+        __shared__ int   bufA[NanoLeaf<BuildT>::SIZE];
+        __shared__ int   bufB[NanoLeaf<BuildT>::SIZE];
+        __shared__ typename cub::BlockReduce<uint32_t, NanoLeaf<BuildT>::SIZE>::TempStorage reduceTmp;
         __shared__ int      changed;
-        __shared__ int      moved;
         __shared__ uint32_t sMinLabel;
         // Ballot words (u32/warp) aliased to the Mask<3> u64 words. NAMED union: an anonymous
         // __shared__ union compiled to per-thread local storage, breaking cross-warp sharing.
@@ -399,22 +387,20 @@ struct LeafComponentMaskFunctor
         int* cur = bufA;
         int* nxt = bufB;
 
-        // Init + convergence: identical schedule to LeafComponentCountFunctor, so both passes agree
-        // on every leaf's labels.
-        cur[tID] = leaf.isActive(uint32_t(tID)) ? tID : CC_INACTIVE;
+        // Init: every active voxel starts as its own root, inactive ones get the sentinel.
+        cur[tID] = leaf.isActive(uint32_t(tID)) ? tID : LeafUnionFind::INACTIVE;
         __syncthreads();
 
-        int rounds = 0, shortcuts = 0;
-        ccSolveLeaf<MaxConvergenceIters>(cur, nxt, tID, mSchedule, &changed, &moved, rounds, shortcuts);
+        LeafUnionFind::solve(cur, nxt, tID, &changed);
 
         // Mask-fill: iterate over leaf-local components in ascending root-label order.
         //
         // Each iteration finds the smallest unprocessed root label via a block-wide unsigned
-        // min (CC_INACTIVE = -1 recasts to 0xFFFFFFFF and thus never wins), then collects
+        // min (INACTIVE = -1 recasts to 0xFFFFFFFF and thus never wins), then collects
         // matching voxels via __ballot_sync and writes the 32-bit result for each warp
         // directly into the Mask<3> word array recast as uint32_t* (each of the 16 warps
         // covers exactly one 32-bit word, so all words are written unconditionally).
-        // Processed entries are erased to CC_INACTIVE so they don't win a future min.
+        // Processed entries are erased to INACTIVE so they don't win a future min.
         // localCompIdx tracks the dense component index in lockstep across all threads.
 
         const uint64_t baseOffset = d_offsets[leafID];
@@ -424,20 +410,20 @@ struct LeafComponentMaskFunctor
         int localCompIdx = 0;
 
         while (true) {
-            uint32_t minLabel = cub::BlockReduce<uint32_t, LEAF_SIZE>(reduceTmp)
+            uint32_t minLabel = cub::BlockReduce<uint32_t, NanoLeaf<BuildT>::SIZE>(reduceTmp)
                                     .Reduce(uint32_t(cur[tID]), ::cuda::minimum<uint32_t>{});
             if (tID == 0) sMinLabel = minLabel;
             __syncthreads();
-            if (sMinLabel == uint32_t(CC_INACTIVE)) break;
+            if (sMinLabel == uint32_t(LeafUnionFind::INACTIVE)) break;
 
             const bool     match  = (uint32_t(cur[tID]) == sMinLabel);
             const uint32_t ballot = __ballot_sync(0xFFFFFFFF, match);
             if (laneID == 0) sMaskWords_u32[warpID] = ballot;
 
-            if (match) cur[tID] = CC_INACTIVE;
+            if (match) cur[tID] = LeafUnionFind::INACTIVE;
             __syncthreads();  // [SYNC1]: sMaskWords_u32 fully written + cur erases visible
 
-            // Coalesced write: first 8 threads store sMaskWords → mask.words(), one uint64_t each.
+            // Coalesced write: first 8 threads store sMaskWords -> mask.words(), one uint64_t each.
             if (tID < 8) {
                 d_masks[baseOffset + localCompIdx].words()[tID] = sMaskWords[tID];
             }
@@ -446,21 +432,21 @@ struct LeafComponentMaskFunctor
             if (tID == 0) {
                 uint64_t* face = d_faces[baseOffset + localCompIdx];
 
-                // ±X: whole word 0 / word 7 are exactly the minusX / plusX face planes.
-                face[minusX] = sMaskWords[0];
-                face[plusX]  = sMaskWords[7];
+                // +/-X: whole word 0 / word 7 are exactly the minusX / plusX face planes.
+                face[LeafNeighborTap::minusX] = sMaskWords[0];
+                face[LeafNeighborTap::plusX]  = sMaskWords[7];
 
-                // ±Y: bottom byte (y=0) and top byte (y=7) of each word x;
+                // +/-Y: bottom byte (y=0) and top byte (y=7) of each word x;
                 //     shift-accumulate from x=7 down; result bit index = x*8 + z (x major, z minor).
                 uint64_t mY = sMaskWords[7] & 0xFF,  pY = (sMaskWords[7] >> 56) & 0xFF;
                 for (int x = 6; x >= 0; --x) {
                     mY = (mY << 8) | (sMaskWords[x] & 0xFF);
                     pY = (pY << 8) | ((sMaskWords[x] >> 56) & 0xFF);
                 }
-                face[minusY] = mY;
-                face[plusY]  = pY;
+                face[LeafNeighborTap::minusY] = mY;
+                face[LeafNeighborTap::plusY]  = pY;
 
-                // ±Z: bit 0 (z=0) and bit 7 (z=7) of each byte in each word;
+                // +/-Z: bit 0 (z=0) and bit 7 (z=7) of each byte in each word;
                 //     shift-accumulate from x=7 down; result bit index = y*8 + x (y major, x minor).
                 uint64_t mZ = sMaskWords[7] & UINT64_C(0x0101010101010101);
                 uint64_t pZ = (sMaskWords[7] >> 7) & UINT64_C(0x0101010101010101);
@@ -468,8 +454,8 @@ struct LeafComponentMaskFunctor
                     mZ = (mZ << 1) | (sMaskWords[x] & UINT64_C(0x0101010101010101));
                     pZ = (pZ << 1) | ((sMaskWords[x] >> 7) & UINT64_C(0x0101010101010101));
                 }
-                face[minusZ] = mZ;
-                face[plusZ]  = pZ;
+                face[LeafNeighborTap::minusZ] = mZ;
+                face[LeafNeighborTap::plusZ]  = pZ;
             }
             __syncthreads();  // [SYNC2]: mask + face writes done; all threads safe for next BlockReduce
 
@@ -478,7 +464,105 @@ struct LeafComponentMaskFunctor
     }
 }; // LeafComponentMaskFunctor
 
+// offsets[i+1] = counts[i]: upcast the per-leaf uint16 component counts into the uint64 offset array.
+struct UpcastCountsFunctor {
+    __device__ void operator()(size_t i, const uint16_t* counts, uint64_t* offsets) const {
+        offsets[i + 1] = uint64_t(counts[i]);
+    }
+};
+
+} // namespace components::detail
+
+template <typename BuildT, typename ResourceT>
+void ConnectedComponents<BuildT, ResourceT>::processLeafConnectedComponents()
+{
+    const uint32_t leafCount =
+        util::cuda::DeviceGridTraits<BuildT>::getTreeData(mDeviceSrcGrid).mNodeCount[0];
+
+    // Allocate one component-count per leaf (device-only). At most 256 components per 8^3
+    // leaf (6-connected worst case), so uint16_t is sufficient.
+    if (mVerbose==1) mTimer.start("Allocating per-leaf component counts");
+    mLeafComponentCounts = BufT<uint16_t>(mStream, this->ref(), leafCount, nanovdb::cuda::noInit);
+    if (mVerbose==1) mTimer.stop();
+
+    if (leafCount == 0) return;
+
+    // One block per leaf, one thread per voxel offset; counts the distinct 6-connected
+    // components of each leaf's active voxels (in isolation) into mLeafComponentCounts.
+    using Op = components::detail::LeafComponentCountFunctor<BuildT>;
+    if (mVerbose==1) mTimer.start("Per-leaf connected-component counting");
+    util::cuda::operatorKernel<Op>
+        <<<leafCount, Op::MaxThreadsPerBlock, 0, mStream>>>(
+            mDeviceSrcGrid, deviceLeafComponentCounts());
+    cudaCheckError();
+    if (mVerbose==1) mTimer.stop();
+
+    // Prefix sum: mLeafComponentOffsets[0]=0, mLeafComponentOffsets[1..leafCount] = inclusive sum
+    // of mLeafComponentCounts. mLeafComponentOffsets[leafCount] = K (total leaf-local components).
+    if (mVerbose==1) mTimer.start("Allocating per-leaf component offsets");
+    mLeafComponentOffsets = BufT<uint64_t>(mStream, this->ref(), std::size_t(leafCount) + 1, nanovdb::cuda::noInit);
+    if (mVerbose==1) mTimer.stop();
+
+    cudaCheck(cudaMemsetAsync(mLeafComponentOffsets.data(), 0, sizeof(uint64_t), mStream));
+
+    // Upcast per-leaf uint16_t counts into offsets[1..leafCount] as uint64_t.
+    uint16_t* d_counts  = deviceLeafComponentCounts();
+    uint64_t* d_offsets = deviceLeafComponentOffsets();
+    util::cuda::lambdaKernel<<<(leafCount + 255) / 256, 256, 0, mStream>>>(
+        leafCount, components::detail::UpcastCountsFunctor{}, d_counts, d_offsets);
+    cudaCheckError();
+
+    // In-place inclusive sum over offsets[1..leafCount]; offsets[leafCount] = K (total components).
+    if (mVerbose==1) mTimer.start("Per-leaf component offset prefix sum");
+    CALL_CUBS(DeviceScan::InclusiveSum, d_offsets + 1, d_offsets + 1, leafCount);
+    cudaCheckError();
+    if (mVerbose==1) mTimer.stop();
+
+    // Read the aggregate count from the sentinel at offsets[leafCount].
+    // Use async copy on mStream (ordered after the scan) + stream sync to avoid
+    // inadvertently synchronizing other streams.
+    cudaCheck(cudaMemcpyAsync(&mLeafComponentAggregateCount, d_offsets + leafCount,
+                              sizeof(uint64_t), cudaMemcpyDeviceToHost, mStream));
+    cudaCheck(cudaStreamSynchronize(mStream));
+
+    // Everything downstream indexes the leaf-local components: the cross-leaf edges store global
+    // slots, the rank scan runs over K items, and the dense labels count them. K is carried as
+    // uint64_t precisely so an out-of-range value survives to be tested here; past this point the
+    // narrower types are known to fit, which is what lets N share ComponentLabelT with the labels.
+    if (mLeafComponentAggregateCount > MaxComponentCount)
+        throw std::runtime_error("nanovdb::tools::cuda::ConnectedComponents: leaf-local component "
+                                 "count exceeds the indexable range");
+
+    // Allocate mLeafComponentAggregateCount Mask<3> objects - one per leaf-local component.
+    // No zero-init needed: the mask-fill kernel writes all 16 uint32_t words of every mask
+    // unconditionally via warp ballot (zero ballot = no component voxels in that warp).
+    if (mVerbose==1) mTimer.start("Allocating per-component leaf masks");
+    mLeafComponentMasks = BufT<nanovdb::Mask<3>>(
+        mStream, this->ref(), mLeafComponentAggregateCount, nanovdb::cuda::noInit);
+    if (mVerbose==1) mTimer.stop();
+
+    // Allocate 6 uint64_t face masks per component (one per LeafNeighborTap entry).
+    // The face-extraction kernel fills these; no zero-init needed for the same reason.
+    if (mVerbose==1) mTimer.start("Allocating per-component face masks");
+    mLeafComponentFaceMasks = BufT<uint64_t[6]>(
+        mStream, this->ref(), mLeafComponentAggregateCount, nanovdb::cuda::noInit);
+    if (mVerbose==1) mTimer.stop();
+
+    // Re-run the leaf union-find and scatter each active voxel's bit into its component's Mask<3>.
+    using MaskOp = components::detail::LeafComponentMaskFunctor<BuildT>;
+    if (mVerbose==1) mTimer.start("Per-leaf component mask fill");
+    util::cuda::operatorKernel<MaskOp>
+        <<<leafCount, MaskOp::MaxThreadsPerBlock, 0, mStream>>>(
+            mDeviceSrcGrid, deviceLeafComponentOffsets(),
+            deviceLeafComponentMasks(), deviceLeafComponentFaceMasks());
+    cudaCheckError();
+    if (mVerbose==1) mTimer.stop();
+}// ConnectedComponents<BuildT, ResourceT>::processLeafConnectedComponents
+
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+namespace components::detail {
+
 // Stage 2: cross-leaf connectivity edges.
 //
 // One block per leaf. For each of the leaf's +X/+Y/+Z neighbor leaves (so each undirected leaf-leaf
@@ -488,7 +572,7 @@ struct LeafComponentMaskFunctor
 
 /// @brief Linear leaf index of leaf's +axis neighbor (axis: 0=+X, 1=+Y, 2=+Z), or -1 if none.
 template <typename BuildT>
-__device__ inline int ccNeighborLeafIndex(const NanoGrid<BuildT>* d_grid,
+__device__ inline int neighborLeafIndex(const NanoGrid<BuildT>* d_grid,
                                            const NanoLeaf<BuildT>&  leaf, int axis)
 {
     const nanovdb::Coord o  = leaf.origin();
@@ -506,41 +590,60 @@ __device__ inline int ccNeighborLeafIndex(const NanoGrid<BuildT>* d_grid,
 ///        passes so their iteration + AND test cannot drift. Threads of the block stride the pair
 ///        grid; emit() must be safe under concurrent calls (it uses a block-scoped atomic).
 template <typename BuildT, typename EdgeFn>
-__device__ inline void ccForEachCrossLeafEdge(
+__device__ inline void forEachCrossLeafEdge(
     const NanoGrid<BuildT>* d_grid, const uint64_t* d_offsets, const uint64_t (*d_faces)[6],
     int leafID, int tID, int nThreads, EdgeFn&& emit)
 {
-    const auto&    leaf   = d_grid->tree().template getFirstNode<0>()[leafID];
-    const uint64_t baseL  = d_offsets[leafID];
-    const int      countL = int(d_offsets[leafID + 1] - baseL);
-    if (countL == 0) return;
+    using LeafNeighborTap = ConnectedComponentsBase::LeafNeighborTap;
+    using ComponentLabelT = ConnectedComponentsBase::ComponentLabelT;
 
-    const int faceL[3] = { plusX,  plusY,  plusZ  };  // this leaf's +axis face
-    const int faceN[3] = { minusX, minusY, minusZ };  // neighbor's matching -axis face
+    // base* is a leaf's first global component slot, count* how many components it has.
+    const auto&    leaf      = d_grid->tree().template getFirstNode<0>()[leafID];
+    const uint64_t baseLeaf  = d_offsets[leafID];
+    const int      countLeaf = int(d_offsets[leafID + 1] - baseLeaf);
+    if (countLeaf == 0) return;
+
+    // Only the +axis faces are walked; the neighbor on its -axis side covers the other direction,
+    // so every adjacent pair is visited exactly once, by the lower leaf.
+    const int faceLeaf[3]     = { LeafNeighborTap::plusX,  LeafNeighborTap::plusY,  LeafNeighborTap::plusZ  };  // this leaf's +axis face
+    const int faceNeighbor[3] = { LeafNeighborTap::minusX, LeafNeighborTap::minusY, LeafNeighborTap::minusZ };  // neighbor's matching -axis face
 
     for (int axis = 0; axis < 3; ++axis) {
-        const int N = ccNeighborLeafIndex<BuildT>(d_grid, leaf, axis);
-        if (N < 0) continue;
-        const uint64_t baseN  = d_offsets[N];
-        const int      countN = int(d_offsets[N + 1] - baseN);
-        if (countN == 0) continue;
-        const int fL = faceL[axis], fN = faceN[axis];
-        const int total = countL * countN;
+        const int neighborID = neighborLeafIndex<BuildT>(d_grid, leaf, axis);
+        if (neighborID < 0) continue;
+        const uint64_t baseNeighbor  = d_offsets[neighborID];
+        const int      countNeighbor = int(d_offsets[neighborID + 1] - baseNeighbor);
+        if (countNeighbor == 0) continue;
+
+        // Every (this leaf's component, neighbor's component) pair, flattened so the block can
+        // stride it; two components are adjacent iff their touching face masks intersect. The
+        // slots narrow to ComponentLabelT, which is safe because the component count is checked
+        // against MaxComponentCount before any of them is produced.
+        const int fLeaf = faceLeaf[axis], fNeighbor = faceNeighbor[axis];
+        const int total = countLeaf * countNeighbor;
         for (int p = tID; p < total; p += nThreads) {
-            const int i = p / countN, j = p % countN;
-            if (d_faces[baseL + i][fL] & d_faces[baseN + j][fN])
-                emit(uint32_t(baseL + i), uint32_t(baseN + j));
+            const int i = p / countNeighbor, j = p % countNeighbor;
+            if (d_faces[baseLeaf + i][fLeaf] & d_faces[baseNeighbor + j][fNeighbor])
+                emit(ComponentLabelT(baseLeaf + i), ComponentLabelT(baseNeighbor + j));
         }
     }
 }
 
 template <typename BuildT>
+/// @brief Counts one leaf's cross-leaf edges, one block per leaf. This sizes the edge array that
+///        CrossLeafEdgeScatterFunctor then fills, so the two must agree on exactly which pairs are
+///        edges -- which is why both drive forEachCrossLeafEdge instead of repeating its test.
 struct CrossLeafEdgeCountFunctor
 {
+    using ComponentLabelT = ConnectedComponentsBase::ComponentLabelT;
+
     static constexpr int MaxThreadsPerBlock         = 128;
     static constexpr int MinBlocksPerMultiprocessor = 1;
 
-    // d_outCount is (leafComponentEdgeOffsets + 1), so writing [leafID] lands at offsets[leafID+1].
+    /// @param d_offsets  per-leaf component offsets (stage 1), not the edge offsets
+    /// @param d_faces    per-component face masks (stage 1)
+    /// @param d_outCount is (edgeOffsets + 1), so writing [leafID] lands at edgeOffsets[leafID+1],
+    ///                   ready for the prefix sum that turns counts into slice bounds
     __device__ void operator()(const NanoGrid<BuildT>* d_grid, const uint64_t* d_offsets,
                                const uint64_t (*d_faces)[6], uint64_t* d_outCount)
     {
@@ -548,19 +651,30 @@ struct CrossLeafEdgeCountFunctor
         const int leafID = blockIdx.x, tID = threadIdx.x;
         if (tID == 0) sEdges = 0;
         __syncthreads();
-        ccForEachCrossLeafEdge<BuildT>(d_grid, d_offsets, d_faces, leafID, tID, blockDim.x,
-            [&] __device__ (uint32_t, uint32_t) { atomicAdd_block(&sEdges, 1); });
+        // The enumerator hands each edge to the callback as a pair of global component slots. This
+        // pass only needs how many there are, so both are left unnamed and the body just tallies.
+        forEachCrossLeafEdge<BuildT>(d_grid, d_offsets, d_faces, leafID, tID, blockDim.x,
+            [&] __device__ (ComponentLabelT, ComponentLabelT) { atomicAdd_block(&sEdges, 1); });
         __syncthreads();
         if (tID == 0) d_outCount[leafID] = uint64_t(sEdges);
     }
 };
 
 template <typename BuildT>
+/// @brief Writes one leaf's cross-leaf edges into the slice the count pass reserved for it,
+///        [d_edgeOffsets[leafID], d_edgeOffsets[leafID+1]). Order within the slice is arbitrary --
+///        a block-scoped atomic hands out slots -- and each edge is stored with a < b, so the
+///        global union-find sees one canonical form per pair.
 struct CrossLeafEdgeScatterFunctor
 {
+    using ComponentLabelT = ConnectedComponentsBase::ComponentLabelT;
+    using CrossLeafEdge   = ConnectedComponentsBase::CrossLeafEdge;
+
     static constexpr int MaxThreadsPerBlock         = 128;
     static constexpr int MinBlocksPerMultiprocessor = 1;
 
+    /// @param d_offsets     per-leaf component offsets (stage 1)
+    /// @param d_edgeOffsets per-leaf edge offsets, the count pass's output after its prefix sum
     __device__ void operator()(const NanoGrid<BuildT>* d_grid, const uint64_t* d_offsets,
                                const uint64_t (*d_faces)[6], const uint64_t* d_edgeOffsets,
                                CrossLeafEdge* d_edges)
@@ -569,8 +683,8 @@ struct CrossLeafEdgeScatterFunctor
         const int leafID = blockIdx.x, tID = threadIdx.x;
         if (tID == 0) sWrite = (unsigned long long)d_edgeOffsets[leafID];
         __syncthreads();
-        ccForEachCrossLeafEdge<BuildT>(d_grid, d_offsets, d_faces, leafID, tID, blockDim.x,
-            [&] __device__ (uint32_t ga, uint32_t gb) {
+        forEachCrossLeafEdge<BuildT>(d_grid, d_offsets, d_faces, leafID, tID, blockDim.x,
+            [&] __device__ (ComponentLabelT ga, ComponentLabelT gb) {
                 const unsigned long long slot = atomicAdd_block(&sWrite, 1ull);
                 CrossLeafEdge e;
                 e.a = (ga < gb) ? ga : gb;  // canonical a < b
@@ -581,12 +695,63 @@ struct CrossLeafEdgeScatterFunctor
     }
 };
 
+} // namespace components::detail
+
+template <typename BuildT, typename ResourceT>
+void ConnectedComponents<BuildT, ResourceT>::processCrossLeafEdges()
+{
+    const uint32_t leafCount =
+        util::cuda::DeviceGridTraits<BuildT>::getTreeData(mDeviceSrcGrid).mNodeCount[0];
+    mCrossLeafEdgeCount = 0;
+    if (leafCount == 0) return;
+
+    // Per-leaf edge offsets: offsets[0]=0, offsets[1..leafCount] filled by the count pass then
+    // scanned in place; offsets[leafCount] = E (total cross-leaf edges).
+    mCrossLeafEdgeOffsets = BufT<uint64_t>(mStream, this->ref(), std::size_t(leafCount) + 1, nanovdb::cuda::noInit);
+    uint64_t* d_offsets = mCrossLeafEdgeOffsets.data();
+    cudaCheck(cudaMemsetAsync(d_offsets, 0, sizeof(uint64_t), mStream));
+
+    // Count pass: one block per leaf, writing each leaf's edge count into offsets[leafID+1].
+    using CountOp = components::detail::CrossLeafEdgeCountFunctor<BuildT>;
+    if (mVerbose==1) mTimer.start("Cross-leaf edge count");
+    util::cuda::operatorKernel<CountOp>
+        <<<leafCount, CountOp::MaxThreadsPerBlock, 0, mStream>>>(
+            mDeviceSrcGrid, deviceLeafComponentOffsets(), deviceLeafComponentFaceMasks(), d_offsets + 1);
+    cudaCheckError();
+    if (mVerbose==1) mTimer.stop();
+
+    // Inclusive prefix sum over offsets[1..leafCount]; offsets[leafCount] = E.
+    if (mVerbose==1) mTimer.start("Cross-leaf edge offset prefix sum");
+    CALL_CUBS(DeviceScan::InclusiveSum, d_offsets + 1, d_offsets + 1, leafCount);
+    cudaCheckError();
+    if (mVerbose==1) mTimer.stop();
+
+    cudaCheck(cudaMemcpyAsync(&mCrossLeafEdgeCount, d_offsets + leafCount,
+                              sizeof(uint64_t), cudaMemcpyDeviceToHost, mStream));
+    cudaCheck(cudaStreamSynchronize(mStream));
+    if (mCrossLeafEdgeCount == 0) return;  // single-leaf grid / no touching components
+
+    // Scatter pass: write each leaf's edges into [offsets[leafID], offsets[leafID+1]).
+    mCrossLeafEdges = BufT<CrossLeafEdge>(mStream, this->ref(), mCrossLeafEdgeCount, nanovdb::cuda::noInit);
+    using ScatterOp = components::detail::CrossLeafEdgeScatterFunctor<BuildT>;
+    if (mVerbose==1) mTimer.start("Cross-leaf edge scatter");
+    util::cuda::operatorKernel<ScatterOp>
+        <<<leafCount, ScatterOp::MaxThreadsPerBlock, 0, mStream>>>(
+            mDeviceSrcGrid, deviceLeafComponentOffsets(), deviceLeafComponentFaceMasks(),
+            d_offsets, deviceCrossLeafEdges());
+    cudaCheckError();
+    if (mVerbose==1) mTimer.stop();
+}// ConnectedComponents<BuildT, ResourceT>::processCrossLeafEdges
+
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+namespace components::detail {
+
 // Stage 3: global union-find over the cross-leaf edge list (representative = min slot in the class).
 
 /// @brief Walk parent pointers to the root of x. Links always point larger->smaller slot, so the
 ///        forest is acyclic and this terminates; the root is the minimum slot in x's class.
-__device__ inline uint64_t ccFind(const uint64_t* parent, uint64_t x)
+__device__ inline uint64_t find(const uint64_t* parent, uint64_t x)
 {
     while (parent[x] != x) x = parent[x];
     return x;
@@ -595,11 +760,11 @@ __device__ inline uint64_t ccFind(const uint64_t* parent, uint64_t x)
 /// @brief Lock-free union of the classes of a and b: find both roots and CAS-link the larger root
 ///        under the smaller (parent[hi] : hi -> lo). Retries if hi ceased to be a root meanwhile.
 ///        Order-independent result: a class's minimum slot is never the "hi", so it stays the root.
-__device__ inline void ccUnite(uint64_t* parent, uint64_t a, uint64_t b)
+__device__ inline void unite(uint64_t* parent, uint64_t a, uint64_t b)
 {
     while (true) {
-        const uint64_t ra = ccFind(parent, a);
-        const uint64_t rb = ccFind(parent, b);
+        const uint64_t ra = find(parent, a);
+        const uint64_t rb = find(parent, b);
         if (ra == rb) return;
         const uint64_t hi = (ra > rb) ? ra : rb;
         const uint64_t lo = (ra < rb) ? ra : rb;
@@ -611,41 +776,75 @@ __device__ inline void ccUnite(uint64_t* parent, uint64_t a, uint64_t b)
     }
 }
 
-//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-// Small element-wise functors driven by lambdaKernel. These are named structs (rather than inline
-// extended __device__ lambdas) so their enclosing ConnectedComponents member functions can have
-// private access — nvcc forbids extended __device__ lambdas inside private/protected methods — which
-// also matches the sibling operators (PruneGrid/DilateGrid/... drive lambdaKernel with named functors).
-
-// offsets[i+1] = counts[i]: upcast the per-leaf uint16 component counts into the uint64 offset array.
-struct UpcastCountsFunctor {
-    __device__ void operator()(size_t i, const uint16_t* counts, uint64_t* offsets) const {
-        offsets[i + 1] = uint64_t(counts[i]);
-    }
-};
-
 // Union-find init: every component is its own root.
 struct LabelInitFunctor {
     __device__ void operator()(size_t s, uint64_t* p) const { p[s] = uint64_t(s); }
 };
 
-// Union-find unite: link the two endpoints of cross-leaf edge e (each ccUnite has its own CAS-retry).
+// Union-find unite: link the two endpoints of cross-leaf edge e (each unite has its own CAS-retry).
 struct LabelUniteFunctor {
+    using CrossLeafEdge = ConnectedComponentsBase::CrossLeafEdge;
+
     __device__ void operator()(size_t e, uint64_t* p, const CrossLeafEdge* edges) const {
-        ccUnite(p, uint64_t(edges[e].a), uint64_t(edges[e].b));
+        unite(p, uint64_t(edges[e].a), uint64_t(edges[e].b));
     }
 };
 
 // Union-find flatten: point every component directly at its representative (class minimum slot).
 struct LabelFlattenFunctor {
-    __device__ void operator()(size_t s, uint64_t* p) const { p[s] = ccFind(p, uint64_t(s)); }
+    __device__ void operator()(size_t s, uint64_t* p) const { p[s] = find(p, uint64_t(s)); }
 };
 
 // flag[s] = 1 if component s is a self-root (parent[s]==s), else 0. An inclusive scan of these flags
-// gives each root its dense id (scan[root]-1) and, in the last entry, the component count N.
+
+} // namespace components::detail
+
+template <typename BuildT, typename ResourceT>
+void ConnectedComponents<BuildT, ResourceT>::processComponentLabels()
+{
+    const uint64_t K = mLeafComponentAggregateCount;
+    mComponentParent = BufT<uint64_t>(mStream, this->ref(), K, nanovdb::cuda::noInit);
+    if (K == 0) return;
+    uint64_t* d_parent = deviceComponentParent();
+
+    auto blocks = [](uint64_t n) { return (unsigned int)((n + 255) / 256); };
+
+    // (a) init: every component is its own root.
+    if (mVerbose==1) mTimer.start("Component-label init");
+    util::cuda::lambdaKernel<<<blocks(K), 256, 0, mStream>>>(
+        K, components::detail::LabelInitFunctor{}, d_parent);
+    cudaCheckError();
+    if (mVerbose==1) mTimer.stop();
+
+    // (b) unite: one thread per edge; each unite has its own CAS-retry, so one pass suffices.
+    if (mCrossLeafEdgeCount) {
+        if (mVerbose==1) mTimer.start("Component-label unite");
+        util::cuda::lambdaKernel<<<blocks(mCrossLeafEdgeCount), 256, 0, mStream>>>(
+            mCrossLeafEdgeCount, components::detail::LabelUniteFunctor{}, d_parent, deviceCrossLeafEdges());
+        cudaCheckError();
+        if (mVerbose==1) mTimer.stop();
+    }
+
+    // (c) flatten: point every component directly at its representative (class minimum slot).
+    if (mVerbose==1) mTimer.start("Component-label flatten");
+    util::cuda::lambdaKernel<<<blocks(K), 256, 0, mStream>>>(
+        K, components::detail::LabelFlattenFunctor{}, d_parent);
+    cudaCheckError();
+    if (mVerbose==1) mTimer.stop();
+}// ConnectedComponents<BuildT, ResourceT>::processComponentLabels
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+namespace components::detail {
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Stage 4: dense label assignment.
+
 struct RootFlagFunctor {
-    __device__ void operator()(size_t s, const uint64_t* p, uint32_t* flag) const {
-        flag[s] = (p[s] == uint64_t(s)) ? 1u : 0u;
+    // LabelT is deduced from the call, so this stays independent of ConnectedComponents.
+    template <typename LabelT>
+    __device__ void operator()(size_t s, const uint64_t* p, LabelT* flag) const {
+        flag[s] = (p[s] == uint64_t(s)) ? LabelT(1) : LabelT(0);
     }
 };
 
@@ -659,12 +858,14 @@ struct RootFlagFunctor {
 template <typename BuildT>
 struct VoxelLabelScatterFunctor
 {
-    static constexpr int MaxThreadsPerBlock         = LEAF_SIZE;
+    static constexpr int MaxThreadsPerBlock         = NanoLeaf<BuildT>::SIZE;
     static constexpr int MinBlocksPerMultiprocessor = 1;
 
+    // LabelT is deduced from the call, so this stays independent of ConnectedComponents.
+    template <typename LabelT>
     __device__ void operator()(const NanoGrid<BuildT>* d_grid, const uint64_t* d_offsets,
                                const nanovdb::Mask<3>* d_masks, const uint64_t* d_parent,
-                               const uint32_t* d_rank, uint32_t* d_voxelLabel)
+                               const LabelT* d_rank, LabelT* d_voxelLabel)
     {
         const int   leafID = blockIdx.x, n = threadIdx.x;
         const auto& leaf   = d_grid->tree().template getFirstNode<0>()[leafID];
@@ -672,210 +873,16 @@ struct VoxelLabelScatterFunctor
         const uint64_t base = d_offsets[leafID], end = d_offsets[leafID + 1];
         for (uint64_t s = base; s < end; ++s)
             if (d_masks[s].isOn(uint32_t(n))) {
-                d_voxelLabel[leaf.getValue(uint32_t(n))] = d_rank[d_parent[s]] - 1u;  // dense id in [0,N)
+                d_voxelLabel[leaf.getValue(uint32_t(n))] = LabelT(d_rank[d_parent[s]] - 1);  // dense id in [0,N)
                 return;
             }
     }
 };
 
-} // namespace cc_detail
+} // namespace components::detail
 
-//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-
-template <typename BuildT>
-std::vector<uint32_t> ConnectedComponents<BuildT>::convergenceHistogram() const
-{
-    // One bin per round, plus a final slot holding the total number of compress steps executed.
-    constexpr int N = cc_detail::LeafComponentCountFunctor<BuildT>::MaxConvergenceIters + 2;
-    std::vector<uint32_t> h(N, 0u);
-    if (mConvergenceHistogram.size())
-        cudaCheck(cudaMemcpy(h.data(), mConvergenceHistogram.deviceData(),
-                             N * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    return h;
-}// ConnectedComponents<BuildT>::convergenceHistogram
-
-//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-
-template <typename BuildT>
-void ConnectedComponents<BuildT>::processLeafConnectedComponents()
-{
-    const uint32_t leafCount =
-        util::cuda::DeviceGridTraits<BuildT>::getTreeData(mDeviceSrcGrid).mNodeCount[0];
-
-    // Allocate one component-count per leaf (device-only). At most 256 components per 8^3
-    // leaf (6-connected worst case), so uint16_t is sufficient.
-    if (mVerbose==1) mTimer.start("Allocating per-leaf component counts");
-    mLeafComponentCounts = nanovdb::cuda::DeviceBuffer::create(
-        std::size_t(leafCount) * sizeof(uint16_t), nullptr, false);
-    if (mVerbose==1) mTimer.stop();
-
-    if (leafCount == 0) return;
-
-    // One block per leaf, one thread per voxel offset; counts the distinct 6-connected
-    // components of each leaf's active voxels (in isolation) into mLeafComponentCounts.
-    using Op = cc_detail::LeafComponentCountFunctor<BuildT>;
-    uint32_t* d_hist = nullptr;
-    if (mConvergenceDiagnostics) {
-        mConvergenceHistogram = nanovdb::cuda::DeviceBuffer::create(
-            (Op::MaxConvergenceIters + 2) * sizeof(uint32_t), nullptr, false);
-        d_hist = static_cast<uint32_t*>(mConvergenceHistogram.deviceData());
-        cudaCheck(cudaMemsetAsync(d_hist, 0, (Op::MaxConvergenceIters + 2) * sizeof(uint32_t), mStream));
-    }
-    if (mVerbose==1) mTimer.start("Per-leaf connected-component counting");
-    Op countOp; countOp.mSchedule = mLeafSchedule;
-    util::cuda::operatorKernelInstance<Op>
-        <<<leafCount, Op::MaxThreadsPerBlock, 0, mStream>>>(countOp, mDeviceSrcGrid,
-                                                            deviceLeafComponentCounts(), d_hist);
-    cudaCheckError();
-    if (mVerbose==1) mTimer.stop();
-
-    // Prefix sum: mLeafComponentOffsets[0]=0, mLeafComponentOffsets[1..leafCount] = inclusive sum
-    // of mLeafComponentCounts. mLeafComponentOffsets[leafCount] = K (total leaf-local components).
-    if (mVerbose==1) mTimer.start("Allocating per-leaf component offsets");
-    mLeafComponentOffsets = nanovdb::cuda::DeviceBuffer::create(
-        (std::size_t(leafCount) + 1) * sizeof(uint64_t), nullptr, false);
-    if (mVerbose==1) mTimer.stop();
-
-    cudaCheck(cudaMemsetAsync(mLeafComponentOffsets.deviceData(), 0, sizeof(uint64_t), mStream));
-
-    // Upcast per-leaf uint16_t counts into offsets[1..leafCount] as uint64_t.
-    uint16_t* d_counts  = deviceLeafComponentCounts();
-    uint64_t* d_offsets = deviceLeafComponentOffsets();
-    util::cuda::lambdaKernel<<<(leafCount + 255) / 256, 256, 0, mStream>>>(
-        leafCount, cc_detail::UpcastCountsFunctor{}, d_counts, d_offsets);
-    cudaCheckError();
-
-    // In-place inclusive sum over offsets[1..leafCount]; offsets[leafCount] = K (total components).
-    if (mVerbose==1) mTimer.start("Per-leaf component offset prefix sum");
-    CALL_CUBS(DeviceScan::InclusiveSum, d_offsets + 1, d_offsets + 1, int(leafCount));
-    cudaCheckError();
-    if (mVerbose==1) mTimer.stop();
-
-    // Read the aggregate count from the sentinel at offsets[leafCount].
-    // Use async copy on mStream (ordered after the scan) + stream sync to avoid
-    // inadvertently synchronizing other streams.
-    cudaCheck(cudaMemcpyAsync(&mLeafComponentAggregateCount, d_offsets + leafCount,
-                              sizeof(uint64_t), cudaMemcpyDeviceToHost, mStream));
-    cudaCheck(cudaStreamSynchronize(mStream));
-
-    // Allocate mLeafComponentAggregateCount Mask<3> objects — one per leaf-local component.
-    // No zero-init needed: the mask-fill kernel writes all 16 uint32_t words of every mask
-    // unconditionally via warp ballot (zero ballot = no component voxels in that warp).
-    if (mVerbose==1) mTimer.start("Allocating per-component leaf masks");
-    mLeafComponentMasks = nanovdb::cuda::DeviceBuffer::create(
-        mLeafComponentAggregateCount * sizeof(nanovdb::Mask<3>), nullptr, false);
-    if (mVerbose==1) mTimer.stop();
-
-    // Allocate 6 uint64_t face masks per component (one per LeafNeighborTap entry).
-    // The face-extraction kernel fills these; no zero-init needed for the same reason.
-    if (mVerbose==1) mTimer.start("Allocating per-component face masks");
-    mLeafComponentFaceMasks = nanovdb::cuda::DeviceBuffer::create(
-        mLeafComponentAggregateCount * 6 * sizeof(uint64_t), nullptr, false);
-    if (mVerbose==1) mTimer.stop();
-
-    // Re-run SV per leaf and scatter each active voxel's bit into its component's Mask<3>.
-    using MaskOp = cc_detail::LeafComponentMaskFunctor<BuildT>;
-    if (mVerbose==1) mTimer.start("Per-leaf component mask fill");
-    MaskOp maskOp; maskOp.mSchedule = mLeafSchedule;
-    util::cuda::operatorKernelInstance<MaskOp>
-        <<<leafCount, MaskOp::MaxThreadsPerBlock, 0, mStream>>>(
-            maskOp, mDeviceSrcGrid, deviceLeafComponentOffsets(),
-            deviceLeafComponentMasks(), deviceLeafComponentFaceMasks());
-    cudaCheckError();
-    if (mVerbose==1) mTimer.stop();
-}// ConnectedComponents<BuildT>::processLeafConnectedComponents
-
-//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-
-template <typename BuildT>
-void ConnectedComponents<BuildT>::processCrossLeafEdges()
-{
-    const uint32_t leafCount =
-        util::cuda::DeviceGridTraits<BuildT>::getTreeData(mDeviceSrcGrid).mNodeCount[0];
-    mCrossLeafEdgeCount = 0;
-    if (leafCount == 0) return;
-
-    // Per-leaf edge offsets: offsets[0]=0, offsets[1..leafCount] filled by the count pass then
-    // scanned in place; offsets[leafCount] = E (total cross-leaf edges).
-    mCrossLeafEdgeOffsets = nanovdb::cuda::DeviceBuffer::create(
-        (std::size_t(leafCount) + 1) * sizeof(uint64_t), nullptr, false);
-    uint64_t* d_offsets = static_cast<uint64_t*>(mCrossLeafEdgeOffsets.deviceData());
-    cudaCheck(cudaMemsetAsync(d_offsets, 0, sizeof(uint64_t), mStream));
-
-    // Count pass: one block per leaf, writing each leaf's edge count into offsets[leafID+1].
-    using CountOp = cc_detail::CrossLeafEdgeCountFunctor<BuildT>;
-    if (mVerbose==1) mTimer.start("Cross-leaf edge count");
-    util::cuda::operatorKernel<CountOp>
-        <<<leafCount, CountOp::MaxThreadsPerBlock, 0, mStream>>>(
-            mDeviceSrcGrid, deviceLeafComponentOffsets(), deviceLeafComponentFaceMasks(), d_offsets + 1);
-    cudaCheckError();
-    if (mVerbose==1) mTimer.stop();
-
-    // Inclusive prefix sum over offsets[1..leafCount]; offsets[leafCount] = E.
-    if (mVerbose==1) mTimer.start("Cross-leaf edge offset prefix sum");
-    CALL_CUBS(DeviceScan::InclusiveSum, d_offsets + 1, d_offsets + 1, int(leafCount));
-    cudaCheckError();
-    if (mVerbose==1) mTimer.stop();
-
-    cudaCheck(cudaMemcpyAsync(&mCrossLeafEdgeCount, d_offsets + leafCount,
-                              sizeof(uint64_t), cudaMemcpyDeviceToHost, mStream));
-    cudaCheck(cudaStreamSynchronize(mStream));
-    if (mCrossLeafEdgeCount == 0) return;  // single-leaf grid / no touching components
-
-    // Scatter pass: write each leaf's edges into [offsets[leafID], offsets[leafID+1]).
-    mCrossLeafEdges = nanovdb::cuda::DeviceBuffer::create(
-        mCrossLeafEdgeCount * sizeof(CrossLeafEdge), nullptr, false);
-    using ScatterOp = cc_detail::CrossLeafEdgeScatterFunctor<BuildT>;
-    if (mVerbose==1) mTimer.start("Cross-leaf edge scatter");
-    util::cuda::operatorKernel<ScatterOp>
-        <<<leafCount, ScatterOp::MaxThreadsPerBlock, 0, mStream>>>(
-            mDeviceSrcGrid, deviceLeafComponentOffsets(), deviceLeafComponentFaceMasks(),
-            d_offsets, deviceCrossLeafEdges());
-    cudaCheckError();
-    if (mVerbose==1) mTimer.stop();
-}// ConnectedComponents<BuildT>::processCrossLeafEdges
-
-//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-
-template <typename BuildT>
-void ConnectedComponents<BuildT>::processComponentLabels()
-{
-    const uint64_t K = mLeafComponentAggregateCount;
-    mComponentParent = nanovdb::cuda::DeviceBuffer::create(
-        std::size_t(K ? K : 1) * sizeof(uint64_t), nullptr, false);  // avoid 0-byte alloc
-    if (K == 0) return;
-    uint64_t* d_parent = deviceComponentParent();
-
-    auto blocks = [](uint64_t n) { return (unsigned int)((n + 255) / 256); };
-
-    // (a) init: every component is its own root.
-    if (mVerbose==1) mTimer.start("Component-label init");
-    util::cuda::lambdaKernel<<<blocks(K), 256, 0, mStream>>>(
-        K, cc_detail::LabelInitFunctor{}, d_parent);
-    cudaCheckError();
-    if (mVerbose==1) mTimer.stop();
-
-    // (b) unite: one thread per edge; each ccUnite has its own CAS-retry, so one pass suffices.
-    if (mCrossLeafEdgeCount) {
-        if (mVerbose==1) mTimer.start("Component-label unite");
-        util::cuda::lambdaKernel<<<blocks(mCrossLeafEdgeCount), 256, 0, mStream>>>(
-            mCrossLeafEdgeCount, cc_detail::LabelUniteFunctor{}, d_parent, deviceCrossLeafEdges());
-        cudaCheckError();
-        if (mVerbose==1) mTimer.stop();
-    }
-
-    // (c) flatten: point every component directly at its representative (class minimum slot).
-    if (mVerbose==1) mTimer.start("Component-label flatten");
-    util::cuda::lambdaKernel<<<blocks(K), 256, 0, mStream>>>(
-        K, cc_detail::LabelFlattenFunctor{}, d_parent);
-    cudaCheckError();
-    if (mVerbose==1) mTimer.stop();
-}// ConnectedComponents<BuildT>::processComponentLabels
-
-//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-
-template <typename BuildT>
-void ConnectedComponents<BuildT>::processVoxelLabels()
+template <typename BuildT, typename ResourceT>
+void ConnectedComponents<BuildT, ResourceT>::processVoxelLabels()
 {
     const uint32_t leafCount =
         util::cuda::DeviceGridTraits<BuildT>::getTreeData(mDeviceSrcGrid).mNodeCount[0];
@@ -883,8 +890,8 @@ void ConnectedComponents<BuildT>::processVoxelLabels()
         util::cuda::DeviceGridTraits<BuildT>::getActiveVoxelCount(mDeviceSrcGrid);
 
     // Per-active-voxel dense-label sidecar (indexed by leaf.getValue(n); slot 0 = background).
-    mVoxelLabel = nanovdb::cuda::DeviceBuffer::create((activeCount + 1) * sizeof(uint32_t), nullptr, false);
-    cudaCheck(cudaMemsetAsync(mVoxelLabel.deviceData(), 0xFF, (activeCount + 1) * sizeof(uint32_t), mStream)); // background = 0xFFFFFFFF
+    mVoxelLabel = BufT<ComponentLabelT>(mStream, this->ref(), activeCount + 1, nanovdb::cuda::noInit);
+    cudaCheck(cudaMemsetAsync(mVoxelLabel.data(), 0xFF, mVoxelLabel.size_bytes(), mStream)); // background = 0xFFFFFFFF
 
     mGlobalComponentCount = 0;
     const uint64_t K = mLeafComponentAggregateCount;
@@ -892,32 +899,40 @@ void ConnectedComponents<BuildT>::processVoxelLabels()
 
     // (a) Assign dense component ids: rank[s] = inclusive count of self-roots in [0,s], so a root's
     //     dense id is rank[root]-1 and rank[K-1] = N.
-    auto rankBuf = nanovdb::cuda::DeviceBuffer::create(K * sizeof(uint32_t), nullptr, false);
-    auto* d_rank = static_cast<uint32_t*>(rankBuf.deviceData());
+    //     rankBuf retains mStream, so the scatter below is ordered before the free at scope exit.
+    BufT<ComponentLabelT> rankBuf(mStream, this->ref(), K, nanovdb::cuda::noInit);
+    auto* d_rank = rankBuf.data();
     util::cuda::lambdaKernel<<<(unsigned int)((K + 255) / 256), 256, 0, mStream>>>(
-        K, cc_detail::RootFlagFunctor{}, deviceComponentParent(), d_rank);
+        K, components::detail::RootFlagFunctor{}, deviceComponentParent(), d_rank);
     cudaCheckError();
-    CALL_CUBS(DeviceScan::InclusiveSum, d_rank, d_rank, int(K));
+    if (mVerbose==1) mTimer.start("Component-rank prefix sum");
+    CALL_CUBS(DeviceScan::InclusiveSum, d_rank, d_rank, K);
     cudaCheckError();
+    if (mVerbose==1) mTimer.stop();
 
-    uint32_t hN = 0;
-    cudaCheck(cudaMemcpyAsync(&hN, d_rank + (K - 1), sizeof(uint32_t), cudaMemcpyDeviceToHost, mStream));
+    cudaCheck(cudaMemcpyAsync(&mGlobalComponentCount, d_rank + (K - 1), sizeof(ComponentLabelT),
+                              cudaMemcpyDeviceToHost, mStream));
     cudaCheck(cudaStreamSynchronize(mStream));
-    mGlobalComponentCount = uint64_t(hN);
 
     // (b) Scatter: each active voxel's dense component id -> sidecar.
-    using ScatterOp = cc_detail::VoxelLabelScatterFunctor<BuildT>;
+    using ScatterOp = components::detail::VoxelLabelScatterFunctor<BuildT>;
     if (mVerbose==1) mTimer.start("Voxel-label scatter");
     util::cuda::operatorKernel<ScatterOp>
         <<<leafCount, ScatterOp::MaxThreadsPerBlock, 0, mStream>>>(
             mDeviceSrcGrid, deviceLeafComponentOffsets(), deviceLeafComponentMasks(),
-            deviceComponentParent(), d_rank, static_cast<uint32_t*>(mVoxelLabel.deviceData()));
+            deviceComponentParent(), d_rank, mVoxelLabel.data());
     cudaCheckError();
     if (mVerbose==1) mTimer.stop();
-}// ConnectedComponents<BuildT>::processVoxelLabels
+}// ConnectedComponents<BuildT, ResourceT>::processVoxelLabels
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 } // namespace tools::cuda
 
 } // namespace nanovdb
+
+#ifdef CALL_CUBS
+#undef CALL_CUBS
+#endif
 
 #endif // NVIDIA_TOOLS_CUDA_CONNECTEDCOMPONENTS_CUH_HAS_BEEN_INCLUDED

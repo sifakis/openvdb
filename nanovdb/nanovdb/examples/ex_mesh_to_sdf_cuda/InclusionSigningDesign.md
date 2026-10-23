@@ -238,7 +238,8 @@ M0 (diagnostic, ~free — establishes N)
 **Prototype M1 with per-label `PruneGrid` first** (§8): extract each γᵢ as a masked sub-grid so M2–M5
 can proceed and the whole algorithm is validated end to end. Replace that with a dedicated **batched
 partition primitive** (label → `N` index grids in one pass) as a later optimization — a sibling of the
-existing `prune` / `dilate` / `merge` topology ops. Decoupling M1's optimization from M2–M5 keeps the
+existing `prune` / `dilate` / `merge` topology ops. That operator is designed in
+[`PartitionGridDesign.md`](./PartitionGridDesign.md). Decoupling M1's optimization from M2–M5 keeps the
 algorithm work unblocked.
 
 ### Status

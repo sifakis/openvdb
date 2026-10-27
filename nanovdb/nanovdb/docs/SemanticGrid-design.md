@@ -225,8 +225,11 @@ An enumeration is built from three choices.
 - **Packed:** `bool` only, one bit per slot, stored as one `Mask<L>` per node.
 - **Compact:** the entity's rank among the members of the subset. No wasted space; needs a rank structure
   (7.4).
-- **Indexed** (optional): each entity holds an index into a shared value table, like USD's indexed
-  primvars. For values that repeat, e.g. a material id per voxel looking up a palette.
+There is deliberately no free-form "indexed" mapping (each entity holding an index into a shared table, like
+USD's indexed primvars). That would break the rule in 7.7. Values that repeat, e.g. a material id per voxel
+looking up a palette, are modelled as two ordinary arrays: a per-voxel `uint32_t` array whose values happen
+to be indices, and the palette under `Global` or its own flat enumeration. The indirection is in the data,
+not in how entities map to positions.
 
 ### 7.2 Catalogue
 
@@ -284,6 +287,8 @@ such as the value or child mask, or a `Packed` array). So:
   usually on the same cache line as the mask. Small, but measurable in tight loops: a reason to keep the
   built-in path for active voxels.
 
+Section 7.8 makes this concrete for leaf-level subsets: an additional index layer.
+
 ### 7.5 The root
 
 The slots of internal nodes form a fixed grid (32^3, 16^3, 8^3). The root's slots are unbounded, and its table
@@ -308,8 +313,10 @@ Enumerations differ in how far correctness depends on stored data.
    number them. A rank is then a function of the masks and the node order. Any stored offsets are a cache of
    that function: checkable in one prefix-sum pass, rebuildable from the masks, and overlaps or gaps are
    errors.
-3. **Free-form stored mapping: anything goes, so it must be checked.** `Indexed`, explicit permutations,
-   and `RootKeys` unless required to be sorted and unique.
+3. **Free-form stored mapping: anything goes, so it must be checked.** Only one enumeration is allowed in
+   this category: active voxels, through the grid's own offsets (7.7). `RootKeys` stays in category 2 by
+   requiring its keys to be sorted and unique. Explicit permutations and per-entity lookup tables are not
+   enumerations at all (7.1).
 
 Voxels differ from nodes here. Voxel indices under `mOffset` are stored data, so two leaves could have
 overlapping index ranges, or leave gaps, or be out of order. Nodes cannot.
@@ -351,6 +358,101 @@ prefix-sum pass when the object is built. Many tools (the CUDA tools, `VoxelBloc
 assume canonical offsets, treating the n-th active voxel's value as `array[n]`. With the flag, such tools
 require it once when they take a view, instead of each tool checking for itself or relying on the
 assumption silently.
+
+If the flag is set, the grid's own `mOffset` and `mPrefixSum` are, like any canonical offsets, only an
+acceleration structure (7.8): a cache that happens to live inside the leaves.
+
+### 7.8 Additional index layers
+
+Some attributes need a second set of voxels with its own consistent numbering. Example: each leaf's active
+voxels plus their 6-connected neighbours within the leaf, with every slot in that extended set numbered.
+
+**What a layer needs.** The same three things a `ValueOnIndex` leaf holds, kept as per-leaf arrays:
+
+- a membership mask per leaf (`Mask<3>`): which slots belong to the set;
+- an offset per leaf: where the leaf's range starts;
+- optionally, the within-leaf prefix sum, for constant-time rank (otherwise a popcount over up to eight words).
+
+All three are indexed by leaf id, so they stay aligned with each other and with the grid for free (7.3). A
+lookup always needs both mask and offset, so they are best stored together, one record per leaf:
+
+```cpp
+template<uint32_t LOG2DIM>
+struct IndexBlock                       // 80 bytes for LOG2DIM = 3
+{
+    Mask<LOG2DIM> mMask;                // membership; not "active", hence not mValueMask
+    uint64_t      mOffset, mPrefixSum;  // as in LeafIndexBase
+};
+
+Attr<Nodes<Leaf>, IndexBlock<3>, tag::Layer<tag::Halo>>            // the layer
+using HaloVoxels = Compact<Slots<Leaf>, LayerOf<tag::Halo>>;
+Attr<HaloVoxels, float, tag::HaloSdf>                               // a channel over the extended set
+```
+
+A channel over a layer refers to the layer by tag, so taking a view checks that the layer is present. A
+location (leaf id, slot) is enough to read any channel over any layer; a voxel in two layers has two indices,
+and nothing converts between them:
+
+```cpp
+auto loc = acc.probe(ijk);
+float a  = view.get<tag::Sdf>(loc);       // through the grid's mOffset (active voxels)
+float h  = view.get<tag::HaloSdf>(loc);   // through the Halo layer's IndexBlock
+```
+
+**Layers are canonical.** An additional layer follows the compact contract (7.6, category 2), so the rule in
+7.7 still holds. Its offsets are fully determined by the masks and the leaf order (the exclusive prefix sum of
+each leaf's popcount, plus a fixed start), so they are only an acceleration structure:
+
+- Random access needs them; a kernel that sweeps all leaves can compute them on the fly with one scan.
+- They need not be stored or serialized. The owner can persist only the masks and build the offsets with one
+  scan when a view is first taken.
+- Offsets the owner built are correct by construction; loaded ones can be checked or rebuilt.
+
+This holds only if the contract fixes the starting value (0, or 1 with slot 0 reserved; use the same
+convention as active voxels), the order (leaves in storage order, bits in order), and no sharing of arrays
+between grids (batching would need a per-grid base offset).
+
+If the membership is itself a function of the topology, as in the example (each leaf's value mask dilated
+within the leaf, which the `MaskShift` helpers in `util/MorphologyHelpers.h` compute), the masks are a cache
+too, and the descriptor records that provenance so the layer is stale when the topology changes. If the set
+is chosen by hand, the masks are primary data. Whether a layer must contain the active voxels is a recorded
+property, not a requirement.
+
+**Sharing code with `LeafData<ValueOnIndex>`.** An `IndexBlock` is exactly the lower part of
+`LeafIndexBase` (`mValueMask`, `mOffset`, `mPrefixSum`), without the leaf's identity (`mBBoxMin`,
+`mBBoxDif`, `mFlags`), which a layer does not need because it shares the grid's leaves. The rank code in
+`LeafData<ValueOnIndex>::getValue` (NanoVDB.h:4240) is exactly what a layer needs. Ways to share it:
+
+- *`IndexBlock` as a base class of `LeafIndexBase`:* rejected. A base class's members come first in memory,
+  which would move the mask from byte 16 to byte 0. PNanoVDB hard-codes the leaf layout
+  (`PNANOVDB_LEAF_OFF_BBOX_MIN 0`, `PNANOVDB_LEAF_OFF_VALUE_MASK 16`, PNanoVDB.h:1830), as do the C port,
+  shaders and existing files. It would be a format change for every index grid.
+- *`IndexBlock` as a member of `LeafIndexBase`:* same bytes, but every `->mValueMask` becomes
+  `->mIndex.mValueMask`, a broad source change.
+- *A view type over the leaf's bytes* (`reinterpret_cast`): works in practice, but relies on aliasing
+  assumptions for no benefit over the next option.
+- *A shared free function (recommended):*
+
+  ```cpp
+  template<uint32_t LOG2DIM>
+  __hostdev__ uint64_t rankOf(const Mask<LOG2DIM>& mask, uint64_t offset, uint64_t prefixSum, uint32_t i);
+  ```
+
+  `LeafData<ValueOnIndex>::getValue` calls it with its own members, and `IndexBlock` with its own. No format
+  change, no renames, and the same tested code for both.
+
+`IndexBlock` should not carry `NANOVDB_ALIGN(NANOVDB_DATA_ALIGNMENT)`: 32-byte alignment would pad each record
+from 80 to 96 bytes. Eight-byte alignment, from its `uint64_t` members, is enough.
+
+**Rejected alternative: a second grid.** Building a second `ValueOnIndex` grid whose leaf masks are the
+extended masks gives `mOffset`, `mPrefixSum` and `ChannelAccessor` for free, but duplicates every internal
+node, lines up leaf ids only if the builder happens to store leaves in the same order, needs two tree lookups
+per query, and leaves two grid identities to keep consistent. The `IndexBlock` array reuses the first grid's
+tree to find the leaf.
+
+The first layer stays special only in what its mask means: the grid's `mValueMask` is both membership and
+topology (it defines which voxels are active), while a layer's mask is only membership. How the two index is
+the same.
 
 ## 8. `GridView`
 
@@ -598,7 +700,8 @@ attached.
 |---|---|
 | Nodes of each level are contiguous; `getFirstNode<LEVEL>()` returns the first | NanoVDB.h:2578-2617 |
 | `ValueOnIndex` leaves return index 0 for inactive voxels (the background slot) | NanoVDB.h:4245 |
-| Index-grid leaves rank active voxels with `mOffset` plus a prefix sum | `LeafIndexBase`, NanoVDB.h:4160 onward |
+| Index-grid leaves rank active voxels with `mOffset` plus a prefix sum | `LeafIndexBase`, NanoVDB.h:4160 onward; rank code in `LeafData<ValueOnIndex>::getValue`, :4240 |
+| PNanoVDB hard-codes the leaf layout: bbox at byte 0, value mask at byte 16 | PNanoVDB.h:1830 |
 | Leaf statistics are interleaved in the value index space | NanoVDB.h:4216 (`ValueIndex`), :4236 (`ValueOnIndex`) |
 | The root's tiles are stored sorted | NanoVDB.h:3219 |
 | `ChannelAccessor`: index-grid accessor plus one channel, from blind data or an external pointer | NanoVDB.h:5884 |
@@ -613,7 +716,7 @@ attached.
 | Houdini attribute classes (point, vertex, primitive, detail) | entity class per attribute; *detail* is `Global` |
 | OpenMesh property handles, CGAL `Surface_mesh` property maps | (entity kind, element type, name) per property, stored as its own array: the `Attr` triple |
 | USD primvars | name, type, *interpolation* (constant, uniform, vertex, varying, faceVarying): interpolation is the enumeration; element counts are checked against the topology |
-| USD indexed primvars (`primvars:foo:indices`) | values stored compactly through an index array: the `Indexed` and `Compact` ideas |
+| USD indexed primvars (`primvars:foo:indices`) | values stored compactly through an index array; here, lookup tables are modelled as data (7.1), and compact storage as `Compact` enumerations |
 | USD typed, applied and multiple-apply API schemas | recipes, add-on components, and the same component applied several times (`tag::Stats<...>`) |
 | `UsdVolVolume` with named fields pointing at `UsdVolOpenVDBAsset` | a named bundle whose parts live in external storage; schema separate from storage location |
 | `std::mdspan` layout policies, `Kokkos::View<T, Layout, MemorySpace>` | a non-owning, trivially copyable view parameterized by an index-to-offset mapping: the enumeration's role |
@@ -644,6 +747,8 @@ as fields or attributes.
 7. **Format additions**: new `GridBlindDataSemantic` values, and marking a blind-data array as per-node.
 8. **Grid identity**: checksum, or a cheaper buffer identity, for the check in 9.3.
 9. **Batching**: a per-grid base offset into shared arrays (7.7), and how it interacts with canonical ranks.
+10. **Index layers** (7.8): whether layers persist their offsets or rebuild them on load, and whether to add
+    the shared `rankOf` function to NanoVDB.h ahead of any layer implementation.
 
 ## 16. Suggested first prototype
 
@@ -652,3 +757,30 @@ and PropagateSign's interior outputs, plus a leaf-and-lower `Stats` array comput
 exercises every enumeration category the level set needs: compact active voxels (the SDF), per-node (the
 statistics), packed slots and root keys (the interior). Check `LevelSetView::getValue` against
 `signedFloodFill` on the equivalent `FloatGrid`.
+
+## 17. Note: growable index grids
+
+A blue-sky idea (discussed with Ken) that the design should stay compatible with. Each leaf's range in the
+value arrays is provisioned with spare slots after its active voxels (e.g. 8 per leaf), so voxels can later be
+activated within existing leaves without rebuilding the arrays. The spare slots have no coordinate and are
+never reached through the tree.
+
+How it fits so far:
+
+- Spare slots are gaps in the active-voxel mapping, which the free-form exception for active voxels allows
+  (7.7). Such a grid is a valid index grid, but not canonical: after insertions a leaf's capacity depends on
+  its history, so the offsets are real data, not a cache.
+- Statistics must first move out of the value channel (section 10): today they sit right after a leaf's last
+  active value, where the spare slots would go.
+- A leaf's capacity is `offset[id+1] - offset[id]` while ranges stay in leaf order, so nothing new is stored.
+- Inserting a voxel shifts the later voxels of its leaf by one slot (rank follows bit order) and rewrites the
+  leaf's `mPrefixSum`. The work stays within the leaf, but must be applied to every array over active voxels.
+  Only the bundle's descriptor knows all of them.
+- Tools that treat a channel as a flat array of `activeVoxelCount` values break; the canonical flag (7.7)
+  lets them refuse such a grid when they take a view.
+- Additional index layers (7.8) could grow the same way, with spare slots in each leaf's range. Their
+  offsets would then become real data too, so a growable layer would be a second exception to the rule in
+  7.7, to be decided if this is pursued.
+- Open: what to do when a leaf runs out of spare slots (rebuild all offsets, or relocate the leaf's range and
+  store per-leaf capacities). New leaves are a topology rebuild, which invalidates every per-node array.
+  On the GPU, insertions would be batched per leaf.

@@ -4,7 +4,7 @@ Design notes for a container/view structure that bundles a NanoVDB index grid wi
 meaning (value channels, interior masks, statistics, global parameters), so that the bundle can be passed
 around as one semantic object, e.g. "a level set".
 
-Status: design discussion only. Nothing here is implemented. All type names (`GridView`, `Attr`, `Nodes`,
+Status: design discussion only. Nothing here is implemented. All type names (`GridView`, `Attribute`, `Nodes`,
 `Compact`, ...) are placeholders. Line references are to `develop/nanovdb` at 5be1b3cd1.
 
 Revision (2026-10-28): section 7.9 tightens the enumerations to four classes, `Global`, `Node<...>`,
@@ -17,7 +17,7 @@ Contents:
 2. Goals and non-goals
 3. Overview: owner, view, accessor, descriptor
 4. The entities of a tree
-5. `Attr`: describing one array
+5. `Attribute`: describing one array
 6. Tags
 7. Enumerations (7.9: the current refinement)
 8. `GridView`
@@ -83,7 +83,7 @@ and `NanoGrid*` (views them).
 | Piece | Lives on | Role |
 |---|---|---|
 | **Owning object** | host | Holds the `GridHandle` and any separate buffers (e.g. stream-ordered `cuda::Buffer<T, ResourceRef<...>>`). Resolves every array to a pointer and hands out views. |
-| **View** (`GridView<BuildT, Attrs...>`) | host and device | Trivially copyable: the grid pointer plus one storage handle per array. Passed by value into kernels. Shared and const. |
+| **View** (`GridView<BuildT, Attributes...>`) | host and device | Trivially copyable: the grid pointer plus one storage handle per array. Passed by value into kernels. Shared and const. |
 | **Accessor** | per thread | Wraps `DefaultReadAccessor<BuildT>` (a node cache, so mutable) plus a reference to the view. Tree lookups go through it. |
 | **Descriptor** | with the owner, optionally serialized | Runtime list of the arrays: name, element type, enumeration, count, storage location, provenance. Used for I/O, runtime callers, and checking a view before it is handed out. |
 
@@ -109,11 +109,11 @@ Values can attach to any of these:
 - **Per slot:** voxel values, tile values, interior masks.
 - **Global:** background, isovalue, narrow-band width.
 
-## 5. `Attr`: describing one array
+## 5. `Attribute`: describing one array
 
 ```cpp
 template<typename EnumerationT, typename T, typename TagT>
-struct Attr
+struct Attribute
 {
     using Enumeration = EnumerationT;  // which entities, and how each maps to an array position
     using ValueType   = T;             // element type
@@ -122,7 +122,7 @@ struct Attr
 };
 ```
 
-`Attr` is a pure compile-time description, like a column in a schema. It holds no data and is never
+`Attribute` is a pure compile-time description, like a column in a schema. It holds no data and is never
 instantiated. The data lives in buffers owned by the owning object, and as pointers inside a view.
 
 The enumeration does most of the work. Every enumeration provides the same small interface:
@@ -142,15 +142,15 @@ struct SomeEnumeration
 `T` and the enumeration together decide the storage. A `bool` over a `Packed<...>` enumeration is stored as
 bits, so its `Storage` is a `const Mask<L>*` and `fetch` tests a bit.
 
-| `Attr` | `Storage` | `fetch(loc)` |
+| `Attribute` | `Storage` | `fetch(loc)` |
 |---|---|---|
-| `Attr<Compact<Slots<Leaf>, Active>, float, tag::Sdf>` | `const float*` | `data[leaf.getValue(slot)]` |
-| `Attr<Nodes<Leaf>, Stats<float>, tag::Stats<tag::Sdf>>` | `const Stats<float>*` | `data[nodeId]` |
-| `Attr<Nodes<Leaf, Lower, Upper, Root>, Stats<float>, ...>` | one pointer per level | `data[loc.level][nodeId]` |
-| `Attr<Packed<Slots<Leaf, Lower, Upper>>, bool, tag::Interior>` | one `Mask` array per node level | bit `slot` of the mask of node `nodeId` at `loc.level` |
-| `Attr<Global, float, tag::Background>` | `float` | the value |
+| `Attribute<Compact<Slots<Leaf>, Active>, float, tag::Sdf>` | `const float*` | `data[leaf.getValue(slot)]` |
+| `Attribute<Nodes<Leaf>, Stats<float>, tag::Stats<tag::Sdf>>` | `const Stats<float>*` | `data[nodeId]` |
+| `Attribute<Nodes<Leaf, Lower, Upper, Root>, Stats<float>, ...>` | one pointer per level | `data[loc.level][nodeId]` |
+| `Attribute<Packed<Slots<Leaf, Lower, Upper>>, bool, tag::Interior>` | one `Mask` array per node level | bit `slot` of the mask of node `nodeId` at `loc.level` |
+| `Attribute<Global, float, tag::Background>` | `float` | the value |
 
-One `Attr` serves three consumers:
+One `Attribute` serves three consumers:
 
 1. the **view**, through `Storage` and `fetch`;
 2. the **owning object**, through `Enumeration::count(grid)` and `sizeof(T)`, to allocate buffers;
@@ -158,7 +158,7 @@ One `Attr` serves three consumers:
 
 An alternative would let the tag own `T` and the enumeration (`struct Sdf { using ValueType = float; ... }`)
 so a view lists only tags. That is shorter, but fixes `Sdf` to one type and one enumeration everywhere.
-Keeping `Attr` a triple lets the same tag mean, for example, a `double` SDF in another view. Aliases can
+Keeping `Attribute` a triple lets the same tag mean, for example, a `double` SDF in another view. Aliases can
 cover the common cases.
 
 ## 6. Tags
@@ -254,7 +254,8 @@ not in how entities map to positions.
 
 ### 7.3 Node ids come from the layout
 
-Each level's nodes are stored contiguously and have one size, so a node's id is a pointer difference:
+Each level's nodes are stored contiguously and have one size, so a node's id is a pointer difference. This
+presumes `grid.isSequential()` (NanoVDB.h:2336): fixed-size nodes, and the `IsBreadthFirst` grid flag set.
 
 ```cpp
 const uint64_t id = nodePtr - tree.getFirstNode<LEVEL>();   // NanoVDB.h:2588, :2607
@@ -391,9 +392,9 @@ struct IndexBlock                       // 80 bytes for LOG2DIM = 3
     uint64_t      mOffset, mPrefixSum;  // as in LeafIndexBase
 };
 
-Attr<Nodes<Leaf>, IndexBlock<3>, tag::Layer<tag::Halo>>            // the layer
+Attribute<Nodes<Leaf>, IndexBlock<3>, tag::Layer<tag::Halo>>            // the layer
 using HaloVoxels = Compact<Slots<Leaf>, LayerOf<tag::Halo>>;
-Attr<HaloVoxels, float, tag::HaloSdf>                               // a channel over the extended set
+Attribute<HaloVoxels, float, tag::HaloSdf>                               // a channel over the extended set
 ```
 
 A channel over a layer refers to the layer by tag, so taking a view checks that the layer is present. A
@@ -487,7 +488,7 @@ an array is.
   `nodePtr - getFirstNode<L>()` (7.3), and each level's positions run from 0 to that level's node count. No
   enumeration has a position space spanning levels. The interface works per level (`count<L>(grid)`), and
   `fetch` uses `loc.level` to choose the level's range.
-- **A multi-level `Attr` is a set of single-level arrays under one tag,** so `get<Tag>(loc)` works at
+- **A multi-level `Attribute` is a set of single-level arrays under one tag,** so `get<Tag>(loc)` works at
   whatever level a lookup stopped. Leaving a level out of the list means that level has no data.
 - **The record can be anything:** statistics, a mask, a rank record, or a value for every slot of the node.
   Dense per-slot data is simply a per-node record of `SLOTS` values (e.g. `float[512]` per leaf), so no
@@ -497,7 +498,7 @@ an array is.
   whose element at level L is that level's `Mask<LOG2DIM>`:
 
   ```cpp
-  Attr<Node<Leaf, Lower, Upper>, NodeMask, tag::Interior>
+  Attribute<Node<Leaf, Lower, Upper>, NodeMask, tag::Interior>
   ```
 
   Since each level is indexed and stored separately, a different type per level is natural, and one tag still
@@ -517,28 +518,56 @@ declare a mask, and neither `MaskBit` nor the overlap between `Nodes<L>` with `M
 #### 7.9.3 `Index<...>`
 
 Values for a subset of the slots of one level, reached through a **rank source**: per node, a membership
-mask, an offset, and within-node prefix counts. An `Index` array names its rank source, so taking a view
-checks that it is present:
+mask, an offset, and within-node prefix counts. The rank source is part of the enumeration, not an attribute:
+it is how the data is indexed, not data of its own. The attribute's element type is the actual data:
 
 ```cpp
-Attr<Index<Leaf, BuiltinActive>, float, tag::Sdf>       // the grid's own leaves are the rank source
-Attr<Index<Leaf, tag::Halo>,     float, tag::HaloSdf>   // rank source: the Node<Leaf> array tagged Halo
+Attribute<Index<Leaf, BuiltinRank>, float, tag::Sdf>       // view stores: data pointer (ranks from the grid)
+Attribute<Index<Leaf, CustomRank>,  float, tag::HaloSdf>   // view stores: data pointer + rank-records pointer
+Attribute<Index<Leaf, CustomRank>,  Vec3f, tag::HaloGrad>  // same rank records, if the owner points it there
+Attribute<Index<Leaf, CustomRank>,  Ordinal, tag::HaloSet> // a set: only the rank-records pointer
 ```
 
-**Offsets are laissez-faire, with properties stated on top.** Gaps, overlaps and non-monotonic offsets are
-all representable. Each rank source records which of these properties it guarantees, and each tool states
-which it needs:
+`CustomRank`, and additional voxel layers in general, are speculative. There is a design argument for using
+a separate grid for each numbering instead: one grid, one numbering, keeps every grid's meaning simple, and
+a layer that crosses leaf boundaries (e.g. a halo dilated across leaves) needs new leaves, so it is a
+different topology anyway. The costs of separate grids are in 7.8 (duplicated internal nodes, leaf ids that
+only line up if both builders order leaves the same way, two lookups per query).
 
-1. **In range:** every position is less than the array's length. Needed by every reader.
-2. **No overlaps:** no two entities share a position. Needed by any tool that writes one value per entity.
-3. **Canonical:** monotonic, no gaps, rank order (nodes in storage order, bits in order, a fixed start).
-   The offsets are then only an acceleration structure: rebuildable from the masks, checkable in one
-   prefix-sum pass. Tools that treat a channel as a flat array need this.
+The two markers name where the ranking comes from. `BuiltinRank` is whatever the grid's leaves index (active
+voxels for `ValueOnIndex`, every leaf voxel for `ValueIndex`). With `CustomRank` the attribute carries a
+pointer to its own rank records, so each attribute is complete on its own, and storage stays per attribute.
+Sharing a layer's records between attributes is the owner's business: it points them at the same array.
+
+What this gives up is knowing at compile time that two attributes share a numbering. Reading several such
+attributes at one voxel computes the rank once per attribute (a popcount and a few loads), and iterating
+positions directly (`sdf[n]`, `grad[n]` for each n) is valid only if both use the same records, which the
+owner checks once when it builds the view. If shared numberings become common, named layers can be added as
+an extension: a declared layer type carrying its level, record type, name and guarantees, used as
+`Index<LayerT>`, with the view holding each layer's records once. `CustomRank` attributes would not change.
+
+Earlier drafts held the rank records as an attribute of their own
+(`Attribute<Node<Leaf>, LeafData<ValueOnIndex>, tag::Halo>`), which put indexing structure where data belongs,
+and then named layers by tag alone (`Index<Leaf, Layer<tag::Halo>>`), which left a layer declared nowhere.
+
+**Offsets are laissez-faire across nodes, with one property stated on top.** Every rank source must satisfy:
+
+- **In range:** every position is less than the array's length.
+- **Sequential within a node:** a node's members occupy consecutive positions in bit order, starting at the
+  node's offset. This is what the offset plus prefix counts encode.
+- **No overlaps:** no two entities share a position. Overlapping ranges would be a bug, not a feature.
+
+Between nodes, anything else is allowed: gaps between nodes' ranges, and nodes' ranges in any order. On top
+of that, a rank source states whether it is:
+
+- **Canonical:** no gaps, and nodes' ranges in storage order (with a fixed start). The offsets are then only
+  an acceleration structure: rebuildable from the masks, checkable in one prefix-sum pass. Tools that treat
+  a channel as a flat array need this.
 
 Examples: a freshly built grid without statistics is canonical; an old grid with interleaved statistics, or a
-growable grid (section 17), has no overlaps but has gaps. This generalizes the "canonical" flag of 7.7, and
-replaces 7.7's rule that only active voxels may be free-form: free-form offsets are now a property of a rank
-source, not a privilege of active voxels.
+growable grid (section 17), has gaps. This generalizes the "canonical" flag of 7.7, and replaces 7.7's rule
+that only active voxels may be free-form: free-form offsets are now a property of a rank source, not a
+privilege of active voxels.
 
 **Rank sources:**
 
@@ -547,7 +576,7 @@ source, not a privilege of active voxels.
   and voxels in one space spanning levels, which per-level indexing does not allow. Such grids remain
   readable as old grids, as grids with interleaved statistics do; new grids are built without tile indices,
   in line with PropagateSign's precondition #4.
-- **Leaf, additional layer:** a `Node<Leaf>` array of `LeafData<ValueOnIndex>` records: a copy of the grid's
+- **Leaf, additional layer (`CustomRank`):** one `LeafData<ValueOnIndex>` record per leaf: a copy of the grid's
   leaves with the mask, `mOffset` and `mPrefixSum` overwritten for the layer, and the statistics flag off.
   It is the same type as the built-in source, so the existing rank code (`getValue`, `valueCount`) applies
   unchanged, and each record carries its leaf's origin, which kernels running over the layer need (nodes
@@ -591,13 +620,43 @@ onward) holds `mOffset`, `mPointCount` and `uint16_t mValues[512]`, the cumulati
 so voxel `i`'s points are `[first(i), last(i))`, read through `PointAccessor::voxelPoints`.
 
 Uses: point attributes (the `Point*` blind-data semantics), triangle or Gaussian ids per voxel
-(`TriangleId`, `GaussianId`), the existing `GridBlindDataSemantic::Range`, fVDB's jagged tensors, and
-variable-width stencils such as general sparse-matrix rows. None reduces to `Index`, which gives each member
-exactly one position, or to a fixed-size element type.
+(`TriangleId`, `GaussianId`), the existing `GridBlindDataSemantic::Range`, and variable-width stencils such
+as general sparse-matrix rows. None reduces to `Index`, which gives each member exactly one position, or to a
+fixed-size element type. (fVDB's jagged tensors are not a `Range` case: they straddle several grids, which is
+the batching question in section 15, not a per-voxel range within one grid.)
 
-A `Range` array names its range source, as an `Index` array names its rank source; for point grids it is the
-grid's own leaves. The same property ladder applies. Including `Range` lets a bundle describe a point grid with
-its attributes, arguably NanoVDB's oldest "grid plus sidecars" case.
+**Point sets as index grids.** Rather than relying on the `Point` build type, a point set is a `ValueOnIndex`
+grid whose active voxels are the voxels holding points, plus range records, with the point attributes as
+`Range` attributes over those records:
+
+```cpp
+Attribute<Range<Leaf, CustomRange>, Vec3f,    tag::Position>    // point attributes over a ValueOnIndex grid
+Attribute<Range<Leaf, CustomRange>, float,    tag::Radius>
+Attribute<Range<Leaf, CustomRange>, uint32_t, tag::TriangleId>  // triangle ids per voxel of any index grid
+```
+
+As with `CustomRank`, the attribute carries a pointer to its range records, and attributes sharing a set of
+ranges point at the same records. There is no built-in range source (an earlier draft had `BuiltinRange` for
+point grids' own leaves); the only built-in indexing is `BuiltinRank`. Consequences:
+
+- Point sets become index grids, so every index-grid tool applies to them unchanged (dilation, topology
+  operations, ConnectedComponents, PropagateSign).
+- A rank alone cannot express this: it gives each voxel exactly one position, while points need a variable
+  count per voxel. Hence range records, not a custom rank.
+- Existing point grids stay readable and convert in one pass; `PointAccessor` and the `Point` build type
+  remain for compatibility, but the bundle does not need them. Including `Range` lets a bundle describe a
+  point set with its attributes, arguably NanoVDB's oldest "grid plus sidecars" case.
+
+Open: the layout of the range records.
+
+| Layout | Cost | Notes |
+|---|---|---|
+| per leaf, `LeafData<Point>`-style: `uint64_t` offset + `uint16_t` ends[512] | about 1 KB per leaf, regardless of occupancy | today's format, so converting is a copy |
+| per leaf a `uint64_t` base (`Node<Leaf>`), plus per active voxel a `uint16_t` cumulative end within its leaf (`Index<Leaf, BuiltinRank>`) | 8 B per leaf + 2 B per occupied voxel | composed from existing classes; smallest for sparse leaves |
+| per active voxel a `uint32_t` or `uint64_t` cumulative end over the whole grid (a CSR row-pointer array) | 4 or 8 B per occupied voxel | simplest to read; no per-leaf structure |
+
+The same contract as for rank sources applies: in range, sequential within an entity's range, no overlaps;
+gaps and any order between entities' ranges are allowed unless the source states it is canonical.
 
 #### 7.9.5 The root and sanitized level sets
 
@@ -645,7 +704,7 @@ return tile && !tile->isChild();   // childless entry: interior; absent: exterio
   `PerNode` was the runner-up.
 - `Node<Leaf>` names an entity and an enumeration at once, like *vertex* and *fragment* in shaders or
   Houdini's point and primitive attributes. It lives in its own namespace (e.g. `bundle::Node`) and appears only
-  as `Attr`'s first argument, so it is not confused with NanoVDB's node types.
+  as `Attribute`'s first argument, so it is not confused with NanoVDB's node types.
 - `Index` rather than `Indexed`, and `Range` to parallel it (matching `GridBlindDataSemantic::Range`). "Index"
   is crowded in NanoVDB (`ValueIndex`, `ValueOnIndex`, `IndexGrid`); the namespace handles those.
 
@@ -660,16 +719,16 @@ Examples elsewhere in this document use the first iteration's names. They transl
 | `Dense<Slots<L>>` with element `T` | `Node<L>` with a record of `SLOTS` values of `T` |
 | `Packed<Slots<Leaf, Lower, Upper>>`, `bool` (interior masks) | `Node<Leaf, Lower, Upper>`, `NodeMask` |
 | `RootKeys` (interior root tiles) | interior root tiles in the root table (7.9.5) |
-| `Compact<Slots<Leaf>, Active>` (`ActiveVoxels`) | `Index<Leaf, BuiltinActive>` |
+| `Compact<Slots<Leaf>, Active>` (`ActiveVoxels`) | `Index<Leaf, BuiltinRank>` |
 | `Compact<Slots<L>, Subset>` | `Index<L, rank source>` |
-| an `IndexBlock` layer with `LayerOf<tag::X>` | `Index<Leaf, tag::X>`, rank source a `Node<Leaf>` array of `LeafData<ValueOnIndex>` |
-| point grids (not covered) | `Range<...>` |
+| an `IndexBlock` layer with `LayerOf<tag::X>` | `Index<Leaf, CustomRank>`; the attribute points at the layer's `LeafData<ValueOnIndex>` rank records |
+| point grids (not covered) | a `ValueOnIndex` grid plus `Range<Leaf, CustomRange>` attributes (7.9.4) |
 
 ## 8. `GridView`
 
 ```cpp
-template<typename BuildT, typename... Attrs>
-struct GridView : detail::AttrHolder<Attrs>...   // one wrapper per Attr, so equal Storage types don't collide
+template<typename BuildT, typename... Attributes>
+struct GridView : detail::AttributeHolder<Attributes>...   // one wrapper per Attribute, so equal Storage types don't collide
 {
     const NanoGrid<BuildT>* mGrid;
 
@@ -679,14 +738,14 @@ struct GridView : detail::AttrHolder<Attrs>...   // one wrapper per Attr, so equ
     template<typename Tag>
     __hostdev__ auto get(const Location& loc) const
     {
-        using A = detail::FindByTag<Tag, Attrs...>;   // compile-time; ambiguous or missing tags fail to compile
-        return A::Enumeration::fetch(static_cast<const detail::AttrHolder<A>&>(*this).mStorage, loc);
+        using A = detail::FindByTag<Tag, Attributes...>;   // compile-time; ambiguous or missing tags fail to compile
+        return A::Enumeration::fetch(static_cast<const detail::AttributeHolder<A>&>(*this).mStorage, loc);
     }
 };
 ```
 
 - `BuildT` fixes the topology type, `NanoGrid<BuildT>`.
-- Each `Attr` contributes one storage member, held in a distinct wrapper base so two arrays with the same
+- Each `Attribute` contributes one storage member, held in a distinct wrapper base so two arrays with the same
   `Storage` type do not collide.
 - Storage is hand-rolled as one base class per array rather than `std::tuple`, which is not usable in device
   code without extra nvcc flags. `cuda::std::tuple` from CCCL (already a NanoVDB dependency) would also work.
@@ -790,7 +849,7 @@ level's array having that level's node count.
 template<typename ValueT>
 struct Stats { ValueT min, max; FloatType<ValueT> avg, std; };   // avg/std in FloatType, as in NanoVDB's leaf data
 
-Attr<Nodes<Leaf, Lower, Upper, Root>, Stats<float>, tag::Stats<tag::Sdf>>
+Attribute<Nodes<Leaf, Lower, Upper, Root>, Stats<float>, tag::Stats<tag::Sdf>>
 ```
 
 - **One array per level, any subset of levels.** Leaf statistics only is `Nodes<Leaf>`.
@@ -820,10 +879,10 @@ Attr<Nodes<Leaf, Lower, Upper, Root>, Stats<float>, tag::Stats<tag::Sdf>>
 
 | In a `FloatGrid` level set | In the narrow-band recipe |
 |---|---|
-| SDF values on active voxels | `Attr<ActiveVoxels, float, tag::Sdf>` |
-| background (= half-width x voxel size) | `Attr<Global, float, tag::Background>`, or `sdf[0]` |
+| SDF values on active voxels | `Attribute<ActiveVoxels, float, tag::Sdf>` |
+| background (= half-width x voxel size) | `Attribute<Global, float, tag::Background>`, or `sdf[0]` |
 | `GridClass::LevelSet`, transform, voxel size | the index grid's header (transform), plus a semantic marking the object as a level set (11.4) |
-| per-node min/max/avg/std | optional: `Attr<Nodes<...>, Stats<float>, tag::Stats<tag::Sdf>>` |
+| per-node min/max/avg/std | optional: `Attribute<Nodes<...>, Stats<float>, tag::Stats<tag::Sdf>>` |
 | sign of inactive voxels and tiles (after `signedFloodFill`) | dropped; the interior component adds it back |
 
 A narrow-band level set therefore holds strictly less than a flood-filled `FloatGrid`: off the band it
@@ -837,8 +896,8 @@ using ActiveVoxels = Compact<Slots<Leaf>, Active>;
 template<typename ValueT = float, typename BuildT = ValueOnIndex>
 struct NarrowBandLevelSetView
     : GridView<BuildT,
-               Attr<ActiveVoxels, ValueT, tag::Sdf>,
-               Attr<Global,       ValueT, tag::Background>>
+               Attribute<ActiveVoxels, ValueT, tag::Sdf>,
+               Attribute<Global,       ValueT, tag::Background>>
 {
     __hostdev__ auto getAccessor() const;
 };
@@ -860,9 +919,9 @@ Adding the interior component makes a full `getValue` possible:
 template<typename ValueT = float, typename BuildT = ValueOnIndex>
 struct LevelSetView
     : GridView<BuildT,
-               Attr<ActiveVoxels,                      ValueT, tag::Sdf>,
-               Attr<Global,                            ValueT, tag::Background>,
-               Attr<Interior,                          bool,   tag::Interior>>   // Packed node levels + RootKeys
+               Attribute<ActiveVoxels, ValueT, tag::Sdf>,
+               Attribute<Global,       ValueT, tag::Background>,
+               Attribute<Interior,     bool,   tag::Interior>>   // Packed node levels + RootKeys
 {
     __hostdev__ auto getAccessor() const;
 };
@@ -925,7 +984,7 @@ attached.
 | Source | What it contributes |
 |---|---|
 | Houdini attribute classes (point, vertex, primitive, detail) | entity class per attribute; *detail* is `Global` |
-| OpenMesh property handles, CGAL `Surface_mesh` property maps | (entity kind, element type, name) per property, stored as its own array: the `Attr` triple |
+| OpenMesh property handles, CGAL `Surface_mesh` property maps | (entity kind, element type, name) per property, stored as its own array: the `Attribute` triple |
 | USD primvars | name, type, *interpolation* (constant, uniform, vertex, varying, faceVarying): interpolation is the enumeration; element counts are checked against the topology |
 | USD indexed primvars (`primvars:foo:indices`) | values stored compactly through an index array; here, lookup tables are modelled as data (7.1), and compact storage as `Compact` enumerations |
 | USD typed, applied and multiple-apply API schemas | recipes, add-on components, and the same component applied several times (`tag::Stats<...>`) |
@@ -951,9 +1010,9 @@ as fields or attributes.
 1. **Names** for the owning object and the view. Suggested: `GridBundle` (owns the bytes) and `GridView`
    (kernel side); "wrapper" was rejected as suggesting one wrapped thing. The enumeration names are settled
    in 7.9.
-2. **Offset properties** (7.9.3): how a rank source records its rung (in range, no overlaps, canonical), and
-   how a tool states the rung it requires. This generalizes the canonical flag of 7.7.
-3. **Slot 0**: whether `Index<Leaf, BuiltinActive>` includes the background slot (7.7).
+2. **Offset properties** (7.9.3): how a rank source records whether it is canonical, and how a tool states
+   that it requires a canonical source. This generalizes the canonical flag of 7.7.
+3. **Slot 0**: whether `Index<Leaf, BuiltinRank>` includes the background slot (7.7).
 4. **Owner composition**: compile-time typed owners per recipe, or a runtime descriptor-driven owner.
 5. **Which rank sources are first-class**: start with the built-in leaf source and leaf layers; add
    internal-level `RankBlock` sources when a tool needs sparse values at an internal level (7.9.3).
@@ -975,7 +1034,7 @@ as fields or attributes.
 
 A `NarrowBandLevelSetView<float, ValueOnIndex>` and a `LevelSetView`, built from a `GridHandle`, an SDF buffer
 and PropagateSign's interior outputs, plus a leaf-and-lower `Stats` array computed from the SDF channel. This
-exercises every enumeration class the level set needs: `Index<Leaf, BuiltinActive>` (the SDF), `Node` records
+exercises every enumeration class the level set needs: `Index<Leaf, BuiltinRank>` (the SDF), `Node` records
 (the statistics, and the interior masks with a level-dependent `NodeMask` element), and the root table (interior
 root tiles, under the sanitized convention of 7.9.5). Check `LevelSetView::getValue` against
 `signedFloodFill` on the equivalent `FloatGrid`.

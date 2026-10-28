@@ -7,6 +7,10 @@ around as one semantic object, e.g. "a level set".
 Status: design discussion only. Nothing here is implemented. All type names (`GridView`, `Attr`, `Nodes`,
 `Compact`, ...) are placeholders. Line references are to `develop/nanovdb` at 5be1b3cd1.
 
+Revision (2026-10-28): section 7.9 tightens the enumerations to four classes, `Global`, `Node<...>`,
+`Index<...>` and `Range<...>`. Sections 7.1-7.8 are the first iteration, kept as a possible alternative.
+Examples elsewhere in this document still use the first iteration's names; 7.9.8 maps them to the new ones.
+
 Contents:
 
 1. Motivation
@@ -15,7 +19,7 @@ Contents:
 4. The entities of a tree
 5. `Attr`: describing one array
 6. Tags
-7. Enumerations
+7. Enumerations (7.9: the current refinement)
 8. `GridView`
 9. The owning object and the descriptor
 10. Statistics as node-indexed arrays
@@ -201,6 +205,9 @@ dependencies: `tag::Stats<tag::Sdf>` and `tag::Stats<tag::Density>` are two inst
 component, and each names the channel it was computed from.
 
 ## 7. Enumerations
+
+Sections 7.1-7.8 are the first iteration. Section 7.9 refines and tightens them, and is the current
+proposal; the first iteration stays here as a possible alternative and as the reasoning that led to 7.9.
 
 ### 7.1 Three independent choices
 
@@ -453,6 +460,210 @@ tree to find the leaf.
 The first layer stays special only in what its mask means: the grid's `mValueMask` is both membership and
 topology (it defines which voxels are active), while a layer's mask is only membership. How the two index is
 the same.
+
+### 7.9 Refinement: `Global`, `Node`, `Index`, `Range` (current proposal)
+
+This section tightens 7.1-7.8 into four enumeration classes. Where the two disagree, this section is the
+current proposal; 7.1-7.8 remain a possible alternative.
+
+#### 7.9.1 The four classes
+
+| Class | Entities | Position comes from | Examples |
+|---|---|---|---|
+| `Global` | the object as a whole | nothing: position 0 | background, isovalue, grid-wide statistics |
+| `Node<Levels...>` | the nodes of each listed level | the layout: the node's place in the flattened tree | statistics, interior masks, rank records, dense per-slot values |
+| `Index<...>` | a subset of the slots of one level | stored offsets (a rank source) | value channels (SDF, colour), channels over additional voxel layers, active-tile values |
+| `Range<...>` | a variable number of items per entity | stored offsets plus per-entity ranges (a range source) | point attributes, triangle or Gaussian ids per voxel |
+
+The names diverge deliberately. `Global` and `Node` are named after what the values attach to, and their
+positions follow from the layout: nothing is stored, nothing can be wrong. `Index` and `Range` are named after
+the mechanism, and their positions go through stored offsets, which may have gaps, overlaps or a
+non-monotonic order unless a stated property rules that out (7.9.3). The name alone tells a reader which kind
+an array is.
+
+#### 7.9.2 `Node<Levels...>`
+
+- **Each level is indexed separately.** A position is (level, node id), where the id is
+  `nodePtr - getFirstNode<L>()` (7.3), and each level's positions run from 0 to that level's node count. No
+  enumeration has a position space spanning levels. The interface works per level (`count<L>(grid)`), and
+  `fetch` uses `loc.level` to choose the level's range.
+- **A multi-level `Attr` is a set of single-level arrays under one tag,** so `get<Tag>(loc)` works at
+  whatever level a lookup stopped. Leaving a level out of the list means that level has no data.
+- **The record can be anything:** statistics, a mask, a rank record, or a value for every slot of the node.
+  Dense per-slot data is simply a per-node record of `SLOTS` values (e.g. `float[512]` per leaf), so no
+  separate dense slot enumeration is needed.
+- **Element types may depend on the level.** Interior masks are `Mask<3>`, `Mask<4>` and `Mask<5>` at the
+  leaf, lower and upper levels. `T` may therefore be a family resolved per level, e.g. a `NodeMask` marker
+  whose element at level L is that level's `Mask<LOG2DIM>`:
+
+  ```cpp
+  Attr<Node<Leaf, Lower, Upper>, NodeMask, tag::Interior>
+  ```
+
+  Since each level is indexed and stored separately, a different type per level is natural, and one tag still
+  covers all levels. For masks, `get<Tag>(loc)` returns the node's whole mask; a helper `isOn<Tag>(loc)`
+  tests bit `loc.slot` of it.
+- **The root level is the root table.** `Node<Root>` enumerates root-table entries by table index:
+  `RootData::probeTile(ijk)` (NanoVDB.h:2830) returns the entry, and its index is `tile - tile(0)`, the same
+  pointer subtraction as node ids. Table indices are not upper-node ids: the table also holds value tiles.
+  The root node's own single record (e.g. grid-wide statistics) is `Global`.
+
+Masks are always `Node` records in this refinement. The first iteration declared them as per-slot booleans
+(`Packed<Slots<...>>`), and a marker element type `MaskBit` was considered to trigger packed storage
+explicitly (rather than `bool`, which would repeat the `std::vector<bool>` mistake; `bool` would then mean one
+byte per slot, which allows writes without atomics). With masks as `Node` records there is only one way to
+declare a mask, and neither `MaskBit` nor the overlap between `Nodes<L>` with `Mask<>` and packed slots arises.
+
+#### 7.9.3 `Index<...>`
+
+Values for a subset of the slots of one level, reached through a **rank source**: per node, a membership
+mask, an offset, and within-node prefix counts. An `Index` array names its rank source, so taking a view
+checks that it is present:
+
+```cpp
+Attr<Index<Leaf, BuiltinActive>, float, tag::Sdf>       // the grid's own leaves are the rank source
+Attr<Index<Leaf, tag::Halo>,     float, tag::HaloSdf>   // rank source: the Node<Leaf> array tagged Halo
+```
+
+**Offsets are laissez-faire, with properties stated on top.** Gaps, overlaps and non-monotonic offsets are
+all representable. Each rank source records which of these properties it guarantees, and each tool states
+which it needs:
+
+1. **In range:** every position is less than the array's length. Needed by every reader.
+2. **No overlaps:** no two entities share a position. Needed by any tool that writes one value per entity.
+3. **Canonical:** monotonic, no gaps, rank order (nodes in storage order, bits in order, a fixed start).
+   The offsets are then only an acceleration structure: rebuildable from the masks, checkable in one
+   prefix-sum pass. Tools that treat a channel as a flat array need this.
+
+Examples: a freshly built grid without statistics is canonical; an old grid with interleaved statistics, or a
+growable grid (section 17), has no overlaps but has gaps. This generalizes the "canonical" flag of 7.7, and
+replaces 7.7's rule that only active voxels may be free-form: free-form offsets are now a property of a rank
+source, not a privilege of active voxels.
+
+**Rank sources:**
+
+- **Leaf, built in:** the grid's own `mValueMask`, `mOffset` and `mPrefixSum`. Restricted to leaf voxels: an
+  index grid built with tile indices (`createNanoGrid(..., includeTiles = true)`, the default) numbers tiles
+  and voxels in one space spanning levels, which per-level indexing does not allow. Such grids remain
+  readable as old grids, as grids with interleaved statistics do; new grids are built without tile indices,
+  in line with PropagateSign's precondition #4.
+- **Leaf, additional layer:** a `Node<Leaf>` array of `LeafData<ValueOnIndex>` records: a copy of the grid's
+  leaves with the mask, `mOffset` and `mPrefixSum` overwritten for the layer, and the statistics flag off.
+  It is the same type as the built-in source, so the existing rank code (`getValue`, `valueCount`) applies
+  unchanged, and each record carries its leaf's origin, which kernels running over the layer need (nodes
+  have no parent pointers). The cost is 96 bytes per leaf rather than the 80 of a bare `IndexBlock`. This
+  supersedes 7.8's recommendation (`IndexBlock` plus a shared `rankOf` function), which remains an
+  alternative. In a layer, `mValueMask` means membership in the layer, not activity.
+- **Internal levels:** a small per-node rank record, not a copy of the tree's internal node type
+  (`InternalData<ValueOnIndex>` gives every slot an 8-byte table entry: about 33 KB per lower node and 270 KB
+  per upper node):
+
+  ```cpp
+  template<uint32_t LOG2DIM>
+  struct RankBlock
+  {
+      uint64_t mOffset;                                  // rank of the node's first member, among this level's nodes
+      uint16_t mPrefix[Mask<LOG2DIM>::WORD_COUNT];       // members before each mask word, within the node
+  };
+  ```
+
+  About 136 bytes per lower node and 1 KB per upper node (about 0.4% of the node); counts per group of 8
+  words cut this by 8 at the cost of up to 7 popcounts. The leaf's packing of seven 9-bit counts into one word
+  does not scale: a lower node has 63 counts of up to 13 bits. The membership mask comes from the tree for
+  tree subsets (active tiles: `value & ~child`), or is stored in the record for layers. Nothing needs this yet;
+  it is built only when a tool asks for sparse values at an internal level.
+- **Complements come free from canonical sources.** Within a node, the rank of slot `n` in `~mask` is
+  `n - rank(n)`, and the complement's node offset is `id * SLOTS - offset(id)` (adjusted for the start
+  value). For example, inactive leaf voxels can be ranked from the active voxels' rank data, but only if
+  those offsets are canonical.
+
+**Considered and deferred: a dedicated `Index` build type** whose leaf holds only the mask, `mOffset` and
+`mPrefixSum`, so that a grid's leaf array is exactly an array of rank records. It saves no memory in the tree
+(nodes are 32-byte aligned, so 80 bytes pad to 96, which is what `LeafIndexBase` already is), leaf-parallel
+code needs the origin it would drop, and it is a format change (new `GridType`, PNanoVDB and C-port support,
+`LeafNode` specializations). If ever pursued, its name would collide with `bundle::Index`.
+
+#### 7.9.4 `Range<...>`
+
+A variable number of items per entity, stored contiguously: an item's position is (entity, k) for
+`k < count(entity)`. NanoVDB already has this built into point grids: `LeafData<Point>` (NanoVDB.h:4270
+onward) holds `mOffset`, `mPointCount` and `uint16_t mValues[512]`, the cumulative end of each voxel's points,
+so voxel `i`'s points are `[first(i), last(i))`, read through `PointAccessor::voxelPoints`.
+
+Uses: point attributes (the `Point*` blind-data semantics), triangle or Gaussian ids per voxel
+(`TriangleId`, `GaussianId`), the existing `GridBlindDataSemantic::Range`, fVDB's jagged tensors, and
+variable-width stencils such as general sparse-matrix rows. None reduces to `Index`, which gives each member
+exactly one position, or to a fixed-size element type.
+
+A `Range` array names its range source, as an `Index` array names its rank source; for point grids it is the
+grid's own leaves. The same property ladder applies. Including `Range` lets a bundle describe a point grid with
+its attributes, arguably NanoVDB's oldest "grid plus sidecars" case.
+
+#### 7.9.5 The root and sanitized level sets
+
+Convention: **sanitized SDF level sets insert interior root tiles into the root table.** A childless root
+tile's existence means interior, so the interior attribute has no root-level part, and no keyed enumeration
+is needed:
+
+```cpp
+const auto* tile = root.probeTile(ijk);
+return tile && !tile->isChild();   // childless entry: interior; absent: exterior; child: continue down
+```
+
+- **Sanitized** means the root holds child tiles and inactive interior tiles, nothing else: no exterior
+  (+background) value tiles and no active root tiles. A `FloatGrid` converted from OpenVDB can have
+  +background root tiles, which sanitizing must drop. The descriptor records the property, and the level-set
+  recipe checks it when a view is taken. In an index grid the interior tiles have value index 0 (the
+  background slot).
+- This matches OpenVDB: after `signedFloodFill`, interior root regions are -background tiles and exterior
+  regions are mostly absent.
+- **PropagateSign:** its list of interior root-tile origins becomes the input to a root rebuild that produces
+  the sanitized grid. Lengthening the root table moves every node, since the table precedes them in the buffer;
+  this appears cheap (shift the node region, fix the root tiles' child offsets and the tree header's node
+  offsets; offsets between internal nodes and their children are relative and node order is unchanged, so
+  node ids and per-node arrays stay valid), but this is not yet verified. The shared root-building helpers
+  from #2389 are the natural home.
+- A sanitized grid violates PropagateSign's precondition #4 (the root holds only child tiles). Accepting
+  sanitized inputs, with childless root tiles as known interior, is a possible future relaxation. Other tools
+  that assume the root table holds only child tiles must be checked before they accept sanitized level sets.
+
+#### 7.9.6 Dropped from the first iteration, and why
+
+| First iteration | Status | Reason |
+|---|---|---|
+| `Slots<...>` with dense positions | dropped | dense per-slot data is a `Node` record of `SLOTS` values; a compact rank over "all slots" equals the dense position anyway |
+| `Packed<...>` with `bool`, or a `MaskBit` element type | dropped | masks are `Node` records (7.9.2) |
+| `RootKeys` (keyed by coordinate) | dropped | root-table indexing plus the sanitized convention (7.9.5) |
+| free-form `Indexed` lookup tables | dropped | lookup tables are data: two ordinary arrays (7.1) |
+| a separate batch class above `Global` | deferred | a per-grid base offset can be a `Global` added by `Index`, unless batching becomes central |
+| "only active voxels may be free-form" (7.7) | generalized | free-form offsets are a stated property of each rank source (7.9.3) |
+
+#### 7.9.7 Names
+
+- `Node` rather than `Nodal`: in simulation vocabulary "nodal" means values at grid vertices (voxel corners),
+  as opposed to cell- or face-centred, exactly the wrong reading for NanoVDB's level-set and MAC-grid users.
+  `PerNode` was the runner-up.
+- `Node<Leaf>` names an entity and an enumeration at once, like *vertex* and *fragment* in shaders or
+  Houdini's point and primitive attributes. It lives in its own namespace (e.g. `bundle::Node`) and appears only
+  as `Attr`'s first argument, so it is not confused with NanoVDB's node types.
+- `Index` rather than `Indexed`, and `Range` to parallel it (matching `GridBlindDataSemantic::Range`). "Index"
+  is crowded in NanoVDB (`ValueIndex`, `ValueOnIndex`, `IndexGrid`); the namespace handles those.
+
+#### 7.9.8 Mapping from the first iteration
+
+Examples elsewhere in this document use the first iteration's names. They translate as follows:
+
+| First iteration | Refinement |
+|---|---|
+| `Global` | `Global` |
+| `Nodes<Levels...>` | `Node<Levels...>` |
+| `Dense<Slots<L>>` with element `T` | `Node<L>` with a record of `SLOTS` values of `T` |
+| `Packed<Slots<Leaf, Lower, Upper>>`, `bool` (interior masks) | `Node<Leaf, Lower, Upper>`, `NodeMask` |
+| `RootKeys` (interior root tiles) | interior root tiles in the root table (7.9.5) |
+| `Compact<Slots<Leaf>, Active>` (`ActiveVoxels`) | `Index<Leaf, BuiltinActive>` |
+| `Compact<Slots<L>, Subset>` | `Index<L, rank source>` |
+| an `IndexBlock` layer with `LayerOf<tag::X>` | `Index<Leaf, tag::X>`, rank source a `Node<Leaf>` array of `LeafData<ValueOnIndex>` |
+| point grids (not covered) | `Range<...>` |
 
 ## 8. `GridView`
 
@@ -737,25 +948,36 @@ as fields or attributes.
 
 ## 15. Open questions
 
-1. **Names** for the owning object, the view, and the enumerations.
-2. **Canonical flag** for active-voxel offsets in the descriptor (7.7): adopt or not.
-3. **Slot 0**: whether `Compact<Slots<Leaf>, Active>` includes the background slot (7.7).
+1. **Names** for the owning object and the view. Suggested: `GridBundle` (owns the bytes) and `GridView`
+   (kernel side); "wrapper" was rejected as suggesting one wrapped thing. The enumeration names are settled
+   in 7.9.
+2. **Offset properties** (7.9.3): how a rank source records its rung (in range, no overlaps, canonical), and
+   how a tool states the rung it requires. This generalizes the canonical flag of 7.7.
+3. **Slot 0**: whether `Index<Leaf, BuiltinActive>` includes the background slot (7.7).
 4. **Owner composition**: compile-time typed owners per recipe, or a runtime descriptor-driven owner.
-5. **Which subsets are first-class**: start with dense subsets plus compact active voxels; add compact
-   enumerations with their own rank structures when a tool needs one.
-6. **Per-level counts** for multi-level enumerations in the `count` interface.
-7. **Format additions**: new `GridBlindDataSemantic` values, and marking a blind-data array as per-node.
-8. **Grid identity**: checksum, or a cheaper buffer identity, for the check in 9.3.
-9. **Batching**: a per-grid base offset into shared arrays (7.7), and how it interacts with canonical ranks.
-10. **Index layers** (7.8): whether layers persist their offsets or rebuild them on load, and whether to add
-    the shared `rankOf` function to NanoVDB.h ahead of any layer implementation.
+5. **Which rank sources are first-class**: start with the built-in leaf source and leaf layers; add
+   internal-level `RankBlock` sources when a tool needs sparse values at an internal level (7.9.3).
+6. **Level-dependent element types** (7.9.2): how `NodeMask`-style families are declared and resolved per
+   level. (Per-level counts are settled: each level is indexed separately.)
+7. **`Global` storage**: the view holds a pointer (no host sync when building a view; works for values
+   computed on the device; can alias `sdf[0]`) or the value itself (a kernel parameter). Leaning towards a
+   pointer, with an optional by-value variant.
+8. **Format additions**: new `GridBlindDataSemantic` values, and marking a blind-data array as per-node.
+9. **Grid identity**: checksum, or a cheaper buffer identity, for the check in 9.3.
+10. **Batching**: a per-grid base offset into shared arrays (7.7), and how it interacts with canonical ranks.
+11. **Index layers**: whether canonical layers persist their offsets or rebuild them on load. (7.9.3 now
+    prefers `LeafData<ValueOnIndex>` records for layers, which makes 7.8's shared `rankOf` function
+    unnecessary.)
+12. **Sanitized roots** (7.9.5): verify that inserting interior root tiles is the cheap rebuild it appears to
+    be, decide where it lives, and whether PropagateSign should later accept sanitized inputs.
 
 ## 16. Suggested first prototype
 
 A `NarrowBandLevelSetView<float, ValueOnIndex>` and a `LevelSetView`, built from a `GridHandle`, an SDF buffer
 and PropagateSign's interior outputs, plus a leaf-and-lower `Stats` array computed from the SDF channel. This
-exercises every enumeration category the level set needs: compact active voxels (the SDF), per-node (the
-statistics), packed slots and root keys (the interior). Check `LevelSetView::getValue` against
+exercises every enumeration class the level set needs: `Index<Leaf, BuiltinActive>` (the SDF), `Node` records
+(the statistics, and the interior masks with a level-dependent `NodeMask` element), and the root table (interior
+root tiles, under the sanitized convention of 7.9.5). Check `LevelSetView::getValue` against
 `signedFloodFill` on the equivalent `FloatGrid`.
 
 ## 17. Note: growable index grids

@@ -381,6 +381,9 @@ consequences:
    sidestepping hazard 1 (trilinear reconstruction blindness) entirely, if queried this way instead
    of resampled onto a lattice and interpolated. Not yet fully explored.
 
+The GPU pass that computes these values at the inside voxels (an exact search over the certified
+voxels within `2W`, one leaf tile per block) is designed in `CertificationSweepGPU.md`, section 14.
+
 ## Objection: is this too "loose" — a piecewise-spherical, "cottage cheese" reconstruction?
 
 **The objection.** `∂O`, the boundary of a union of balls, is generically non-smooth — spherical

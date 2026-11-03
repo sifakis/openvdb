@@ -1,7 +1,8 @@
 # The ball-certification sweep on the GPU: design
 
-> Working design from the October 2026 design review (branch `new-distancing-approach`). Not yet
-> implemented. The theory it relies on is in `NewDistancingApproach.md`: Step 2 (the closure),
+> Working design from the October–November 2026 design review (branch `new-distancing-approach`).
+> The sweep (sections 1–12) is implemented as `tools::cuda::SignCertifier`
+> (`nanovdb/tools/cuda/SignCertifier.cuh`); the inside-magnitude pass (section 14) is not yet. The theory it relies on is in `NewDistancingApproach.md`: Step 2 (the closure),
 > "Stencil reach of the closure sweep" (how far a voxel must look), and "Overlap tolerance of the
 > certification test". The experiments that will validate it are listed there under "Queued
 > certification experiments". The current implementation, for comparison, is `BallCertifyFunctor`
@@ -331,7 +332,12 @@ round (an estimate to confirm by profiling).
 Items 1–5 of the review are settled: scope (section 11), rounds and termination (section 9),
 the tolerance (`NewDistancingApproach.md`), promotion and pocket entry (sections 9 and 10), and
 validation (below). Item 4b is settled (sealed cavities are filled). Item 6 is decided in part: inside magnitudes will
-be recomputed (design open); the isovalue is deferred.
+be recomputed (version 1 designed, section 14); the isovalue is deferred.
+
+**Next step (decided November 2026):** integrate the sweep and the inside recompute into
+`MeshToSDF` as one of two barrier-signing options, the other being the existing OpenVDB-style
+intersecting-voxel heuristic. Still deferred: the isovalue, and the provisional choices (the value
+of inside voxels with nothing within reach, section 14.5; the default of `promote`, after S5).
 
 **#4 — Component promotion and pocket entry: settled** (sections 9 and 10). Promotion is left out
 of version 1 and planned as the `promote` option afterwards, sized by S5. Pockets whose entry needs
@@ -390,20 +396,137 @@ mismatch clusters or in the sphere test; add it if a cluster cannot be explained
 numbers (OpenVDB stands in).
 
 **#6 — Follow-ons that share this infrastructure.**
-- *Inside magnitudes: decided, recompute; design open.* Uncertified voxels get
+- *Inside magnitudes: decided, recompute; version 1 designed* (section 14). Uncertified voxels get
   `φ(p) = -minᵢ(|p - Vᵢ| - dᵢ)` over certified `Vᵢ`, the exact signed distance to `∂O` (Step 3 of
   `NewDistancingApproach.md`), rather than `-udf`. Reasons: the field is self-consistent everywhere
   (keeping `-udf` puts large negative values next to large positive ones across the neck of a missed
   pocket), inclusion holds by construction, and it can be evaluated between lattice points. For a
   truly inside `p` it is never below `udf(p)`, so it departs from the mesh distance only where `∂O`
-  comes loose from `Σ`. Starting points for the design discussion, none settled: one pass, no
-  iteration; reach up to `2W` with all offsets (the primitive reduction does not apply to a min);
-  taps sorted by `|w|` with a cut once `|w| - W ≥` the best so far; the leaf tile infrastructure,
-  `H = 5` at `W = 3` (the clipped offsets only produce values `≥ W`). The mode of parallelism and the
-  remaining details are to be discussed.
+  comes loose from `Σ`. Version 1 is an exact brute-force search; it is to be benchmarked before any
+  optimization is discussed.
 - *The isovalue: deferred until after the inside recompute.* Notes so far: `iso > 0` (dilation) is
   the same sweep on `udf - iso` over voxels with `udf > iso` (radius `udf - iso`, barrier
   `udf - iso < D`, reach `W + D` in those terms; the input band must widen to `W + iso` to keep an
   effective `W`, which feeds the choice of `H`; necks narrower than about `2·iso` close, correctly).
   `iso < 0` (erosion) cannot use unsigned data; it is a post-pass `φ + |iso|` on the signed result
   and needs inside magnitudes valid to `|iso|`, so it depends on the recompute above.
+
+## 14. Inside magnitudes: the recompute pass (version 1)
+
+*Status: designed, not implemented. Implement exactly as below, then benchmark (14.6) before
+considering any of the optimizations in 14.7.*
+
+### 14.1 What it computes
+
+After `SignCertifier` has converged (including pedantic passes, if enabled), every uncertified
+active voxel `p` gets
+
+```
+φ(p) = -min over certified V of (|p - V| - d_V),   clamped to [-W, 0]
+```
+
+in voxel units, written to the SDF sidecar as `φ(p)·h`. `d_V` is the input UDF of `V`. Certified
+voxels keep `+udf`, which is already their exact distance to `∂O` (the Property section of
+`NewDistancingApproach.md`). So the pass reads the UDF only at certified voxels and never uses the
+UDF of `p` itself. It is one pass with no iteration: the certified set is final.
+
+### 14.2 How far to look, and when to stop
+
+- **Taps:** *all* integer offsets with `0 < |w| < 2W` (894 at `W = 3`), sorted by `|w|`. The
+  primitive reduction does not apply: it was an argument about reachability, and this is a
+  minimum over distances.
+- **Why `2W`:** a certified `V` at offset `w` contributes `|w| - d_V ≥ |w| - W`, which reaches the
+  clamp `W` once `|w| ≥ 2W`.
+- **Stop rule:** start with `best = W` (the clamp). Scan the taps in order, keeping
+  `best = min(best, |w| - d_V)` over certified `V`, and stop at the first tap with
+  `|w| ≥ best + W`. Every later tap contributes at least `|w| - W ≥ best`.
+- **Why `best + W` and not `best`:** a farther `V` can still win if its ball is larger. These deep
+  balls are often the winners: a ball of radius `r` bulges about `s²/8r` away from `Σ` between the
+  points where balls touch it (`s` about one voxel), so the deepest balls hug `Σ` best, which is the
+  same mechanism as the planar infinite-lattice result.
+- **Expected scan length:** for a truly inside `p` at depth `u`, `best ≥ u`, so a voxel scans at
+  least the taps with `|w| < u + W`:
+
+  | depth `u` | 0.25 | 0.5 | 1 | 1.5 | 2 | 2.5 | 3 |
+  |---|---|---|---|---|---|---|---|
+  | taps scanned | 146 | 178 | 250 | 388 | 484 | 738 | 894 |
+
+  That is about 420 on average over a uniformly deep inside band, slightly more in practice, since
+  `best` sits a little above `u`.
+
+### 14.3 Tile
+
+- One CTA per leaf that has at least one uncertified active voxel (the has-candidates bit the
+  sweep already keeps).
+- **Halo `H = ⌈2W⌉ - 1`**, so `H = 5` at `W = 3`. Every offset with `|w| < 2W` has all coordinates
+  at most 5. The tile is `18³ = 5,832` floats, 23 KB, and fits within the 3×3×3 block of
+  neighbouring leaves up to `W = 4.5`.
+- The tile is the same as the pedantic shell pass's, with the same encoding: certified voxels
+  hold `d` in voxel units, everything else holds `-inf`, so `|w| - tile` is `+inf` for them and the
+  loop needs no branch. Reuse the gather, the neighbour table and the `H = 5` instantiation.
+
+### 14.4 Parallel mapping: a thread per inside voxel, taps in lockstep
+
+The sweep uses a warp per voxel and a lane per tap, because a success ends the search early. Here
+there is no early success, only a running minimum, so the mapping flips:
+
+- **Compact** the leaf's uncertified active voxels into a shared-memory list, in tile order, so
+  that threads are not wasted on certified or inactive voxels.
+- **A thread per listed voxel**, looping over the list if there are more voxels than threads.
+- **All lanes read the same tap at the same time.** The tap table can therefore live in
+  `__constant__` memory, whose reads are broadcasts when uniform across the warp (894 taps × 8 bytes
+  ≈ 7 KB). This is the opposite of the sweep, where lanes read different taps. The tile reads
+  `tile[cell(p) + delta]` are consecutive across lanes, as in an ordinary stencil.
+- **Per-thread stop, per-warp exit:** each thread stops updating at its own cutoff; the warp
+  leaves the loop when `__all_sync` says every lane is past its cutoff, checked every 16 taps.
+  Voxels in one warp are spatially close and of similar depth, so lanes should finish at similar
+  points.
+- **Tap lengths** are stored rounded up, as in the sweep. Here that can only make `|φ|` larger by
+  at most one ulp, which is conservative for inclusion.
+
+### 14.5 Edge cases
+
+- **Nothing within reach** (`best` stays at `W`): write `-W·h`, the band's inside limit.
+  (Provisional; the alternative is the negative background.)
+- **Truly outside voxels that were not certified** (sub-gap barrier voxels, bubbles, pockets
+  behind sub-voxel necks, sealed cavities): they get the same formula and are consistent with
+  `∂O`. For them `|φ|` can be below their UDF, which is expected.
+- **Inactive voxels and tiles** are signed by `PropagateSign` as before; this pass touches only
+  active voxels.
+
+### 14.6 Validation and benchmark
+
+- **Unit test (the sphere of #5):** for every inside voxel, `|φ| ≥ udf - 1e-5` (the lower bound
+  for truly inside points) and `|φ| - udf ≤ 0.1` (looseness of `∂O`; print the largest value on
+  failure).
+- **Example:** report the distribution of `|φ| - udf` over inside voxels (extremes, percentiles),
+  with the locations of the extremes. Large positive values mark places where `∂O` comes loose from
+  `Σ` (narrow creases the balls cannot enter); negative values can only occur at truly outside
+  voxels that were not certified (missed pockets, bubbles, sealed cavities).
+- **Benchmark, before any optimization:**
+  - the pass's GPU time, next to the other pipeline stages in `BENCHMARK.md`. Rasterization (mesh to
+    UDF and index) is about 95% of the pipeline on single-surface input, so the pass is judged
+    against that;
+  - the number of leaves processed, inside voxels, and taps scanned per voxel (mean and
+    distribution);
+  - scaling with resolution (the dragon series of `BENCHMARK.md`).
+
+### 14.7 Optimizations, deferred until the benchmark says they matter
+
+- **Floor-based stop:** for a truly inside `p`, every candidate is at least `udf(p)`, so stopping
+  once `best - udf(p) ≤ ε` bounds the error by `ε`. Exact only at `ε = 0`, where it rarely triggers;
+  for missed exterior voxels the floor does not hold.
+- **A tighter cap than `W`** in the stop rule: the largest `d` actually present in the tile.
+  Exact, but in a full band usually close to `W`.
+- **Normal-directed search:** with the foot point from the nearest-triangle sidecar, near-planar
+  `Σ` puts the winning `V` within about 0.8 voxel of `p`'s normal line (`τ² ≤ 2λ(u + z) + λ²`,
+  `λ = dist(foot, ∂O)`). It needs only tens of taps, but it is not exact at sharp convex edges or
+  high curvature, so it needs a fallback.
+- **Shell-by-shell propagation of the winning site:** the region where a given `V` wins is
+  star-shaped from `V`, so candidates can come from the neighbours' winners, about 26 evaluations
+  per voxel over 3–5 shells. It is approximate on the lattice (rare small errors, as with
+  propagation distance transforms), and its per-voxel work is small enough that iterating over each
+  shell with the `VoxelBlockManager` fits better than leaf tiles.
+- **Warp per voxel** (lanes over taps) as an alternative mapping to benchmark.
+- **Fusion with the pedantic shell pass:** same tile and overlapping candidates; run the recompute
+  speculatively in the last shell pass and redo only leaves next to a new certification.

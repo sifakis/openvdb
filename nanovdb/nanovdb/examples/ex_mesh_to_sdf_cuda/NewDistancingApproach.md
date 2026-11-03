@@ -119,6 +119,11 @@ work transitively through the nesting chain (inner shell encapsulated by solid, 
 by outside)? Not yet resolved — likely needs a second property alongside inclusion to fully pin
 down the nested/hollow case (candidate: something expressing the even-odd/parity structure from
 `InclusionSigningDesign.md`, but not yet stated formally in this new framing).
+*Partly answered (October 2026 review):* the specification is that the outside set contains the
+region at infinity and never intersects `Σ`. Within one UDF component, encapsulation is transitive:
+a sealed cavity is filled (labelled inside), since no ball chain can reach it. Across UDF components
+the nesting stage applies the even-odd or solid rule, so a cavity whose inner boundary is its own
+component becomes a void. See `CertificationSweepGPU.md`, section 13 (#4b).
 
 ## Hazards that can compromise inclusion (initial, non-exhaustive catalog)
 

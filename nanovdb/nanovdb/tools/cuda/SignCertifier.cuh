@@ -12,8 +12,8 @@
              to only include it in .cu files (or other .cuh files)
 */
 
-#ifndef NVIDIA_TOOLS_CUDA_SIGNCERTIFIER_CUH_HAS_BEEN_INCLUDED
-#define NVIDIA_TOOLS_CUDA_SIGNCERTIFIER_CUH_HAS_BEEN_INCLUDED
+#ifndef NANOVDB_TOOLS_CUDA_SIGNCERTIFIER_CUH_HAS_BEEN_INCLUDED
+#define NANOVDB_TOOLS_CUDA_SIGNCERTIFIER_CUH_HAS_BEEN_INCLUDED
 
 #include <nanovdb/NanoVDB.h>
 #include <nanovdb/cuda/Buffer.h>
@@ -237,9 +237,9 @@ private:
     BufT<uint32_t> mHasCandidates;    // leafCount x uint32_t: 1 while the leaf has a candidate, written by the leaf's block only
     BufT<uint32_t> mDirtyCurr;        // leafCount x uint32_t: 1 if a voxel of the leaf or of a neighbour leaf was certified in the previous round
     BufT<uint32_t> mDirtyNext;        // leafCount x uint32_t: the same for the current round, for the next one
-    BufT<uint32_t> mChanged;          // 1 x uint32_t: 1 if the current round certified anything
+    BufT<uint32_t> mChanged;          // 1 x uint32_t: one flag for the whole grid, 1 if the current round certified a voxel in any leaf
     BufT<TapT>     mDefaultTaps;      // taps of the default pass, sorted by length
-    BufT<TapT>     mPedanticTaps;     // taps of the pedantic pass (pedantic mode only), sorted by length
+    BufT<TapT>     mPedanticTaps;     // taps of the pedantic pass (pedantic mode only): only the longer offsets, none of mDefaultTaps, sorted by length
 };// tools::cuda::SignCertifier<BuildT, ResourceT>
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -286,7 +286,8 @@ void SignCertifier<BuildT, ResourceT>::initialize()
     mChanged       = BufT<uint32_t>(mStream, this->ref(), 1, nanovdb::cuda::noInit);
     if (mLeafCount == 0) return;
 
-    util::cuda::lambdaKernel<<<(mLeafCount + 127) / 128, 128, 0, mStream>>>(
+    static constexpr unsigned int threadsPerBlock = 128;
+    util::cuda::lambdaKernel<<<util::cuda::blocksPerGrid(mLeafCount, threadsPerBlock), threadsPerBlock, 0, mStream>>>(
         mLeafCount, certification::detail::InitializeFunctor<BuildT>(), mDeviceGrid, mDeviceSeedMasks,
         mCertifiedMasks.data(), mHasCandidates.data(), mDirtyCurr.data());
     cudaCheckError();
@@ -343,14 +344,15 @@ struct SweepFunctor
     using TileT = HaloTile<BuildT, Halo>;
 
     /// @brief Tile cell of voxel n of the leaf.
-    __device__ static int cellOf(uint32_t n)
+    __device__ static int tileCellOf(uint32_t n)
     {
         const Coord ijk = LeafT::OffsetToLocalCoord(n);
         return ((ijk[0] + Halo) * TileT::DIM + ijk[1] + Halo) * TileT::DIM + ijk[2] + Halo;
     }
 
-    /// @brief Index, from 0 to 2, of the leaf a tile coordinate t falls in along one axis.
-    __device__ static int leafSlotOf(int t) { return int(t >= Halo) + int(t >= Halo + int(LeafT::DIM)); }
+    /// @brief Region of the tile, along one axis, that tile coordinate t falls in: 0 for the halo below the
+    ///        leaf, 1 for the leaf, 2 for the halo above.
+    __device__ static int tileRegionOf(int t) { return int(t >= Halo) + int(t >= Halo + int(LeafT::DIM)); }
 
     __device__ void operator()(const NanoGrid<BuildT>* d_grid, const float* d_udf, SweepSettings settings,
                                const Mask<3>* d_readMasks, Mask<3>* d_certifiedMasks, uint32_t* d_hasCandidates,
@@ -359,13 +361,15 @@ struct SweepFunctor
         using BlockScanT = cub::BlockScan<int, MaxThreadsPerBlock>;
         constexpr int WarpCount = MaxThreadsPerBlock / 32;
 
-        __shared__ uint32_t sNeighbourIDs[27];
+        __shared__ uint32_t sNeighbourIDs[3][3][3];
         __shared__ float    sTile[TileT::SIZE];
         __shared__ uint16_t sCandidates[MaxThreadsPerBlock];  // voxel offsets
-        __shared__ float    sRadii[MaxThreadsPerBlock];       // their distances to the surface
+        __shared__ float    sRadii[MaxThreadsPerBlock];       // their distances to the surface (the UDF in index space)
         __shared__ uint8_t  sStates[MaxThreadsPerBlock];      // 0: uncertified, 1: certified in this test, 2: before
-        __shared__ uint32_t sNewBits[WarpCount];              // voxels certified by this block, 32 per word
+        // Voxels certified by this block, 32 per word, set with 32-bit atomics and read as a Mask<3>
+        __shared__ alignas(Mask<3>) uint32_t sNewBits[Mask<3>::SIZE / 32];
         __shared__ typename BlockScanT::TempStorage sScanStorage;
+        const auto& newMask = reinterpret_cast<const Mask<3>&>(sNewBits);
 
         const uint32_t leafID = blockIdx.x, tID = threadIdx.x, warpID = tID >> 5, laneID = tID & 31;
         // Uniform across the block: neither array is written for this leaf until the block is done with it
@@ -391,20 +395,21 @@ struct SweepFunctor
             sStates[index]     = 0;
         }
 
-        // The 27 leaves around this one, itself at 13, as leaf indices, or UINT32_MAX where there is none
+        // The 27 leaves around this one, one per tile region with itself at [1][1][1], as leaf indices,
+        // or UINT32_MAX where there is none
         if (tID < 27) {
-            const int  dim       = int(LeafT::DIM);
+            const int  i = int(tID) / 9, j = int(tID) / 3 % 3, k = int(tID) % 3, dim = int(LeafT::DIM);
             const auto neighbour = d_grid->tree().root().probeLeaf(
-                leaf.origin().offsetBy((int(tID) / 9 - 1) * dim, (int(tID) / 3 % 3 - 1) * dim, (int(tID) % 3 - 1) * dim));
-            sNeighbourIDs[tID] = neighbour ? uint32_t(neighbour - firstLeaf) : UINT32_MAX;
+                leaf.origin().offsetBy((i - 1) * dim, (j - 1) * dim, (k - 1) * dim));
+            sNeighbourIDs[i][j][k] = neighbour ? uint32_t(neighbour - firstLeaf) : UINT32_MAX;
         }
-        if (tID < WarpCount) sNewBits[tID] = 0;
+        if (tID < Mask<3>::SIZE / 32) sNewBits[tID] = 0;
         __syncthreads();
 
         // Gather the tile
         for (int c = int(tID); c < TileT::SIZE; c += MaxThreadsPerBlock) {
             const int i = c / (TileT::DIM * TileT::DIM), j = c / TileT::DIM % TileT::DIM, k = c % TileT::DIM;
-            const uint32_t neighbourID = sNeighbourIDs[9 * leafSlotOf(i) + 3 * leafSlotOf(j) + leafSlotOf(k)];
+            const uint32_t neighbourID = sNeighbourIDs[tileRegionOf(i)][tileRegionOf(j)][tileRegionOf(k)];
             const uint32_t n = LeafT::CoordToOffset(Coord(i - Halo, j - Halo, k - Halo));
             float r = -INFINITY;
             if (neighbourID != UINT32_MAX &&
@@ -418,7 +423,7 @@ struct SweepFunctor
             // Test each uncertified candidate; the tile stays unchanged during the test
             for (int i = int(warpID); i < candidateCount; i += WarpCount) {
                 if (sStates[i]) continue;
-                const int   centre = cellOf(sCandidates[i]);
+                const int   centre = tileCellOf(sCandidates[i]);
                 const float r      = sRadii[i];
                 // Every voxel is within the band, so taps this long cannot certify
                 const float reach  = r + settings.bandWidth;
@@ -440,7 +445,7 @@ struct SweepFunctor
             for (int i = int(tID); i < candidateCount; i += MaxThreadsPerBlock)
                 if (sStates[i] == 1) {
                     const uint32_t n = sCandidates[i];
-                    sTile[cellOf(n)] = sRadii[i];
+                    sTile[tileCellOf(n)] = sRadii[i];
                     atomicOr(&sNewBits[n >> 5], 1u << (n & 31));
                     sStates[i] = 2;
                     changed = true;
@@ -449,17 +454,19 @@ struct SweepFunctor
         }
 
         // Write back; mark this leaf and its neighbours dirty for the next round
-        if (!__syncthreads_or(tID < WarpCount && sNewBits[tID] != 0)) return;
+        if (!__syncthreads_or(tID < Mask<3>::WORD_COUNT && newMask.words()[tID] != 0)) return;
         bool uncertifiedLeft = false;
         if (tID < Mask<3>::WORD_COUNT) {
-            const uint64_t newBits = uint64_t(sNewBits[2 * tID]) | uint64_t(sNewBits[2 * tID + 1]) << 32;
+            const uint64_t newBits = newMask.words()[tID];
             const uint64_t word    = d_readMasks[leafID].words()[tID] | newBits;
             if (newBits) atomicRef(d_certifiedMasks[leafID].words()[tID]).store(word, ::cuda::memory_order_relaxed);
             uncertifiedLeft = (leaf.valueMask().words()[tID] & ~word) != 0;
         }
         const bool hasCandidates = __syncthreads_or(uncertifiedLeft);
-        if (tID < 27 && sNeighbourIDs[tID] != UINT32_MAX)
-            atomicRef(d_dirtyNext[sNeighbourIDs[tID]]).store(1u, ::cuda::memory_order_relaxed);
+        if (tID < 27) {
+            const uint32_t neighbourID = sNeighbourIDs[tID / 9][tID / 3 % 3][tID % 3];
+            if (neighbourID != UINT32_MAX) atomicRef(d_dirtyNext[neighbourID]).store(1u, ::cuda::memory_order_relaxed);
+        }
         if (tID == 0) {
             d_hasCandidates[leafID] = uint32_t(hasCandidates);
             atomicRef(*d_changed).store(1u, ::cuda::memory_order_relaxed);
@@ -520,4 +527,4 @@ bool SignCertifier<BuildT, ResourceT>::processPedanticPass()
 
 }// namespace nanovdb
 
-#endif // NVIDIA_TOOLS_CUDA_SIGNCERTIFIER_CUH_HAS_BEEN_INCLUDED
+#endif // NANOVDB_TOOLS_CUDA_SIGNCERTIFIER_CUH_HAS_BEEN_INCLUDED

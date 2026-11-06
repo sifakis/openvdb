@@ -1,0 +1,221 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="446" viewBox="0 0 760 446" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" role="img">
+<title>Node fill and seeding across trigger faces</title>
+<desc>A leaf fill with sweep numbers, and a lower node fill seeded by its leaves.</desc>
+<rect x="0" y="0" width="760" height="446" fill="#ffffff"/>
+<defs><marker id="f2a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d4570f"/></marker></defs>
+<text x="20.0" y="24.0" font-size="15" fill="#1f2328" text-anchor="start" font-weight="600">(a) Stage 1: one leaf</text>
+<text x="20.0" y="42.0" font-size="12" fill="#59636e" text-anchor="start" font-weight="normal">Number = the sweep in which the voxel turns on.</text>
+<rect x="44.0" y="280.0" width="30.0" height="30.0" fill="#fbd5a8" stroke="#ffffff" stroke-width="1"/>
+<text x="59.0" y="299.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">5</text>
+<rect x="44.0" y="250.0" width="30.0" height="30.0" fill="#fbd5a8" stroke="#ffffff" stroke-width="1"/>
+<text x="59.0" y="269.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">4</text>
+<rect x="44.0" y="220.0" width="30.0" height="30.0" fill="#fbd5a8" stroke="#ffffff" stroke-width="1"/>
+<text x="59.0" y="239.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">3</text>
+<rect x="44.0" y="190.0" width="30.0" height="30.0" fill="#fbd5a8" stroke="#ffffff" stroke-width="1"/>
+<text x="59.0" y="209.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">2</text>
+<rect x="44.0" y="160.0" width="30.0" height="30.0" fill="#fbd5a8" stroke="#ffffff" stroke-width="1"/>
+<text x="59.0" y="179.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">1</text>
+<rect x="44.0" y="130.0" width="30.0" height="30.0" fill="#2f62a8" stroke="#ffffff" stroke-width="1"/>
+<rect x="44.0" y="100.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<rect x="44.0" y="70.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<rect x="74.0" y="280.0" width="30.0" height="30.0" fill="#fbd5a8" stroke="#ffffff" stroke-width="1"/>
+<text x="89.0" y="299.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">4</text>
+<rect x="74.0" y="250.0" width="30.0" height="30.0" fill="#fbd5a8" stroke="#ffffff" stroke-width="1"/>
+<text x="89.0" y="269.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">4</text>
+<rect x="74.0" y="220.0" width="30.0" height="30.0" fill="#fbd5a8" stroke="#ffffff" stroke-width="1"/>
+<text x="89.0" y="239.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">3</text>
+<rect x="74.0" y="190.0" width="30.0" height="30.0" fill="#fbd5a8" stroke="#ffffff" stroke-width="1"/>
+<text x="89.0" y="209.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">2</text>
+<rect x="74.0" y="160.0" width="30.0" height="30.0" fill="#fbd5a8" stroke="#ffffff" stroke-width="1"/>
+<text x="89.0" y="179.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">1</text>
+<rect x="74.0" y="130.0" width="30.0" height="30.0" fill="#2f62a8" stroke="#ffffff" stroke-width="1"/>
+<rect x="74.0" y="100.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<rect x="74.0" y="70.0" width="30.0" height="30.0" fill="#f6f8fa" stroke="#ffffff" stroke-width="1"/>
+<rect x="104.0" y="280.0" width="30.0" height="30.0" fill="#fbd5a8" stroke="#ffffff" stroke-width="1"/>
+<text x="119.0" y="299.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">3</text>
+<rect x="104.0" y="250.0" width="30.0" height="30.0" fill="#fbd5a8" stroke="#ffffff" stroke-width="1"/>
+<text x="119.0" y="269.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">3</text>
+<rect x="104.0" y="220.0" width="30.0" height="30.0" fill="#fbd5a8" stroke="#ffffff" stroke-width="1"/>
+<text x="119.0" y="239.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">2</text>
+<rect x="104.0" y="190.0" width="30.0" height="30.0" fill="#fbd5a8" stroke="#ffffff" stroke-width="1"/>
+<text x="119.0" y="209.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">1</text>
+<rect x="104.0" y="160.0" width="30.0" height="30.0" fill="#2f62a8" stroke="#ffffff" stroke-width="1"/>
+<rect x="104.0" y="130.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<rect x="104.0" y="100.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<rect x="104.0" y="70.0" width="30.0" height="30.0" fill="#f6f8fa" stroke="#ffffff" stroke-width="1"/>
+<rect x="134.0" y="280.0" width="30.0" height="30.0" fill="#fbd5a8" stroke="#ffffff" stroke-width="1"/>
+<text x="149.0" y="299.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">2</text>
+<rect x="134.0" y="250.0" width="30.0" height="30.0" fill="#fbd5a8" stroke="#ffffff" stroke-width="1"/>
+<text x="149.0" y="269.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">2</text>
+<rect x="134.0" y="220.0" width="30.0" height="30.0" fill="#fbd5a8" stroke="#ffffff" stroke-width="1"/>
+<text x="149.0" y="239.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">1</text>
+<rect x="134.0" y="190.0" width="30.0" height="30.0" fill="#2f62a8" stroke="#ffffff" stroke-width="1"/>
+<rect x="134.0" y="160.0" width="30.0" height="30.0" fill="#2f62a8" stroke="#ffffff" stroke-width="1"/>
+<rect x="134.0" y="130.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<rect x="134.0" y="100.0" width="30.0" height="30.0" fill="#f6f8fa" stroke="#ffffff" stroke-width="1"/>
+<rect x="134.0" y="70.0" width="30.0" height="30.0" fill="#f6f8fa" stroke="#ffffff" stroke-width="1"/>
+<rect x="164.0" y="280.0" width="30.0" height="30.0" fill="#fbd5a8" stroke="#ffffff" stroke-width="1"/>
+<text x="179.0" y="299.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">1</text>
+<rect x="164.0" y="250.0" width="30.0" height="30.0" fill="#fbd5a8" stroke="#ffffff" stroke-width="1"/>
+<text x="179.0" y="269.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">1</text>
+<rect x="164.0" y="220.0" width="30.0" height="30.0" fill="#2f62a8" stroke="#ffffff" stroke-width="1"/>
+<rect x="164.0" y="190.0" width="30.0" height="30.0" fill="#2f62a8" stroke="#ffffff" stroke-width="1"/>
+<rect x="164.0" y="160.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<rect x="164.0" y="130.0" width="30.0" height="30.0" fill="#f6f8fa" stroke="#ffffff" stroke-width="1"/>
+<rect x="164.0" y="100.0" width="30.0" height="30.0" fill="#f6f8fa" stroke="#ffffff" stroke-width="1"/>
+<rect x="164.0" y="70.0" width="30.0" height="30.0" fill="#f6f8fa" stroke="#ffffff" stroke-width="1"/>
+<rect x="194.0" y="280.0" width="30.0" height="30.0" fill="#2f62a8" stroke="#ffffff" stroke-width="1"/>
+<rect x="194.0" y="250.0" width="30.0" height="30.0" fill="#2f62a8" stroke="#ffffff" stroke-width="1"/>
+<rect x="194.0" y="220.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<rect x="194.0" y="190.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<rect x="194.0" y="160.0" width="30.0" height="30.0" fill="#f6f8fa" stroke="#ffffff" stroke-width="1"/>
+<rect x="194.0" y="130.0" width="30.0" height="30.0" fill="#f6f8fa" stroke="#ffffff" stroke-width="1"/>
+<rect x="194.0" y="100.0" width="30.0" height="30.0" fill="#f6f8fa" stroke="#ffffff" stroke-width="1"/>
+<rect x="194.0" y="70.0" width="30.0" height="30.0" fill="#f6f8fa" stroke="#ffffff" stroke-width="1"/>
+<rect x="224.0" y="280.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<rect x="224.0" y="250.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<rect x="224.0" y="220.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<rect x="224.0" y="190.0" width="30.0" height="30.0" fill="#f6f8fa" stroke="#ffffff" stroke-width="1"/>
+<rect x="224.0" y="160.0" width="30.0" height="30.0" fill="#f6f8fa" stroke="#ffffff" stroke-width="1"/>
+<rect x="224.0" y="130.0" width="30.0" height="30.0" fill="#f6f8fa" stroke="#ffffff" stroke-width="1"/>
+<rect x="224.0" y="100.0" width="30.0" height="30.0" fill="#f6f8fa" stroke="#ffffff" stroke-width="1"/>
+<rect x="224.0" y="70.0" width="30.0" height="30.0" fill="#f6f8fa" stroke="#ffffff" stroke-width="1"/>
+<rect x="254.0" y="280.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<rect x="254.0" y="250.0" width="30.0" height="30.0" fill="#f6f8fa" stroke="#ffffff" stroke-width="1"/>
+<rect x="254.0" y="220.0" width="30.0" height="30.0" fill="#f6f8fa" stroke="#ffffff" stroke-width="1"/>
+<rect x="254.0" y="190.0" width="30.0" height="30.0" fill="#f6f8fa" stroke="#ffffff" stroke-width="1"/>
+<rect x="254.0" y="160.0" width="30.0" height="30.0" fill="#f6f8fa" stroke="#ffffff" stroke-width="1"/>
+<rect x="254.0" y="130.0" width="30.0" height="30.0" fill="#f6f8fa" stroke="#ffffff" stroke-width="1"/>
+<rect x="254.0" y="100.0" width="30.0" height="30.0" fill="#f6f8fa" stroke="#ffffff" stroke-width="1"/>
+<rect x="254.0" y="70.0" width="30.0" height="30.0" fill="#f6f8fa" stroke="#ffffff" stroke-width="1"/>
+<rect x="44.0" y="70.0" width="240.0" height="240.0" fill="none" stroke="#1f2328" stroke-width="1.6"/>
+<line x1="44.0" y1="70.0" x2="44.0" y2="310.0" stroke="#d4570f" stroke-width="4.5"/>
+<line x1="44.0" y1="310.0" x2="284.0" y2="310.0" stroke="#d4570f" stroke-width="4.5"/>
+<line x1="40.0" y1="220.0" x2="14.0" y2="220.0" stroke="#d4570f" stroke-width="1.8" marker-end="url(#f2a)"/>
+<line x1="254.0" y1="314.0" x2="254.0" y2="336.0" stroke="#d4570f" stroke-width="1.8" marker-end="url(#f2a)"/>
+<text x="44.0" y="332.0" font-size="12" fill="#d4570f" text-anchor="start" font-weight="600">trigger faces: seed stage 2, 3 or 4</text>
+<text x="44.0" y="354.0" font-size="12" fill="#59636e" text-anchor="start" font-weight="normal">5 sweeps turn voxels on; sweep 6 changes nothing.</text>
+<text x="44.0" y="370.0" font-size="12" fill="#59636e" text-anchor="start" font-weight="normal">Bound for a leaf: 3·(8−1) + 1 = 22 sweeps.</text>
+<text x="400.0" y="24.0" font-size="15" fill="#1f2328" text-anchor="start" font-weight="600">(b) Stage 2: one lower node</text>
+<text x="400.0" y="42.0" font-size="12" fill="#59636e" text-anchor="start" font-weight="normal">Leaves are walls; seeds arrive across the leaves’ trigger faces.</text>
+<rect x="420.0" y="280.0" width="30.0" height="30.0" fill="#f5ad66" stroke="#ffffff" stroke-width="1"/>
+<text x="435.0" y="299.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">4</text>
+<rect x="420.0" y="250.0" width="30.0" height="30.0" fill="#f5ad66" stroke="#ffffff" stroke-width="1"/>
+<text x="435.0" y="269.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">3</text>
+<rect x="420.0" y="220.0" width="30.0" height="30.0" fill="#f5ad66" stroke="#ffffff" stroke-width="1"/>
+<text x="435.0" y="239.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">2</text>
+<rect x="420.0" y="190.0" width="30.0" height="30.0" fill="#f5ad66" stroke="#ffffff" stroke-width="1"/>
+<text x="435.0" y="209.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">1</text>
+<rect x="420.0" y="160.0" width="30.0" height="30.0" fill="#f08a3a" stroke="#ffffff" stroke-width="1"/>
+<text x="435.0" y="179.5" font-size="12.5" fill="#ffffff" text-anchor="middle" font-weight="600" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">S</text>
+<rect x="420.0" y="130.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<path d="M421.0,159.0 L421.0,140.5 L439.5,159.0 z" fill="#2f62a8"/>
+<rect x="420.0" y="100.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<path d="M421.0,129.0 L421.0,110.5 L439.5,129.0 z" fill="#2f62a8"/>
+<rect x="420.0" y="70.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="450.0" y="280.0" width="30.0" height="30.0" fill="#f5ad66" stroke="#ffffff" stroke-width="1"/>
+<text x="465.0" y="299.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">3</text>
+<rect x="450.0" y="250.0" width="30.0" height="30.0" fill="#f5ad66" stroke="#ffffff" stroke-width="1"/>
+<text x="465.0" y="269.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">3</text>
+<rect x="450.0" y="220.0" width="30.0" height="30.0" fill="#f5ad66" stroke="#ffffff" stroke-width="1"/>
+<text x="465.0" y="239.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">2</text>
+<rect x="450.0" y="190.0" width="30.0" height="30.0" fill="#f5ad66" stroke="#ffffff" stroke-width="1"/>
+<text x="465.0" y="209.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">1</text>
+<rect x="450.0" y="160.0" width="30.0" height="30.0" fill="#f08a3a" stroke="#ffffff" stroke-width="1"/>
+<text x="465.0" y="179.5" font-size="12.5" fill="#ffffff" text-anchor="middle" font-weight="600" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">S</text>
+<rect x="450.0" y="130.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<path d="M451.0,159.0 L451.0,140.5 L469.5,159.0 z" fill="#2f62a8"/>
+<rect x="450.0" y="100.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<path d="M451.0,129.0 L451.0,110.5 L469.5,129.0 z" fill="#2f62a8"/>
+<rect x="450.0" y="70.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="480.0" y="280.0" width="30.0" height="30.0" fill="#f5ad66" stroke="#ffffff" stroke-width="1"/>
+<text x="495.0" y="299.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">2</text>
+<rect x="480.0" y="250.0" width="30.0" height="30.0" fill="#f5ad66" stroke="#ffffff" stroke-width="1"/>
+<text x="495.0" y="269.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">2</text>
+<rect x="480.0" y="220.0" width="30.0" height="30.0" fill="#f5ad66" stroke="#ffffff" stroke-width="1"/>
+<text x="495.0" y="239.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">1</text>
+<rect x="480.0" y="190.0" width="30.0" height="30.0" fill="#f08a3a" stroke="#ffffff" stroke-width="1"/>
+<text x="495.0" y="209.5" font-size="12.5" fill="#ffffff" text-anchor="middle" font-weight="600" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">S</text>
+<rect x="480.0" y="160.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<path d="M481.0,189.0 L481.0,170.5 L499.5,189.0 z" fill="#2f62a8"/>
+<rect x="480.0" y="130.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<path d="M481.0,159.0 L481.0,140.5 L499.5,159.0 z" fill="#2f62a8"/>
+<rect x="480.0" y="100.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="480.0" y="70.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="510.0" y="280.0" width="30.0" height="30.0" fill="#f5ad66" stroke="#ffffff" stroke-width="1"/>
+<text x="525.0" y="299.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">1</text>
+<rect x="510.0" y="250.0" width="30.0" height="30.0" fill="#f5ad66" stroke="#ffffff" stroke-width="1"/>
+<text x="525.0" y="269.5" font-size="12.5" fill="#1f2328" text-anchor="middle" font-weight="normal" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">1</text>
+<rect x="510.0" y="220.0" width="30.0" height="30.0" fill="#f08a3a" stroke="#ffffff" stroke-width="1"/>
+<text x="525.0" y="239.5" font-size="12.5" fill="#ffffff" text-anchor="middle" font-weight="600" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">S</text>
+<rect x="510.0" y="190.0" width="30.0" height="30.0" fill="#f08a3a" stroke="#ffffff" stroke-width="1"/>
+<text x="525.0" y="209.5" font-size="12.5" fill="#ffffff" text-anchor="middle" font-weight="600" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">S</text>
+<rect x="510.0" y="160.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<path d="M511.0,189.0 L511.0,170.5 L529.5,189.0 z" fill="#2f62a8"/>
+<rect x="510.0" y="130.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<path d="M511.0,159.0 L511.0,140.5 L529.5,159.0 z" fill="#2f62a8"/>
+<rect x="510.0" y="100.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="510.0" y="70.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="540.0" y="280.0" width="30.0" height="30.0" fill="#f08a3a" stroke="#ffffff" stroke-width="1"/>
+<text x="555.0" y="299.5" font-size="12.5" fill="#ffffff" text-anchor="middle" font-weight="600" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">S</text>
+<rect x="540.0" y="250.0" width="30.0" height="30.0" fill="#f08a3a" stroke="#ffffff" stroke-width="1"/>
+<text x="555.0" y="269.5" font-size="12.5" fill="#ffffff" text-anchor="middle" font-weight="600" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">S</text>
+<rect x="540.0" y="220.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<path d="M541.0,249.0 L541.0,230.5 L559.5,249.0 z" fill="#2f62a8"/>
+<rect x="540.0" y="190.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<path d="M541.0,219.0 L541.0,200.5 L559.5,219.0 z" fill="#2f62a8"/>
+<rect x="540.0" y="160.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<path d="M541.0,189.0 L541.0,170.5 L559.5,189.0 z" fill="#2f62a8"/>
+<rect x="540.0" y="130.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="540.0" y="100.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="540.0" y="70.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="570.0" y="280.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<path d="M571.0,309.0 L571.0,290.5 L589.5,309.0 z" fill="#2f62a8"/>
+<rect x="570.0" y="250.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<path d="M571.0,279.0 L571.0,260.5 L589.5,279.0 z" fill="#2f62a8"/>
+<rect x="570.0" y="220.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<path d="M571.0,249.0 L571.0,230.5 L589.5,249.0 z" fill="#2f62a8"/>
+<rect x="570.0" y="190.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<path d="M571.0,219.0 L571.0,200.5 L589.5,219.0 z" fill="#2f62a8"/>
+<rect x="570.0" y="160.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="570.0" y="130.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="570.0" y="100.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="570.0" y="70.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="600.0" y="280.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<path d="M601.0,309.0 L601.0,290.5 L619.5,309.0 z" fill="#2f62a8"/>
+<rect x="600.0" y="250.0" width="30.0" height="30.0" fill="#c8d3df" stroke="#ffffff" stroke-width="1"/>
+<path d="M601.0,279.0 L601.0,260.5 L619.5,279.0 z" fill="#2f62a8"/>
+<rect x="600.0" y="220.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="600.0" y="190.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="600.0" y="160.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="600.0" y="130.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="600.0" y="100.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="600.0" y="70.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="630.0" y="280.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="630.0" y="250.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="630.0" y="220.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="630.0" y="190.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="630.0" y="160.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="630.0" y="130.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="630.0" y="100.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="630.0" y="70.0" width="30.0" height="30.0" fill="#ffffff" stroke="#e3e7ec" stroke-width="1"/>
+<rect x="420.0" y="70.0" width="240.0" height="240.0" fill="none" stroke="#1f2328" stroke-width="1.6"/>
+<line x1="420.0" y1="70.0" x2="420.0" y2="310.0" stroke="#d4570f" stroke-width="4.5"/>
+<line x1="420.0" y1="310.0" x2="660.0" y2="310.0" stroke="#d4570f" stroke-width="4.5"/>
+<line x1="416.0" y1="220.0" x2="390.0" y2="220.0" stroke="#d4570f" stroke-width="1.8" marker-end="url(#f2a)"/>
+<line x1="630.0" y1="314.0" x2="630.0" y2="336.0" stroke="#d4570f" stroke-width="1.8" marker-end="url(#f2a)"/>
+<text x="420.0" y="332.0" font-size="12" fill="#d4570f" text-anchor="start" font-weight="600">trigger faces: seed stage 3 or 4</text>
+<text x="420.0" y="354.0" font-size="12" fill="#59636e" text-anchor="start" font-weight="normal">Drawn with 8×8 slots; a lower node has 16³.</text>
+<rect x="20" y="388" width="16" height="16" fill="#2f62a8" stroke="#b6bfc9" stroke-width="0.8"/>
+<text x="44.0" y="400.5" font-size="12.5" fill="#1f2328" text-anchor="start" font-weight="normal">active, &lt; 0 (seed)</text>
+<rect x="185" y="388" width="16" height="16" fill="#c8d3df" stroke="#b6bfc9" stroke-width="0.8"/>
+<text x="209.0" y="400.5" font-size="12.5" fill="#1f2328" text-anchor="start" font-weight="normal">active, ≥ 0 (wall)</text>
+<rect x="345" y="388" width="16" height="16" fill="#fbd5a8" stroke="#b6bfc9" stroke-width="0.8"/>
+<text x="369.0" y="400.5" font-size="12.5" fill="#1f2328" text-anchor="start" font-weight="normal">leaf mask bit</text>
+<rect x="475" y="388" width="16" height="16" fill="#f08a3a"/>
+<text x="483.0" y="400.5" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="600" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">S</text>
+<text x="499.0" y="400.5" font-size="12.5" fill="#1f2328" text-anchor="start" font-weight="normal">seeded in stage 1</text>
+<rect x="620" y="388" width="16" height="16" fill="#f5ad66" stroke="#b6bfc9" stroke-width="0.8"/>
+<text x="644.0" y="400.5" font-size="12.5" fill="#1f2328" text-anchor="start" font-weight="normal">lower mask bit</text>
+<text x="20.0" y="428.0" font-size="11.5" fill="#59636e" text-anchor="start" font-weight="normal">In (b) a leaf is drawn as a child slot (wall), with its narrow band in miniature.</text>
+</svg>

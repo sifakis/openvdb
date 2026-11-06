@@ -49,8 +49,20 @@ struct Tap { int32_t delta; float length; };
 template <typename BuildT, int Halo>
 struct HaloTile
 {
-    static constexpr int DIM  = int(NanoLeaf<BuildT>::DIM) + 2 * Halo;
+    using LeafT = NanoLeaf<BuildT>;
+    static constexpr int DIM  = int(LeafT::DIM) + 2 * Halo;
     static constexpr int SIZE = DIM * DIM * DIM;
+
+    /// @brief Tile cell of voxel n of the leaf.
+    __hostdev__ static int cellOf(uint32_t n)
+    {
+        const Coord ijk = LeafT::OffsetToLocalCoord(n);
+        return ((ijk[0] + Halo) * DIM + ijk[1] + Halo) * DIM + ijk[2] + Halo;
+    }
+
+    /// @brief Region of the tile, along one axis, that tile coordinate t falls in: 0 for the halo below the
+    ///        leaf, 1 for the leaf, 2 for the halo above.
+    __hostdev__ static int regionOf(int t) { return int(t >= Halo) + int(t >= Halo + int(LeafT::DIM)); }
 };
 
 /// @brief The taps of the primitive offsets w in [-Halo, Halo]^3 with minLength <= |w| < maxLength, sorted
@@ -311,6 +323,41 @@ __device__ inline ::cuda::atomic_ref<T, ::cuda::thread_scope_device> atomicRef(c
     return ::cuda::atomic_ref<T, ::cuda::thread_scope_device>(const_cast<T&>(word));
 }
 
+/// @brief Block-wide: finds the 27 leaves around leaf leafID, one per tile region with the leaf itself at
+///        [1][1][1], as leaf indices in sNeighbourIDs, or UINT32_MAX where there is none; then gathers its halo
+///        tile into sTile, cell c holding r (the distance to the surface in voxels) if its voxel is on in
+///        d_certifiedMasks and -inf if not. d_udf is read at certified voxels only. The masks are read with
+///        relaxed atomics, since during a sweep other blocks of the same launch write them. Ends with a
+///        __syncthreads().
+template <typename BuildT, int Halo>
+__device__ void gatherTile(const NanoGrid<BuildT>* d_grid, uint32_t leafID, const float* d_udf, float voxelSize,
+                           const Mask<3>* d_certifiedMasks, uint32_t (&sNeighbourIDs)[3][3][3], float* sTile)
+{
+    using TileT = HaloTile<BuildT, Halo>;
+    using LeafT = typename TileT::LeafT;
+    const auto* firstLeaf = d_grid->tree().template getFirstNode<0>();
+    const int   tID       = int(threadIdx.x);
+    if (tID < 27) {
+        const int  i = tID / 9, j = tID / 3 % 3, k = tID % 3, dim = int(LeafT::DIM);
+        const auto neighbour = d_grid->tree().root().probeLeaf(
+            firstLeaf[leafID].origin().offsetBy((i - 1) * dim, (j - 1) * dim, (k - 1) * dim));
+        sNeighbourIDs[i][j][k] = neighbour ? uint32_t(neighbour - firstLeaf) : UINT32_MAX;
+    }
+    __syncthreads();
+
+    for (int c = tID; c < TileT::SIZE; c += int(blockDim.x)) {
+        const int i = c / (TileT::DIM * TileT::DIM), j = c / TileT::DIM % TileT::DIM, k = c % TileT::DIM;
+        const uint32_t neighbourID = sNeighbourIDs[TileT::regionOf(i)][TileT::regionOf(j)][TileT::regionOf(k)];
+        const uint32_t n = LeafT::CoordToOffset(Coord(i - Halo, j - Halo, k - Halo));
+        float r = -INFINITY;
+        if (neighbourID != UINT32_MAX &&
+            (atomicRef(d_certifiedMasks[neighbourID].words()[n >> 6]).load(::cuda::memory_order_relaxed) >> (n & 63) & 1))
+            r = d_udf[firstLeaf[neighbourID].getValue(n)] / voxelSize;
+        sTile[c] = r;
+    }
+    __syncthreads();
+}
+
 /// @brief What one round uses besides the grid and the per-leaf arrays.
 struct SweepSettings
 {
@@ -340,19 +387,7 @@ struct SweepFunctor
     static constexpr int MaxThreadsPerBlock         = NanoLeaf<BuildT>::SIZE;
     static constexpr int MinBlocksPerMultiprocessor = 1;
 
-    using LeafT = NanoLeaf<BuildT>;
     using TileT = HaloTile<BuildT, Halo>;
-
-    /// @brief Tile cell of voxel n of the leaf.
-    __device__ static int tileCellOf(uint32_t n)
-    {
-        const Coord ijk = LeafT::OffsetToLocalCoord(n);
-        return ((ijk[0] + Halo) * TileT::DIM + ijk[1] + Halo) * TileT::DIM + ijk[2] + Halo;
-    }
-
-    /// @brief Region of the tile, along one axis, that tile coordinate t falls in: 0 for the halo below the
-    ///        leaf, 1 for the leaf, 2 for the halo above.
-    __device__ static int tileRegionOf(int t) { return int(t >= Halo) + int(t >= Halo + int(LeafT::DIM)); }
 
     __device__ void operator()(const NanoGrid<BuildT>* d_grid, const float* d_udf, SweepSettings settings,
                                const Mask<3>* d_readMasks, Mask<3>* d_certifiedMasks, uint32_t* d_hasCandidates,
@@ -375,8 +410,7 @@ struct SweepFunctor
         // Uniform across the block: neither array is written for this leaf until the block is done with it
         if (!d_hasCandidates[leafID] || (!settings.allLeaves && !d_dirtyCurr[leafID])) return;
 
-        const auto* firstLeaf = d_grid->tree().template getFirstNode<0>();
-        const auto& leaf      = firstLeaf[leafID];
+        const auto& leaf      = d_grid->tree().template getFirstNode<0>()[leafID];
         const float voxelSize = float(d_grid->voxelSize()[0]);
 
         // List the candidates
@@ -395,35 +429,14 @@ struct SweepFunctor
             sStates[index]     = 0;
         }
 
-        // The 27 leaves around this one, one per tile region with itself at [1][1][1], as leaf indices,
-        // or UINT32_MAX where there is none
-        if (tID < 27) {
-            const int  i = int(tID) / 9, j = int(tID) / 3 % 3, k = int(tID) % 3, dim = int(LeafT::DIM);
-            const auto neighbour = d_grid->tree().root().probeLeaf(
-                leaf.origin().offsetBy((i - 1) * dim, (j - 1) * dim, (k - 1) * dim));
-            sNeighbourIDs[i][j][k] = neighbour ? uint32_t(neighbour - firstLeaf) : UINT32_MAX;
-        }
         if (tID < Mask<3>::SIZE / 32) sNewBits[tID] = 0;
-        __syncthreads();
-
-        // Gather the tile
-        for (int c = int(tID); c < TileT::SIZE; c += MaxThreadsPerBlock) {
-            const int i = c / (TileT::DIM * TileT::DIM), j = c / TileT::DIM % TileT::DIM, k = c % TileT::DIM;
-            const uint32_t neighbourID = sNeighbourIDs[tileRegionOf(i)][tileRegionOf(j)][tileRegionOf(k)];
-            const uint32_t n = LeafT::CoordToOffset(Coord(i - Halo, j - Halo, k - Halo));
-            float r = -INFINITY;
-            if (neighbourID != UINT32_MAX &&
-                (atomicRef(d_readMasks[neighbourID].words()[n >> 6]).load(::cuda::memory_order_relaxed) >> (n & 63) & 1))
-                r = d_udf[firstLeaf[neighbourID].getValue(n)] / voxelSize;
-            sTile[c] = r;
-        }
-        __syncthreads();
+        gatherTile<BuildT, Halo>(d_grid, leafID, d_udf, voxelSize, d_readMasks, sNeighbourIDs, sTile);
 
         for (int iteration = 0; iteration < settings.maxLocalIterations; ++iteration) {
             // Test each uncertified candidate; the tile stays unchanged during the test
             for (int i = int(warpID); i < candidateCount; i += WarpCount) {
                 if (sStates[i]) continue;
-                const int   centre = tileCellOf(sCandidates[i]);
+                const int   centre = TileT::cellOf(sCandidates[i]);
                 const float r      = sRadii[i];
                 // Every voxel is within the band, so taps this long cannot certify
                 const float reach  = r + settings.bandWidth;
@@ -445,7 +458,7 @@ struct SweepFunctor
             for (int i = int(tID); i < candidateCount; i += MaxThreadsPerBlock)
                 if (sStates[i] == 1) {
                     const uint32_t n = sCandidates[i];
-                    sTile[tileCellOf(n)] = sRadii[i];
+                    sTile[TileT::cellOf(n)] = sRadii[i];
                     atomicOr(&sNewBits[n >> 5], 1u << (n & 31));
                     sStates[i] = 2;
                     changed = true;

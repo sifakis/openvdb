@@ -65,28 +65,29 @@ struct HaloTile
     __hostdev__ static int regionOf(int t) { return int(t >= Halo) + int(t >= Halo + int(LeafT::DIM)); }
 };
 
-/// @brief The taps of the primitive offsets w in [-Halo, Halo]^3 with minLength <= |w| < maxLength, sorted
-///        by length.
-/// @details A voxel q is certified from a certified voxel q + w when the balls around them, with radii r their
-///          distances to the surface, overlap: r(q) + r(q + w) > |w| + tolerance.
-///          Multiples k*w (k > 1) are left out: certifying q from q + k*w can be replaced by k steps of w,
-///          through the voxels in between, which are in the band and get certified too, so the final certified
-///          set is the same.
-///          Sorting puts the shortest offsets first: since r is at most the band half-width W, only
-///          |w| < r(q) + W can certify q, so the scan for q can stop at the first longer one.
+/// @brief The taps of the offsets w in [-Halo, Halo]^3 with minLength <= |w| < maxLength, only the primitive
+///        ones (not a multiple of a shorter offset) if primitive, sorted by length.
+/// @details The passes that certify use the primitive offsets. A voxel q is certified from a certified voxel
+///          q + w when the balls around them, with radii r their distances to the surface, overlap:
+///          r(q) + r(q + w) > |w| + tolerance. Multiples k*w (k > 1) are left out: certifying q from q + k*w can
+///          be replaced by k steps of w, through the voxels in between, which are in the band and get certified
+///          too, so the final certified set is the same.
+///          The inside recompute pass takes a minimum over distances, so it uses every offset.
+///          Sorting puts the shortest offsets first, so a scan can stop at the first offset too long to matter.
 template <typename BuildT, int Halo>
-std::vector<Tap> makeTaps(float minLength, float maxLength)
+std::vector<Tap> makeTaps(float minLength, float maxLength, bool primitive)
 {
     constexpr int dim = HaloTile<BuildT, Halo>::DIM;
-    // The loops below only visit [-Halo, Halo]^3; a primitive offset outside it is at least
-    // sqrt((Halo + 1)^2 + 1) long, so this bound keeps every offset shorter than maxLength in the table
-    NANOVDB_ASSERT(maxLength * maxLength <= float((Halo + 1) * (Halo + 1) + 1));
+    // The loops below only visit [-Halo, Halo]^3; an offset outside it is at least Halo + 1 long, and a
+    // primitive one at least sqrt((Halo + 1)^2 + 1), so this bound keeps every offset shorter than maxLength
+    NANOVDB_ASSERT(maxLength * maxLength <= float((Halo + 1) * (Halo + 1) + (primitive ? 1 : 0)));
 
     std::vector<Tap> taps;
     for (int dx = -Halo; dx <= Halo; ++dx)
         for (int dy = -Halo; dy <= Halo; ++dy)
             for (int dz = -Halo; dz <= Halo; ++dz) {
-                if (std::gcd(std::gcd(dx, dy), dz) != 1) continue; // w = 0, or a multiple of a shorter offset
+                const int divisor = std::gcd(std::gcd(dx, dy), dz);
+                if (divisor == 0 || (primitive && divisor != 1)) continue; // w = 0, or a multiple of a shorter offset
                 const int lengthSqr = dx * dx + dy * dy + dz * dz;
                 if (float(lengthSqr) < minLength * minLength || float(lengthSqr) >= maxLength * maxLength) continue;
                 // Rounded up, so the overlap test can only get stricter
@@ -139,7 +140,8 @@ public:
     ///        run in both modes, uses the offsets w with |w| < W + D; the pedantic pass, which only pedantic
     ///        mode adds, uses W + D <= |w| < 2W. A primitive w (not a multiple of a shorter offset) has a
     ///        component above a halo width h only if |w| >= sqrt((h + 1)^2 + 1), so each set of offsets fits
-    ///        in [-h, h]^3.
+    ///        in [-h, h]^3. The inside recompute pass uses every w with |w| < 2W, primitive or not, which fits
+    ///        in the pedantic tile too since any w has a component above h only if |w| >= h + 1.
     static constexpr int DefaultHalo  = 3;
     static constexpr int PedanticHalo = 5;
 
@@ -153,6 +155,8 @@ public:
                   "The offsets of the default pass must fit in [-DefaultHalo, DefaultHalo]^3");
     static_assert(4.f * BandWidth * BandWidth <= (PedanticHalo + 1) * (PedanticHalo + 1) + 1,
                   "The offsets of the pedantic pass must fit in [-PedanticHalo, PedanticHalo]^3");
+    static_assert(2.f * BandWidth <= PedanticHalo + 1,
+                  "The offsets of the inside recompute pass must fit in [-PedanticHalo, PedanticHalo]^3");
 
     /// @brief Constructor
     /// @param d_grid device index grid of the narrow band around one connected surface, without active tiles
@@ -204,6 +208,24 @@ public:
         return std::move(mCertifiedMasks);
     }
 
+    /// @brief Returns the certified masks of getCertifiedMasks() and a signed distance sidecar, indexed as the
+    ///        UDF: a certified voxel keeps its UDF, and every other active voxel p gets
+    ///        phi(p) = -min over certified V of (|p - V| - d_V), clamped to [-W, 0], d_V the UDF of V; slot 0 keeps
+    ///        the background. Distances in the sidecar are in world units. Ownership of both passes to the caller.
+    /// @note phi(p) is the signed distance to the boundary of the union of the certified balls, which is at
+    ///       least the UDF of p for a truly inside p, and departs from it only where the balls cannot follow
+    ///       the surface into narrow creases.
+    /// todo: The sidecar is a new array beside the UDF, 4 bytes more per value until the caller frees the UDF.
+    ///       For high-resolution inputs, consider an API that writes the SDF over the UDF in place: the recompute
+    ///       pass reads the UDF only at certified voxels and writes only the others.
+    std::pair<BufT<Mask<3>>, BufT<float>> getCertifiedMasksAndSDF()
+    {
+        auto certifiedMasks = getCertifiedMasks();
+        auto sdf            = recomputeInsideDistances(certifiedMasks.data());
+        cudaCheck(cudaStreamSynchronize(mStream));
+        return {std::move(certifiedMasks), std::move(sdf)};
+    }
+
 private:
 
     // Stage 1: the certified masks start as the seed masks (active voxels only); every leaf with a
@@ -215,6 +237,9 @@ private:
 
     // Stage 3: one round of the pedantic pass over every leaf; returns whether it certified anything.
     bool processPedanticPass();
+
+    // Stage 4: the inside recompute pass; returns the signed distance sidecar of getCertifiedMasksAndSDF().
+    BufT<float> recomputeInsideDistances(const Mask<3>* d_certifiedMasks);
 
     /// @brief One round: one block per leaf, each certifying the candidates of its leaf at least minRadius
     ///        from the surface with the taps; skips the leaves that are not dirty unless allLeaves. Returns
@@ -304,9 +329,9 @@ void SignCertifier<BuildT, ResourceT>::initialize()
         mCertifiedMasks.data(), mHasCandidates.data(), mDirtyCurr.data());
     cudaCheckError();
 
-    mDefaultTaps = upload(certification::detail::makeTaps<BuildT, DefaultHalo>(0.f, BandWidth + BarrierThreshold));
+    mDefaultTaps = upload(certification::detail::makeTaps<BuildT, DefaultHalo>(0.f, BandWidth + BarrierThreshold, true));
     if (mPedantic)
-        mPedanticTaps = upload(certification::detail::makeTaps<BuildT, PedanticHalo>(BandWidth + BarrierThreshold, 2.f * BandWidth));
+        mPedanticTaps = upload(certification::detail::makeTaps<BuildT, PedanticHalo>(BandWidth + BarrierThreshold, 2.f * BandWidth, true));
 }// SignCertifier<BuildT, ResourceT>::initialize
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -533,6 +558,99 @@ bool SignCertifier<BuildT, ResourceT>::processPedanticPass()
     // leaves it marks dirty are where the next default pass resumes.
     return sweep<PedanticHalo>(mPedanticTaps, BarrierThreshold, true);
 }// SignCertifier<BuildT, ResourceT>::processPedanticPass
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+namespace certification::detail {
+
+// Stage 4: the inside recompute pass.
+
+/// @brief Taps of the inside recompute pass, in constant memory: every lane of a warp reads the same tap at the
+///        same time, so the reads are broadcasts. Sized for every offset of a halo-5 tile. Every SignCertifier
+///        uploads the same table, since it depends only on the fixed band width and halo.
+static __constant__ Tap cInsideTaps[11 * 11 * 11 - 1];
+
+/// @brief The inside recompute pass over one leaf: every active voxel p of the leaf that is not certified gets
+///        phi(p) = -min over certified V of (|p - V| - d_V), clamped to [-W, 0] (in voxels), written to d_sdf
+///        in world units.
+/// @details The block skips a leaf with no uncertified voxel. Otherwise it lists them, gathers the halo tile,
+///          cell c holding d (the UDF in voxels) if its voxel is certified and -inf if not, so that |w| - tile is
+///          +inf for the others, and gives each listed voxel a thread. A thread scans the taps, sorted by length,
+///          keeping best = min(best, |w| - d) from best = W, and stops at the first tap with |w| >= best + W:
+///          since d <= W, no later tap can lower best. All lanes read the same tap at the same time; the warp
+///          leaves the scan once every lane has stopped, checked every 16 taps.
+template <typename BuildT, int Halo>
+struct RecomputeFunctor
+{
+    static constexpr int MaxThreadsPerBlock         = NanoLeaf<BuildT>::SIZE;
+    static constexpr int MinBlocksPerMultiprocessor = 1;
+
+    using TileT = HaloTile<BuildT, Halo>;
+
+    __device__ void operator()(const NanoGrid<BuildT>* d_grid, const float* d_udf, const Mask<3>* d_certifiedMasks,
+                               const uint32_t* d_hasCandidates, int tapCount, float bandWidth, float* d_sdf)
+    {
+        using BlockScanT = cub::BlockScan<int, MaxThreadsPerBlock>;
+        constexpr int TapsPerCheck = 16;
+
+        __shared__ uint32_t sNeighbourIDs[3][3][3];
+        __shared__ float    sTile[TileT::SIZE];
+        __shared__ uint16_t sVoxels[MaxThreadsPerBlock]; // offsets of the uncertified voxels, in tile order
+        __shared__ typename BlockScanT::TempStorage sScanStorage;
+
+        const uint32_t leafID = blockIdx.x, tID = threadIdx.x;
+        if (!d_hasCandidates[leafID]) return;
+
+        const auto& leaf      = d_grid->tree().template getFirstNode<0>()[leafID];
+        const float voxelSize = float(d_grid->voxelSize()[0]);
+
+        const bool uncertified = leaf.isActive(tID) && !d_certifiedMasks[leafID].isOn(tID);
+        int index, count;
+        BlockScanT(sScanStorage).ExclusiveSum(int(uncertified), index, count);
+        if (uncertified) sVoxels[index] = uint16_t(tID);
+        gatherTile<BuildT, Halo>(d_grid, leafID, d_udf, voxelSize, d_certifiedMasks, sNeighbourIDs, sTile);
+
+        // Every lane takes part in the warp votes; a lane past the list has nothing to scan
+        const bool listed = int(tID) < count;
+        const int  centre = listed ? TileT::cellOf(sVoxels[tID]) : 0;
+        float best    = bandWidth;
+        bool  stopped = !listed;
+        for (int t = 0; t < tapCount && !__all_sync(0xFFFFFFFFu, stopped); t += TapsPerCheck)
+            for (int u = t; u < min(t + TapsPerCheck, tapCount); ++u) {
+                const Tap tap = cInsideTaps[u];
+                stopped = stopped || tap.length >= best + bandWidth;
+                if (!stopped) best = fminf(best, tap.length - sTile[centre + tap.delta]);
+            }
+        if (listed) d_sdf[leaf.getValue(sVoxels[tID])] = -fmaxf(best, 0.f) * voxelSize;
+    }
+};
+
+} // namespace certification::detail
+
+template <typename BuildT, typename ResourceT>
+typename SignCertifier<BuildT, ResourceT>::template BufT<float>
+SignCertifier<BuildT, ResourceT>::recomputeInsideDistances(const Mask<3>* d_certifiedMasks)
+{
+    // The certified voxels and the background keep their values, so the sidecar starts as a copy of the UDF
+    const uint64_t valueCount = util::cuda::DeviceGridTraits<BuildT>::getValueCount(mDeviceGrid);
+    BufT<float> sdf(mStream, this->ref(), valueCount, nanovdb::cuda::noInit);
+    cudaCheck(cudaMemcpyAsync(sdf.data(), mDeviceUDF, sdf.size_bytes(), cudaMemcpyDeviceToDevice, mStream));
+    if (mLeafCount == 0) return sdf;
+
+    const auto taps = certification::detail::makeTaps<BuildT, PedanticHalo>(0.f, 2.f * BandWidth, false);
+    constexpr int span = 2 * PedanticHalo + 1;
+    static_assert(sizeof(certification::detail::cInsideTaps) == (span * span * span - 1) * sizeof(TapT),
+                  "cInsideTaps holds every offset of the pedantic tile");
+    // The source is pageable, so the copy has been staged by the time the call returns
+    cudaCheck(cudaMemcpyToSymbolAsync(certification::detail::cInsideTaps, taps.data(), taps.size() * sizeof(TapT), 0,
+                                      cudaMemcpyHostToDevice, mStream));
+
+    using RecomputeOp = certification::detail::RecomputeFunctor<BuildT, PedanticHalo>;
+    util::cuda::operatorKernel<RecomputeOp><<<mLeafCount, RecomputeOp::MaxThreadsPerBlock, 0, mStream>>>(
+        mDeviceGrid, mDeviceUDF, d_certifiedMasks, mHasCandidates.data(), int(taps.size()), BandWidth, sdf.data());
+    cudaCheckError();
+    return sdf;
+}// SignCertifier<BuildT, ResourceT>::recomputeInsideDistances
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 

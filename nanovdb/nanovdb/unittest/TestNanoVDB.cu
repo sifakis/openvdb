@@ -4634,28 +4634,55 @@ TEST(TestNanoVDBCUDA, SignCertifierSphere)
     cudaCheck(cudaMemcpy(deviceUDF.data(), hostUDF.data(), deviceUDF.size_bytes(), cudaMemcpyHostToDevice));
     cudaCheck(cudaMemcpy(deviceSeeds.data(), hostSeeds.data(), deviceSeeds.size_bytes(), cudaMemcpyHostToDevice));
 
-    auto certify = [&](bool pedantic) {
-        CertifierT certifier(reinterpret_cast<const nanovdb::NanoGrid<BuildT>*>(deviceGrid.data()), deviceUDF.data(),
-                             deviceSeeds.data());
-        certifier.setPedantic(pedantic);
-        auto                          deviceMasks = certifier.getCertifiedMasks();
-        std::vector<nanovdb::Mask<3>> masks(leafCount);
-        cudaCheck(cudaMemcpy(masks.data(), deviceMasks.data(), deviceMasks.size_bytes(), cudaMemcpyDeviceToHost));
-        return masks;
+    auto download = [](const auto& deviceBuffer) {
+        std::vector<typename std::decay_t<decltype(deviceBuffer)>::ElementType> host(deviceBuffer.size());
+        cudaCheck(cudaMemcpy(host.data(), deviceBuffer.data(), deviceBuffer.size_bytes(), cudaMemcpyDeviceToHost));
+        return host;
     };
-    const auto byDefault = certify(false), byPedantic = certify(true);
+    const auto* d_grid = reinterpret_cast<const nanovdb::NanoGrid<BuildT>*>(deviceGrid.data());
+    auto [deviceMasks, deviceSDF] = CertifierT(d_grid, deviceUDF.data(), deviceSeeds.data()).getCertifiedMasksAndSDF();
+    CertifierT pedanticCertifier(d_grid, deviceUDF.data(), deviceSeeds.data());
+    pedanticCertifier.setPedantic();
+    const auto byDefault = download(deviceMasks), byPedantic = download(pedanticCertifier.getCertifiedMasks());
+    const auto sdf = download(deviceSDF);
 
     // Soundness: no inside voxel is certified. Completeness: every outside voxel with udf > 0.1 is certified; closer
     // to the surface (below about 0.04 on a plane) a ball can be too small to overlap a certified one, and 0.1 also
     // covers the curvature and the tolerance. Modes agree: a sphere has no pockets, so the pedantic pass adds nothing.
-    uint64_t unsound = 0, missed = 0, differ = 0;
-    float    smallestMissed = std::numeric_limits<float>::max();
+    // Inside distances: |phi| of an inside voxel is at least its udf, since the certified balls contain no surface,
+    // and exceeds it by at most 0.1, how loosely the balls follow a smooth surface. The sidecar matches the pass
+    // recomputed on the host from the same UDF values and certified voxels: the UDF where certified, else phi.
+    auto gridAcc        = grid->getAccessor();
+    auto insideDistance = [&](const nanovdb::Coord& p) { // phi(p) in voxels, by brute force over |w| < 2W
+        const int reach = int(2 * W);
+        float     best  = W;
+        for (int dx = -reach; dx <= reach; ++dx)
+            for (int dy = -reach; dy <= reach; ++dy)
+                for (int dz = -reach; dz <= reach; ++dz) {
+                    const int lengthSqr = dx * dx + dy * dy + dz * dz;
+                    if (lengthSqr == 0 || float(lengthSqr) >= 4.f * W * W) continue;
+                    const nanovdb::Coord v    = p.offsetBy(dx, dy, dz);
+                    const auto*          leaf = gridAcc.probeLeaf(v);
+                    const uint32_t       n    = nanovdb::NanoLeaf<BuildT>::CoordToOffset(v);
+                    if (!leaf || !byDefault[leaf - leaves].isOn(n)) continue; // certified voxels only
+                    best = std::min(best, std::sqrt(float(lengthSqr)) - hostUDF[leaf->getValue(n)] / float(voxelSize));
+                }
+        return -std::max(best, 0.f);
+    };
+    uint64_t unsound = 0, missed = 0, differ = 0, belowUDF = 0, mismatched = 0;
+    float    smallestMissed = std::numeric_limits<float>::max(), largestExcess = 0.f;
     for (uint32_t l = 0; l < leafCount; ++l)
         for (auto it = leaves[l].valueMask().beginOn(); it; ++it) {
             const nanovdb::Coord ijk       = leaves[l].offsetToGlobalCoord(*it);
             const bool           certified = byDefault[l].isOn(*it);
+            const uint64_t       index     = leaves[l].getValue(*it);
+            const float          expected  = certified ? hostUDF[index] : insideDistance(ijk) * float(voxelSize);
+            mismatched += std::fabs(sdf[index] - expected) > 1e-5f * float(voxelSize);
             if (distanceToCentre(ijk) < R) {
                 unsound += certified;
+                const float magnitude = -sdf[index] / float(voxelSize);
+                belowUDF += magnitude < udf(ijk) - 1e-5f;
+                largestExcess = std::max(largestExcess, magnitude - udf(ijk));
             } else if (udf(ijk) > 0.1f && !certified) {
                 ++missed;
                 smallestMissed = std::min(smallestMissed, udf(ijk));
@@ -4665,4 +4692,7 @@ TEST(TestNanoVDBCUDA, SignCertifierSphere)
     EXPECT_EQ(unsound, 0u) << "inside voxels certified";
     EXPECT_EQ(missed, 0u) << "outside voxels with udf > 0.1 left uncertified; smallest udf " << smallestMissed;
     EXPECT_EQ(differ, 0u) << "voxels certified by one mode only";
+    EXPECT_EQ(belowUDF, 0u) << "inside voxels with |phi| below their udf";
+    EXPECT_LE(largestExcess, 0.1f) << "largest |phi| - udf over the inside voxels";
+    EXPECT_EQ(mismatched, 0u) << "sidecar values that differ from the host recomputation by more than 1e-5 voxel";
 }// SignCertifierSphere

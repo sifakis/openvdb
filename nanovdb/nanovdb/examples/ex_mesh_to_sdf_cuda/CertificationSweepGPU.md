@@ -200,18 +200,27 @@ The isovalue (deferred) will interact with this choice: with an offset the radiu
 ## 9. Rounds, dirty leaves and termination
 
 **Version 1 (correctness first):**
-- Launch one CTA per leaf over all leaves each round. Thread 0 reads the leaf's state word; if it is
-  not both dirty and has-candidates, the whole CTA exits together (decide through a shared flag after
-  one `__syncthreads()`).
+- **Launch one CTA per dirty leaf.** Each round the host compacts the dirty flags into a leaf list
+  (`cub::DeviceSelect::Flagged`, so the list is in leaf order), reads its length and launches that
+  many CTAs. CTA `b` processes leaf `list[b]` and exits at once if the leaf has no candidates. An
+  empty list ends the pass.
 - **Dirty flags are pushed.** A CTA that certifies anything stores 1 into the next round's dirty
-  word of its own leaf and its 26 neighbours. Clean leaves then exit after a single load, without
-  touching the neighbour table.
+  word of its own leaf and its 26 neighbours. Clean leaves get no CTA.
 - **Double-buffer** the dirty words: round `r` reads `dirtyCurr` and writes `dirtyNext`; swap and
   clear (`cudaMemsetAsync`) between rounds. Round 1 starts with every leaf that has candidates.
 - **Has-candidates** is cleared by the owner at write-back when no uncertified active voxel remains.
 - **Termination:** a global "anything changed" counter, read by the host every round.
-- Keep a mode that ignores dirty flags and processes every leaf with candidates every round; all
-  modes must agree.
+- Keep a mode that ignores dirty flags and processes every leaf with candidates every round (the
+  list is then compacted from the has-candidates flags); all modes must agree.
+
+**Why the leaf list is in version 1** (it was the last of the later items). A launched CTA costs
+about 2 ns even if it exits at once, and the number of rounds grows with resolution: a region
+reached late is crossed one leaf per round. Hairball, band 2, RTX 5090: 14, 243 and 402 rounds at
+resolutions 3072, 3840 and 4592; at 4592 (14.4M leaves) a round over every leaf costs about 30 ms
+while a few hundred to a few tens of thousands of leaves do work. At resolution 5344 (3.23B
+voxels, 19.9M leaves, 445 rounds) the list takes the sweep from 19.6 s to 1.5 s with the same
+certified voxels. A list the CTAs push into themselves (guarded by a queued flag per leaf) was
+0.08 s faster there and needs more code, so the compaction stays.
 
 **Pedantic mode: the shell pass (in version 1).** After the `W + D` sweep reaches its fixpoint, run
 one pass of the same kernel with the shell stencil (section 2) and `H = 5` at `W = 3`, over leaves
@@ -229,17 +238,15 @@ worth of work. It goes into version 1 because it is the same kernel with another
 candidate filter, and because it is the GPU reference for the default stencil (S2 in
 `NewDistancingApproach.md`).
 
-**Later, in order:**
-1. **A fixed grid looping over every leaf** (about SM count × occupancy CTAs, each striding over
-   leaf indices and skipping clean ones). A CTA reserves its shared memory at launch even if it exits
-   at once, so at `H = 8` (one CTA per SM) launching one CTA per leaf costs about a millisecond per
-   round in empty CTAs for 100k leaves. The loop pays a few loads per clean leaf instead.
-2. **Fewer host syncs:** read the counter every `k` rounds (extra rounds after convergence are
-   nearly free), then a CUDA graph with a conditional `while` node (CUDA 12.4+), keeping the batched
-   host loop as fallback. A persistent cooperative kernel with `grid.sync()` was rejected: residency
-   limits with large tiles, more complexity, no precedent in the codebase.
-3. **A compacted leaf list** (`cub::DeviceSelect::Flagged`), only if profiling at scale (millions of
-   leaves, many rounds) shows the flag scan matters.
+**Later:**
+- **Fewer host syncs:** read the counter every `k` rounds (extra rounds after convergence are
+  nearly free), then a CUDA graph with a conditional `while` node (CUDA 12.4+), keeping the batched
+  host loop as fallback. A persistent cooperative kernel with `grid.sync()` was rejected: residency
+  limits with large tiles, more complexity, no precedent in the codebase. The leaf list adds a
+  second host read per round (its length), which batching must also cover.
+
+Dropped: a fixed grid of CTAs looping over every leaf and skipping the clean ones. It targeted the
+empty CTAs, which the leaf list no longer launches.
 
 ## 10. Component promotion (#4): not in version 1, a planned optimization
 
@@ -289,7 +296,8 @@ belongs to the nesting question in section 13, not here.
 pieces holding a certified voxel and a pass that certifies their voxels, and must repeat (a promoted
 pocket may have necks into further pockets). Against that, the rounds it saves are cheap ones:
 with dirty-leaf early exit a round does real work only on the frontier, so the saving is mostly
-launch and termination-check overhead, which the later items of section 9 also reduce.
+launch and termination-check overhead, which the leaf list and the later item of section 9 also
+reduce.
 
 **A possible shape.** Seeding becomes the first promotion: clear `rootOutside[N]`, mark the extreme
 voxel's label, run the inherit pass. Then: sweep round, during which the owning CTA marks

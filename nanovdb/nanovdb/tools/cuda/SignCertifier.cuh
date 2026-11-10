@@ -18,10 +18,12 @@
 #include <nanovdb/NanoVDB.h>
 #include <nanovdb/cuda/Buffer.h>
 #include <nanovdb/cuda/DeviceResource.h>
+#include <nanovdb/cuda/TempPool.h>
 #include <nanovdb/util/cuda/DeviceGridTraits.cuh>
 #include <nanovdb/util/cuda/Util.h> // for lambdaKernel, operatorKernel
 
-#include <cub/cub.cuh>    // cub::BlockScan
+#include <cub/cub.cuh>    // cub::BlockScan, cub::DeviceSelect
+#include <thrust/iterator/counting_iterator.h> // thrust::counting_iterator
 #include <cuda/atomic>    // cuda::atomic_ref
 
 #include <algorithm> // std::sort
@@ -32,6 +34,21 @@
 #include <stdexcept> // std::runtime_error
 #include <utility>   // std::move, std::swap
 #include <vector>    // std::vector
+
+// Define utility macro used to call cub functions that use dynamic temporary storage
+#ifndef CALL_CUBS
+#ifdef _WIN32
+#define CALL_CUBS(func, ...) \
+    cudaCheck(cub::func(nullptr, mTempDevicePool.requestedSize(), __VA_ARGS__, mStream)); \
+    mTempDevicePool.reallocate(mStream); \
+    cudaCheck(cub::func(mTempDevicePool.data(), mTempDevicePool.size(), __VA_ARGS__, mStream));
+#else
+#define CALL_CUBS(func, args...) \
+    cudaCheck(cub::func(nullptr, mTempDevicePool.requestedSize(), args, mStream)); \
+    mTempDevicePool.reallocate(mStream); \
+    cudaCheck(cub::func(mTempDevicePool.data(), mTempDevicePool.size(), args, mStream));
+#endif
+#endif // ifndef CALL_CUBS
 
 namespace nanovdb {
 
@@ -171,12 +188,15 @@ public:
     SignCertifier(const GridT* d_grid, const float* d_udf, const Mask<3>* d_seedMasks, cudaStream_t stream = 0,
                   ResourceT& resource = nanovdb::cuda::default_resource<ResourceT>())
         : mStream(stream), mDeviceGrid(d_grid), mDeviceUDF(d_udf), mDeviceSeedMasks(d_seedMasks), mResource(&resource)
+        , mTempDevicePool(resource)
         , mCertifiedMasks(stream, resource, 0, nanovdb::cuda::noInit)
         , mRoundStartMasks(stream, resource, 0, nanovdb::cuda::noInit)
         , mHasCandidates(stream, resource, 0, nanovdb::cuda::noInit)
         , mDirtyCurr(stream, resource, 0, nanovdb::cuda::noInit)
         , mDirtyNext(stream, resource, 0, nanovdb::cuda::noInit)
         , mChanged(stream, resource, 0, nanovdb::cuda::noInit)
+        , mWorklist(stream, resource, 0, nanovdb::cuda::noInit)
+        , mWorkCount(stream, resource, 0, nanovdb::cuda::noInit)
         , mDefaultTaps(stream, resource, 0, nanovdb::cuda::noInit)
         , mPedanticTaps(stream, resource, 0, nanovdb::cuda::noInit) {}
 
@@ -241,9 +261,9 @@ private:
     // Stage 4: the inside recompute pass; returns the signed distance sidecar of getCertifiedMasksAndSDF().
     BufT<float> recomputeInsideDistances(const Mask<3>* d_certifiedMasks);
 
-    /// @brief One round: one block per leaf, each certifying the candidates of its leaf at least minRadius
-    ///        from the surface with the taps; skips the leaves that are not dirty unless allLeaves. Returns
-    ///        whether the round certified anything.
+    /// @brief One round: one block per dirty leaf (per leaf with a candidate if allLeaves), each certifying the
+    ///        candidates of its leaf at least minRadius from the surface with the taps. Returns whether the
+    ///        round certified anything.
     template <int Halo>
     bool sweep(const BufT<TapT>& taps, float minRadius, bool allLeaves);
 
@@ -264,6 +284,7 @@ private:
     const float   *mDeviceUDF;
     const Mask<3> *mDeviceSeedMasks;
     ResourceT     *mResource;         // non-owning
+    nanovdb::cuda::TempPool<ResourceT> mTempDevicePool;
     float          mTolerance{1e-3f};
     bool           mPedantic{false};
     bool           mReferenceMode{false};
@@ -275,6 +296,8 @@ private:
     BufT<uint32_t> mDirtyCurr;        // leafCount x uint32_t: 1 if a voxel of the leaf or of a neighbour leaf was certified in the previous round
     BufT<uint32_t> mDirtyNext;        // leafCount x uint32_t: the same for the current round, for the next one
     BufT<uint32_t> mChanged;          // 1 x uint32_t: one flag for the whole grid, 1 if the current round certified a voxel in any leaf
+    BufT<uint32_t> mWorklist;         // leafCount x uint32_t: the leaves the current round processes, in leaf order
+    BufT<uint32_t> mWorkCount;        // 1 x uint32_t: the number of leaves in mWorklist
     BufT<TapT>     mDefaultTaps;      // taps of the default pass, sorted by length
     BufT<TapT>     mPedanticTaps;     // taps of the pedantic pass (pedantic mode only): only the longer offsets, none of mDefaultTaps, sorted by length
 };// tools::cuda::SignCertifier<BuildT, ResourceT>
@@ -321,6 +344,8 @@ void SignCertifier<BuildT, ResourceT>::initialize()
     mDirtyCurr     = BufT<uint32_t>(mStream, this->ref(), mLeafCount, nanovdb::cuda::noInit);
     mDirtyNext     = BufT<uint32_t>(mStream, this->ref(), mLeafCount, nanovdb::cuda::noInit);
     mChanged       = BufT<uint32_t>(mStream, this->ref(), 1, nanovdb::cuda::noInit);
+    mWorklist      = BufT<uint32_t>(mStream, this->ref(), mLeafCount, nanovdb::cuda::noInit);
+    mWorkCount     = BufT<uint32_t>(mStream, this->ref(), 1, nanovdb::cuda::noInit);
     if (mLeafCount == 0) return;
 
     static constexpr unsigned int threadsPerBlock = 128;
@@ -392,13 +417,12 @@ struct SweepSettings
     float      tolerance;          // tau
     float      minRadius;          // only voxels at least this far from the surface are candidates
     int        maxLocalIterations; // tests of the candidates per round, over the same loaded tile
-    bool       allLeaves;          // process the leaves that are not dirty too
 };
 
 /// @brief One round over one leaf: certifies the candidates of the leaf (its active voxels not certified
 ///        yet, at least minRadius from the surface) from the certified voxels within reach, using the taps
 ///        of a halo tile with Halo voxels beyond each face of the leaf.
-/// @details The block skips a leaf with no candidates, or that is not dirty unless allLeaves. Otherwise it
+/// @details Block b processes leaf d_worklist[b], and skips it if it has no candidates. Otherwise it
 ///          lists the candidates, gathers the halo tile, cell c holding r (the distance to the surface) if
 ///          its voxel is certified and -inf if not, then tests each candidate against its taps, one warp per
 ///          candidate and one lane per tap, until one certifies it. Certifications are written into the tile
@@ -415,8 +439,8 @@ struct SweepFunctor
     using TileT = HaloTile<BuildT, Halo>;
 
     __device__ void operator()(const NanoGrid<BuildT>* d_grid, const float* d_udf, SweepSettings settings,
-                               const Mask<3>* d_readMasks, Mask<3>* d_certifiedMasks, uint32_t* d_hasCandidates,
-                               const uint32_t* d_dirtyCurr, uint32_t* d_dirtyNext, uint32_t* d_changed)
+                               const uint32_t* d_worklist, const Mask<3>* d_readMasks, Mask<3>* d_certifiedMasks,
+                               uint32_t* d_hasCandidates, uint32_t* d_dirtyNext, uint32_t* d_changed)
     {
         using BlockScanT = cub::BlockScan<int, MaxThreadsPerBlock>;
         constexpr int WarpCount = MaxThreadsPerBlock / 32;
@@ -431,9 +455,9 @@ struct SweepFunctor
         __shared__ typename BlockScanT::TempStorage sScanStorage;
         const auto& newMask = reinterpret_cast<const Mask<3>&>(sNewBits);
 
-        const uint32_t leafID = blockIdx.x, tID = threadIdx.x, warpID = tID >> 5, laneID = tID & 31;
-        // Uniform across the block: neither array is written for this leaf until the block is done with it
-        if (!d_hasCandidates[leafID] || (!settings.allLeaves && !d_dirtyCurr[leafID])) return;
+        const uint32_t leafID = d_worklist[blockIdx.x], tID = threadIdx.x, warpID = tID >> 5, laneID = tID & 31;
+        // Uniform across the block: the flag is not written for this leaf until the block is done with it
+        if (!d_hasCandidates[leafID]) return;
 
         const auto& leaf      = d_grid->tree().template getFirstNode<0>()[leafID];
         const float voxelSize = float(d_grid->voxelSize()[0]);
@@ -518,8 +542,17 @@ template <typename BuildT, typename ResourceT>
 template <int Halo>
 bool SignCertifier<BuildT, ResourceT>::sweep(const BufT<TapT>& taps, float minRadius, bool allLeaves)
 {
+    // The worklist: the dirty leaves, or every leaf with a candidate. A round launches a block only for them.
+    const uint32_t* d_listed = (allLeaves || mReferenceMode) ? mHasCandidates.data() : mDirtyCurr.data();
+    CALL_CUBS(DeviceSelect::Flagged, thrust::counting_iterator<uint32_t>(0), d_listed, mWorklist.data(), mWorkCount.data(),
+              int(mLeafCount));
+    uint32_t workCount = 0;
+    cudaCheck(cudaMemcpyAsync(&workCount, mWorkCount.data(), sizeof(workCount), cudaMemcpyDeviceToHost, mStream));
+    cudaCheck(cudaStreamSynchronize(mStream));
+    if (workCount == 0) return false;
+
     const certification::detail::SweepSettings settings{taps.data(), int(taps.size()), BandWidth, mTolerance, minRadius,
-                                                        mReferenceMode ? 1 : MaxLocalIterations, allLeaves || mReferenceMode};
+                                                        mReferenceMode ? 1 : MaxLocalIterations};
     const Mask<3>* d_readMasks = mCertifiedMasks.data();
     if (mReferenceMode) {
         cudaCheck(cudaMemcpyAsync(mRoundStartMasks.data(), mCertifiedMasks.data(), mCertifiedMasks.size_bytes(),
@@ -530,9 +563,9 @@ bool SignCertifier<BuildT, ResourceT>::sweep(const BufT<TapT>& taps, float minRa
     cudaCheck(cudaMemsetAsync(mChanged.data(), 0, mChanged.size_bytes(), mStream));
 
     using SweepOp = certification::detail::SweepFunctor<BuildT, Halo>;
-    util::cuda::operatorKernel<SweepOp><<<mLeafCount, SweepOp::MaxThreadsPerBlock, 0, mStream>>>(
-        mDeviceGrid, mDeviceUDF, settings, d_readMasks, mCertifiedMasks.data(), mHasCandidates.data(),
-        mDirtyCurr.data(), mDirtyNext.data(), mChanged.data());
+    util::cuda::operatorKernel<SweepOp><<<workCount, SweepOp::MaxThreadsPerBlock, 0, mStream>>>(
+        mDeviceGrid, mDeviceUDF, settings, mWorklist.data(), d_readMasks, mCertifiedMasks.data(), mHasCandidates.data(),
+        mDirtyNext.data(), mChanged.data());
     cudaCheckError();
 
     uint32_t changed = 0;
@@ -657,5 +690,9 @@ SignCertifier<BuildT, ResourceT>::recomputeInsideDistances(const Mask<3>* d_cert
 }// namespace tools::cuda
 
 }// namespace nanovdb
+
+#ifdef CALL_CUBS
+#undef CALL_CUBS
+#endif
 
 #endif // NANOVDB_TOOLS_CUDA_SIGNCERTIFIER_CUH_HAS_BEEN_INCLUDED

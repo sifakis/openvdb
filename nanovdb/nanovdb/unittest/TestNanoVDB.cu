@@ -4599,7 +4599,7 @@ TEST(TestNanoVDBCUDA, SignCertifierSphere)
     // the overlap tolerance, and inside/outside is exact. Lengths are in voxels.
     using BuildT     = nanovdb::ValueOnIndex;
     using CertifierT = nanovdb::tools::cuda::SignCertifier<BuildT>;
-    const float          W = CertifierT::BandWidth, R = 24.f;
+    const float          W = CertifierT::MaxBandWidth, R = 24.f;
     const nanovdb::Vec3f c(0.37f, 0.21f, 0.64f); // centre, off the lattice
     const double         voxelSize = 0.1;         // the certifier reads the UDF in world units
     auto distanceToCentre = [&](const nanovdb::Coord& ijk) { return (ijk.asVec3s() - c).length(); };

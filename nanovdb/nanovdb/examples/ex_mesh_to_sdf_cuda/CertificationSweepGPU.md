@@ -56,6 +56,15 @@ with that `H` can use. Residency assumes about 100 KB of shared memory and 48 wa
 every row up to `H = 5` keeps all 48 warp slots busy. Compile `H ∈ {3, 4, 5, 8}` and choose at runtime the smallest that covers
 `W + D`. `H = 3` covers the default; `H = 8` is a slow catch-all.
 
+**`W` in the code.** `W` is the band width of the input grid, given per certifier (`setBandWidth`;
+default and maximum 3) and required to be at least `3D` (the primitive reduction). Only `H = 3`
+(sweep) and `H = 5` (shell and recompute passes) are compiled, which is what caps `W` at 3. The tap
+tables are built on the host from `W`: at `W = 2` the sweep has 74 taps (`|w|² ≤ 6`) instead of
+146. Before `W` was a parameter the code used `W = 3` for every grid. On narrower bands (1.7 to
+2.5, 20 inputs, both modes) that certified the same voxels, but wrote inside distances down to
+`-3` voxels, beyond the background value. Hairball, band 2, resolution 5344, RTX 5090: with
+`W = 2` the sweep takes 1.3 s instead of 1.5 s, and the recompute pass 0.5 s instead of 0.8 s.
+
 **Shell stencil (pedantic mode only).** Primitive `w` with `W + D ≤ |w| < 2W`: 624 taps at `W = 3`.
 It needs the box with `2W ≤ √((H + 1)² + 1)`, so `H = 5` at `W = 3`; the cap `H ≤ 8` allows
 `W ≤ 4.53`. Beyond that the shell is clipped and pedantic mode is no longer exact (still sound).
@@ -448,6 +457,9 @@ UDF of `p` itself. It is one pass with no iteration: the certified set is final.
 - **Stop rule:** start with `best = W` (the clamp). Scan the taps in order, keeping
   `best = min(best, |w| - d_V)` over certified `V`, and stop at the first tap with
   `|w| ≥ best + W`. Every later tap contributes at least `|w| - W ≥ best`.
+- **One table for every `W`:** the constant table holds the offsets of the largest band
+  (`W = 3`). A narrower band reads a prefix of it: the stop rule ends the scan no later than the
+  first tap with `|w| ≥ 2W`.
 - **Why `best + W` and not `best`:** a farther `V` can still win if its ball is larger. These deep
   balls are often the winners: a ball of radius `r` bulges about `s²/8r` away from `Σ` between the
   points where balls touch it (`s` about one voxel), so the deepest balls hug `Σ` best, which is the

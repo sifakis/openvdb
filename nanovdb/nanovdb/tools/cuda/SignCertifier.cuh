@@ -141,11 +141,11 @@ class SignCertifier
 
 public:
 
-    /// @brief Half-width W of the narrow band: no active voxel is farther than W from the surface.
+    /// @brief Largest half-width W of the narrow band; see setBandWidth().
     /// @note Fixed, so the halos below are fixed too. A wider band needs larger halos; halo 8, the largest
     ///       that stays within the 3x3x3 leaves around a leaf, has a 24^3 float tile (55 KB), more than the
     ///       48 KB of static shared memory a block can use.
-    static constexpr float BandWidth = 3.f;
+    static constexpr float MaxBandWidth = 3.f;
 
     /// @brief Barrier threshold D: voxels closer than D to the surface are barrier voxels. Face neighbours at
     ///        least D from the surface are on the same side of it, since 2D > 1, so a seed grown through face
@@ -166,13 +166,13 @@ public:
     ///        voxels certified by the previous test; what is left goes to the next round.
     static constexpr int MaxLocalIterations = 8;
 
-    static_assert(BarrierThreshold > .5f && BarrierThreshold <= 1.f && BandWidth >= 3.f * BarrierThreshold,
+    static_assert(BarrierThreshold > .5f && BarrierThreshold <= 1.f && MaxBandWidth >= 3.f * BarrierThreshold,
                   "Seeding by face neighbours needs D > 1/2, and leaving out multiples of offsets needs D <= 1 and W >= 3D");
-    static_assert((BandWidth + BarrierThreshold) * (BandWidth + BarrierThreshold) <= (DefaultHalo + 1) * (DefaultHalo + 1) + 1,
+    static_assert((MaxBandWidth + BarrierThreshold) * (MaxBandWidth + BarrierThreshold) <= (DefaultHalo + 1) * (DefaultHalo + 1) + 1,
                   "The offsets of the default pass must fit in [-DefaultHalo, DefaultHalo]^3");
-    static_assert(4.f * BandWidth * BandWidth <= (PedanticHalo + 1) * (PedanticHalo + 1) + 1,
+    static_assert(4.f * MaxBandWidth * MaxBandWidth <= (PedanticHalo + 1) * (PedanticHalo + 1) + 1,
                   "The offsets of the pedantic pass must fit in [-PedanticHalo, PedanticHalo]^3");
-    static_assert(2.f * BandWidth <= PedanticHalo + 1,
+    static_assert(2.f * MaxBandWidth <= PedanticHalo + 1,
                   "The offsets of the inside recompute pass must fit in [-PedanticHalo, PedanticHalo]^3");
 
     /// @brief Constructor
@@ -203,6 +203,16 @@ public:
     /// @brief Sets the overlap tolerance tau: a voxel q is certified from a certified voxel q + w only if
     ///        r(q) + r(q + w) > |w| + tau.
     void setTolerance(float tolerance = 1e-3f) { mTolerance = tolerance; }
+
+    /// @brief Sets the half-width W of the narrow band of the grid: no active voxel is farther than W from the
+    ///        surface. The offsets of every pass are chosen from W, and inside distances stop at -W.
+    /// @note W must be at most MaxBandWidth, and at least 3D, which leaving out multiples of offsets needs.
+    void setBandWidth(float bandWidth = MaxBandWidth)
+    {
+        if (bandWidth < 3.f * BarrierThreshold || bandWidth > MaxBandWidth)
+            throw std::runtime_error("nanovdb::tools::cuda::SignCertifier: the band width must be between 3D and MaxBandWidth");
+        mBandWidth = bandWidth;
+    }
 
     /// @brief Toggles pedantic mode (off by default). It adds the pedantic pass: once the default pass
     ///        certifies nothing more, the voxels that are not barrier voxels are tested against the offsets
@@ -286,6 +296,7 @@ private:
     ResourceT     *mResource;         // non-owning
     nanovdb::cuda::TempPool<ResourceT> mTempDevicePool;
     float          mTolerance{1e-3f};
+    float          mBandWidth{MaxBandWidth};
     bool           mPedantic{false};
     bool           mReferenceMode{false};
     uint32_t       mLeafCount{0};
@@ -354,9 +365,9 @@ void SignCertifier<BuildT, ResourceT>::initialize()
         mCertifiedMasks.data(), mHasCandidates.data(), mDirtyCurr.data());
     cudaCheckError();
 
-    mDefaultTaps = upload(certification::detail::makeTaps<BuildT, DefaultHalo>(0.f, BandWidth + BarrierThreshold, true));
+    mDefaultTaps = upload(certification::detail::makeTaps<BuildT, DefaultHalo>(0.f, mBandWidth + BarrierThreshold, true));
     if (mPedantic)
-        mPedanticTaps = upload(certification::detail::makeTaps<BuildT, PedanticHalo>(BandWidth + BarrierThreshold, 2.f * BandWidth, true));
+        mPedanticTaps = upload(certification::detail::makeTaps<BuildT, PedanticHalo>(mBandWidth + BarrierThreshold, 2.f * mBandWidth, true));
 }// SignCertifier<BuildT, ResourceT>::initialize
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -551,7 +562,7 @@ bool SignCertifier<BuildT, ResourceT>::sweep(const BufT<TapT>& taps, float minRa
     cudaCheck(cudaStreamSynchronize(mStream));
     if (workCount == 0) return false;
 
-    const certification::detail::SweepSettings settings{taps.data(), int(taps.size()), BandWidth, mTolerance, minRadius,
+    const certification::detail::SweepSettings settings{taps.data(), int(taps.size()), mBandWidth, mTolerance, minRadius,
                                                         mReferenceMode ? 1 : MaxLocalIterations};
     const Mask<3>* d_readMasks = mCertifiedMasks.data();
     if (mReferenceMode) {
@@ -600,7 +611,7 @@ namespace certification::detail {
 
 /// @brief Taps of the inside recompute pass, in constant memory: every lane of a warp reads the same tap at the
 ///        same time, so the reads are broadcasts. Sized for every offset of a halo-5 tile. Every SignCertifier
-///        uploads the same table, since it depends only on the fixed band width and halo.
+///        uploads the same table, the one of the largest band width; a narrower band scans a prefix of it.
 static __constant__ Tap cInsideTaps[11 * 11 * 11 - 1];
 
 /// @brief The inside recompute pass over one leaf: every active voxel p of the leaf that is not certified gets
@@ -670,7 +681,7 @@ SignCertifier<BuildT, ResourceT>::recomputeInsideDistances(const Mask<3>* d_cert
     cudaCheck(cudaMemcpyAsync(sdf.data(), mDeviceUDF, sdf.size_bytes(), cudaMemcpyDeviceToDevice, mStream));
     if (mLeafCount == 0) return sdf;
 
-    const auto taps = certification::detail::makeTaps<BuildT, PedanticHalo>(0.f, 2.f * BandWidth, false);
+    const auto taps = certification::detail::makeTaps<BuildT, PedanticHalo>(0.f, 2.f * MaxBandWidth, false);
     constexpr int span = 2 * PedanticHalo + 1;
     static_assert(sizeof(certification::detail::cInsideTaps) == (span * span * span - 1) * sizeof(TapT),
                   "cInsideTaps holds every offset of the pedantic tile");
@@ -680,7 +691,7 @@ SignCertifier<BuildT, ResourceT>::recomputeInsideDistances(const Mask<3>* d_cert
 
     using RecomputeOp = certification::detail::RecomputeFunctor<BuildT, PedanticHalo>;
     util::cuda::operatorKernel<RecomputeOp><<<mLeafCount, RecomputeOp::MaxThreadsPerBlock, 0, mStream>>>(
-        mDeviceGrid, mDeviceUDF, d_certifiedMasks, mHasCandidates.data(), int(taps.size()), BandWidth, sdf.data());
+        mDeviceGrid, mDeviceUDF, d_certifiedMasks, mHasCandidates.data(), int(taps.size()), mBandWidth, sdf.data());
     cudaCheckError();
     return sdf;
 }// SignCertifier<BuildT, ResourceT>::recomputeInsideDistances

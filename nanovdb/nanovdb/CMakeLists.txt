@@ -359,6 +359,7 @@ set(NANOVDB_INCLUDE_IO_FILES
 set(NANOVDB_INCLUDE_MATH_FILES
   math/CSampleFromVoxels.h
   math/DitherLUT.h
+  math/FiniteDifference.h
   math/HalfLite.h
   math/HDDA.h
   math/Math.h
@@ -399,6 +400,8 @@ set(NANOVDB_INCLUDE_TOOLS_CUDA_FILES
   tools/cuda/VoxelBlockManager.cuh
   tools/cuda/MeshToGrid.cuh
   tools/cuda/ConnectedComponents.cuh
+  tools/cuda/PropagateSign.cuh
+  tools/cuda/LevelSetTracker.cuh
 )
 
 # NanoVDB util header files

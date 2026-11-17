@@ -184,7 +184,15 @@ Two options, for steps 1 and 3 alike:
 - **Recompute them with PropagateSign** on `(newG, newPhi)`. Both outputs meet its preconditions, but it
   pays for full flood fills to recover what is already known.
 
-Leaning: derive in the operator, use PropagateSign as the test oracle. Not decided.
+**First draft: recompute.** `LevelSetTracker` reruns PropagateSign after dilation and after prune, for two
+reasons:
+
+- It is one call per step and no new code. Deriving needs its own logic for each case listed above, at
+  the leaf, lower, upper and root level.
+- Its cost is small. Measured on an RTX 5090 with the dragon at 696 M active voxels: the two PropagateSign
+  calls take 13.2 ms and 14.8 ms of a 749 ms `track()` (3.7%), while renormalization takes 658 ms.
+
+Deriving stays open as an optimization, with PropagateSign as its test oracle.
 
 ### 7.3 Ownership
 
@@ -271,7 +279,7 @@ entries, so the choice affects them directly.
 
 ## 10. Open questions
 
-1. Producing the new masks: derive or recompute (section 7.2).
+1. Producing the new masks: the first draft recomputes; deriving is open as an optimization (section 7.2).
 2. The carrier of the state: the semantic-grid bundle, or a tracker-local struct first (section 7.3).
 3. The root-level representation (section 9.3).
 4. A position on renormalization moving the interface (section 9.2).

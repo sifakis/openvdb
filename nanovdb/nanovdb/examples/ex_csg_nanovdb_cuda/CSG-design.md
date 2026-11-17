@@ -6,7 +6,7 @@ paper argument that the first implementation must check against OpenVDB.
 **Origin:** whiteboard discussion of 2026-11-17 (the case table of section 4.1 and the conjecture
 that the invert masks of a union are the OR of the input masks).
 
-**Depends on:** the level-set state and the sign lookup of `InterfaceTracking-design.md` (sections 3
+**Depends on:** the level-set state and the sign lookup of `nanovdb/nanovdb/docs/InterfaceTracking-design.md` (sections 3
 and 7.1 there), `tools::cuda::PropagateSign`, `tools::cuda::MergeGrids`, `tools::cuda::PruneGrid`, and
 `isInverted()` in `tools/cuda/LevelSetTracker.cuh`.
 

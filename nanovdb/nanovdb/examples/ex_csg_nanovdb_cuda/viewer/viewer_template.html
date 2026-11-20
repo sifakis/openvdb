@@ -123,7 +123,7 @@ label.cut { flex: 1 1 240px; display: flex; flex-direction: column; gap: 2px; mi
     </div>
     <div class="heads" id="heads"></div>
     <canvas id="gl" role="img" aria-label="The stored voxels drawn as boxes"></canvas>
-    <p class="hint">Drag to rotate, wheel to zoom. One box is one voxel; a large slab is an 8×8×8 block covered by one bit of a lower node, cut into slices one voxel thick. The panes share one camera.</p>
+    <p class="hint">Drag to rotate, wheel to zoom. One box is one voxel; a large slab is an 8×8×8 block covered by one bit of a lower node, cut into slices one voxel thick along the cut direction. The panes share one camera.</p>
     <p id="status3d" class="hint" hidden></p>
   </section>
 
@@ -173,14 +173,16 @@ const NAMES = /*NAMES*/["input 1", "input 2"];
   const SCALE = 2;
   let D = null, cache = {}, timer = null, scene = 0;
   const RULE = "The rule: the value of the result is min (union), max (intersection) or max(value 1, −value 2) (difference) of the values of the inputs, where an inactive voxel takes the background or its negation as its mask bit says.";
+  const AXIS = "xyz";
   const SCENES = [
     { name: "3D", data: DATA_VOXELS, kind: "ops3d",
-      text: `${NAMES[0]} (input 1) stays in place and ${NAMES[1]} (input 2) moves toward it along +z. Choose an operation and which inputs to negate; the three panes draw input 1, input 2 and the result as voxel boxes. Voxels with x below the cut position are hidden to show the inside.`,
+      text: `${NAMES[0]} (input 1) stays in place and ${NAMES[1]} (input 2) moves toward it along +${AXIS[(DATA_VOXELS || {}).moveAxis]}. Choose an operation and which inputs to negate; the three panes draw input 1, input 2 and the result as voxel boxes. Voxels below the cut position are hidden to show the inside.`,
       notes: ["Only what is stored is drawn: the voxels with a value, and the places where a mask bit is on. A level set with a negative background is inside everywhere far away; that unbounded inside is not stored and is not drawn.",
               "The data holds four results per frame, computed from the inputs as they are: 1 ∪ 2, 1 ∩ 2, 1 − 2 and 2 − 1. Each of the 12 results (3 operations × 4 sign pairs of the backgrounds) is one of these four or its negation. The generator computed all 12 and compared each with that result byte for byte (grid, values and the masks of the three levels); the line above shows how many differed in this frame.",
               "Every one of the 12 results was also compared with the rule at every voxel of a box around both inputs. " + RULE] },
     { name: "Slices", data: DATA_SLICES, kind: "ops",
-      text: `${NAMES[0]} (input 1) stays in place and ${NAMES[1]} (input 2) moves toward it. Choose an operation and which inputs to negate. The slice is the plane x = 0: horizontal is z, vertical is y (up is +y).`,
+      text: `${NAMES[0]} (input 1) stays in place and ${NAMES[1]} (input 2) moves toward it. Choose an operation and which inputs to negate. ` +
+            (DATA_SLICES ? `The slice is the plane ${AXIS[DATA_SLICES.sliceAxis]} = ${DATA_SLICES.sliceIndex}: horizontal is ${AXIS[DATA_SLICES.uAxis]}, vertical is ${AXIS[DATA_SLICES.vAxis]} (up is +${AXIS[DATA_SLICES.vAxis]}).` : ""),
       notes: ["The sign of the result's background follows from the operation and the backgrounds of the inputs: a union, for example, has a negative background if either input has one.",
               "The pictures of the inputs are one slice each, recolored when the input is negated. The picture of the result is a slice of the result computed for that combination.",
               "Every one of the 12 results of a frame was compared with the rule on every second voxel (in each direction) of a box around both inputs, and on every voxel of this slice. " + RULE,
@@ -273,7 +275,7 @@ const NAMES = /*NAMES*/["input 1", "input 2"];
   function render() {
     if (!D) return;
     const fi = +$("frame").value, f = D.frames[fi];
-    $("frameval").textContent = `${fi + 1} / ${D.frames.length} · ${NAMES[1]} moved ${f.off} voxels along z`;
+    $("frameval").textContent = `${fi + 1} / ${D.frames.length} · ${NAMES[1]} moved ${f.off} voxels along ${AXIS[D.moveAxis]}`;
     renderOps(fi, f, $("leaflines").checked);
   }
 
@@ -306,10 +308,15 @@ const NAMES = /*NAMES*/["input 1", "input 2"];
     }
     return { neg, pos, inv };
   }
-  // childless slots: origin (3 x int16) each, cut into slabs one voxel thick along x
+  // The cut plane is normal to cutAxis and the camera looks along it: x, or z if the motion is along x.
+  const cutAxis = () => D.moveAxis === 0 ? 2 : 0;
+  // childless slots: origin (3 x int16) each, cut into slabs one voxel thick along the cut axis
   function decodeSlabs(a, dim) {
-    const out = [];
-    for (let o = 0; o < a.length; o += 6) { const ox = i16(a, o), oy = i16(a, o + 2), oz = i16(a, o + 4); for (let d = 0; d < dim; d++) out.push(ox + d, oy, oz); }
+    const out = [], axis = cutAxis();
+    for (let o = 0; o < a.length; o += 6) {
+      const origin = [i16(a, o), i16(a, o + 2), i16(a, o + 4)];
+      for (let d = 0; d < dim; d++) { const p = origin.slice(); p[axis] += d; out.push(p[0], p[1], p[2]); }
+    }
     return out;
   }
   function decodeTree(t) {
@@ -328,8 +335,9 @@ const NAMES = /*NAMES*/["input 1", "input 2"];
     return [asRead(get("i1", D.i1), c.n1), asRead(get(fi + "i2", f.i2), c.n2), asRead(get(fi + c.base, f[c.base]), !!c.comp)];
   }
 
-  const KINDS = [["neg", "--actn", [1, 1, 1]], ["pos", "--actp", [1, 1, 1]], ["in1", "--in1", [1, 1, 1]], ["in2", "--in2", [1, 8, 8]], ["in3", "--in3", [1, 128, 128]],
-                 ["ob1", "--ob1", [1, 1, 1]], ["ob2", "--ob2", [1, 8, 8]], ["ob3", "--ob3", [1, 128, 128]]];
+  // kind of box, its color, and its edge length across the cut axis (it is 1 voxel thick along the cut axis)
+  const KINDS = [["neg", "--actn", 1], ["pos", "--actp", 1], ["in1", "--in1", 1], ["in2", "--in2", 8], ["in3", "--in3", 128],
+                 ["ob1", "--ob1", 1], ["ob2", "--ob2", 8], ["ob3", "--ob3", 128]];
   function init3d() {
     if (G) { layout3d(); return; }
     if (!window.THREE) { $("status3d").hidden = false; $("status3d").textContent = "The 3D library could not be loaded (it comes from a CDN)."; return; }
@@ -337,20 +345,26 @@ const NAMES = /*NAMES*/["input 1", "input 2"];
     try { renderer = new THREE.WebGLRenderer({ canvas: $("gl"), antialias: true }); }
     catch (e) { $("status3d").hidden = false; $("status3d").textContent = "WebGL is not available in this browser."; return; }
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-    const camera = new THREE.PerspectiveCamera(32, 1, 5, 3000);
-    camera.position.set(-250, 70, 30);
+    // Look at the middle of the scene box along the cut axis, from slightly above; y is up.
+    const center = [0, 1, 2].map(a => (D.lo[a] + D.hi[a]) / 2), extent = Math.max(D.hi[0] - D.lo[0], D.hi[1] - D.lo[1], D.hi[2] - D.lo[2]);
+    const eye = center.slice(), axis = cutAxis();
+    eye[axis] -= 1.6 * extent; eye[1] += 0.45 * extent;
+    const camera = new THREE.PerspectiveCamera(32, 1, Math.max(1, 0.02 * extent), 20 * extent);
+    camera.position.set(eye[0], eye[1], eye[2]);
     const controls = new THREE.OrbitControls(camera, renderer.domElement);
-    controls.target.set(0, 0, 30); controls.update();
+    controls.target.set(center[0], center[1], center[2]); controls.update();
     const box = new THREE.BoxGeometry(1, 1, 1);
-    const uniforms = { cut: { value: 0 } };
+    const cutDir = new THREE.Vector3(); cutDir.setComponent(axis, 1);
+    const uniforms = { cut: { value: 0 }, cutDir: { value: cutDir } };
     const panes = PANES.map(() => {
       const scene = new THREE.Scene(), meshes = {};
-      KINDS.forEach(([key, , size]) => {
+      KINDS.forEach(([key, , edge]) => {
+        const size = new THREE.Vector3(edge, edge, edge); size.setComponent(axis, 1);
         const mat = new THREE.ShaderMaterial({
-          uniforms: { cut: uniforms.cut, size: { value: new THREE.Vector3(size[0], size[1], size[2]) }, color: { value: new THREE.Color() } },
-          vertexShader: "attribute vec3 offset; uniform vec3 size; uniform float cut; varying vec3 vN;\n" +
+          uniforms: { cut: uniforms.cut, cutDir: uniforms.cutDir, size: { value: size }, color: { value: new THREE.Color() } },
+          vertexShader: "attribute vec3 offset; uniform vec3 size; uniform vec3 cutDir; uniform float cut; varying vec3 vN;\n" +
             "void main() { vN = normalMatrix * normal; vec3 p = (position * 0.94 + 0.5) * size + offset;\n" +
-            "  gl_Position = offset.x < cut ? vec4(2.0, 2.0, 2.0, 1.0) : projectionMatrix * modelViewMatrix * vec4(p, 1.0); }",
+            "  gl_Position = dot(offset, cutDir) < cut ? vec4(2.0, 2.0, 2.0, 1.0) : projectionMatrix * modelViewMatrix * vec4(p, 1.0); }",
           fragmentShader: "uniform vec3 color; varying vec3 vN;\n" +
             "void main() { float d = max(dot(normalize(vN), normalize(vec3(0.35, 0.55, 0.75))), 0.0); gl_FragColor = vec4(color * (0.42 + 0.58 * d), 1.0); }"
         });
@@ -400,8 +414,9 @@ const NAMES = /*NAMES*/["input 1", "input 2"];
   function draw3d() {
     if (!G || built === -1) return;
     const css = getComputedStyle(document.documentElement), cut = +$("cut").value, showPos = $("showpos").checked;
-    $("cutval").textContent = cut <= -50 ? "no cut" : `voxels with x < ${cut} are hidden`;
-    G.uniforms.cut.value = cut <= -50 ? -1e6 : cut;
+    const noCut = cut <= +$("cut").min;   // the slider's lowest position
+    $("cutval").textContent = noCut ? "no cut" : `voxels with ${AXIS[cutAxis()]} < ${cut} are hidden`;
+    G.uniforms.cut.value = noCut ? -1e6 : cut;
     G.panes.forEach(p => KINDS.forEach(([key, token]) => {
       p.meshes[key].material.uniforms.color.value.set(css.getPropertyValue(token).trim());
       if (key === "pos") p.meshes[key].visible = showPos && p.meshes[key].geometry.instanceCount > 0;
@@ -429,6 +444,7 @@ const NAMES = /*NAMES*/["input 1", "input 2"];
     $("panel3d").hidden = !is3d;
     $("frame").max = D.frames.length - 1; $("frame").value = Math.round((D.frames.length - 1) * 0.6);
     $("leaflines").disabled = is3d;
+    if (is3d) { const cut = $("cut"), a = cutAxis(); cut.min = D.lo[a] - 1; cut.max = D.hi[a] + 1; cut.value = Math.round((D.lo[a] + D.hi[a]) / 2); }
     built = -1;
     if (is3d) init3d();
     render();

@@ -4,13 +4,18 @@
 /// @file csg_viewer_voxels.cu
 ///
 /// @brief Data for the 3D view of the CSG viewer (viewer/) and for figures: one mesh level set stays in place, a
-///        second one moves toward it along +z in 15 steps. For every step the program writes, as JSON, every
+///        second one moves toward it in steps. For every step the program writes, as JSON, every
 ///        stored voxel and invert bit of the two inputs and of four results on the plain inputs: 1 | 2, 1 & 2,
 ///        1 - 2 and 2 - 1. Each of the 12 results (three operations, four sign pairs of the backgrounds) is one
 ///        of these four or its complement; the program computes all 12 and checks that, byte for byte, and
 ///        checks each against the per-voxel rule. viewer/README.md describes the file.
 ///
-/// usage: csg_viewer_voxels fixed.band moving.band out.json   (band files: see mesh_to_band.cu)
+/// usage: csg_viewer_voxels fixed.band moving.band out.json [options]   (band files: see mesh_to_band.cu)
+///   --frames N      number of steps (default 15)
+///   --move-axis A   x, y or z: the moving input is translated along +A (default z)
+///   --start S       translation in the first step, in voxels; it shrinks linearly to 0 in the last step
+///                   (default: the moving input starts one leaf beyond the fixed one)
+/// Coordinates are written as 16-bit integers, so every voxel must lie within +-32767 of the origin.
 
 #include "CsgExampleUtil.cuh"
 
@@ -64,10 +69,21 @@ template<int LEVEL, typename MaskT> static std::vector<unsigned char> packSlots(
 
 int main(int argc, char** argv)
 {
-    if (argc < 4) { printf("usage: %s fixed.band moving.band out.json\n", argv[0]); return 1; }
+    if (argc < 4) { printf("usage: %s fixed.band moving.band out.json [--frames N] [--move-axis x|y|z] [--start S]\n", argv[0]); return 1; }
     ResourceT& res = nanovdb::cuda::default_resource<ResourceT>();
-    const int FRAMES = 15, START = 105;
     const Band bandA = loadBand(argv[1]), bandB = loadBand(argv[2]);
+
+    // The scene: how the moving input travels, and the box that holds both inputs over all steps.
+    const int FRAMES   = std::max(1, intOption(argc, argv, "--frames", 15));
+    const int moveAxis = axisOption(argc, argv, "--move-axis", 2);
+    const int START    = intOption(argc, argv, "--start", separatingOffset(bandA, bandB, moveAxis));
+    const auto translation = [&](int off) { Coord t(0); t[moveAxis] = off; return t; };
+    nanovdb::CoordBBox scene = bandBBox(bandA), boxB = bandBBox(bandB);
+    scene.expand(boxB);
+    Coord farthest = boxB.max(); farthest[moveAxis] += START;
+    scene.expand(farthest);
+    for (int a = 0; a < 3; ++a)
+        if (scene.min()[a] < -32760 || scene.max()[a] > 32760) { printf("the scene does not fit 16-bit coordinates\n"); return 1; }
     const auto fieldOf = [](const HostState& h, const Coord& p) {
         const auto* leaf = h.g()->tree().root().probeLeaf(p);
         const uint32_t n = NanoLeaf<BuildT>::CoordToOffset(p);
@@ -87,7 +103,8 @@ int main(int argc, char** argv)
         b64(f, packLeaves(h.g(), h.phi, h.leaf.data()));
         fprintf(f, ",\"l\":"); b64(f, packSlots<1>(h.g(), h.lower)); fprintf(f, ",\"u\":"); b64(f, packSlots<2>(h.g(), h.upper)); fprintf(f, "}");
     };
-    fprintf(f, "{\"band\":%g,", W);
+    fprintf(f, "{\"band\":%g,\"moveAxis\":%d,\"lo\":[%d,%d,%d],\"hi\":[%d,%d,%d],", W, moveAxis, scene.min()[0], scene.min()[1], scene.min()[2],
+            scene.max()[0], scene.max()[1], scene.max()[2]);
     { StateT s1 = makeFromBand(bandA, Coord(0), res); putTree("i1", download(s1)); }
     fprintf(f, ",\"frames\":[\n");
 
@@ -97,10 +114,10 @@ int main(int argc, char** argv)
     static const bool COMP[2][2][3] = {{{false, false, false}, {true, false, false}}, {{true, false, true}, {true, true, false}}};
     bool allOk = true;
     for (int fr = 0; fr < FRAMES; ++fr) {
-        const int off = int(std::lround(double(START) * (FRAMES - 1 - fr) / (FRAMES - 1)));
+        const int off = FRAMES > 1 ? int(std::lround(double(START) * (FRAMES - 1 - fr) / (FRAMES - 1))) : START;
         HostState base[4];
         {
-            StateT s1 = makeFromBand(bandA, Coord(0), res), s2 = makeFromBand(bandB, Coord(0, 0, off), res);
+            StateT s1 = makeFromBand(bandA, Coord(0), res), s2 = makeFromBand(bandB, translation(off), res);
             fprintf(f, "%s{\"off\":%d,", fr ? ",\n" : "", off);
             putTree("i2", download(s2)); fprintf(f, ",");
             base[0] = download(apply(0, s1, s2)); base[1] = download(apply(1, s1, s2)); base[2] = download(apply(2, s1, s2)); base[3] = download(apply(2, s2, s1));
@@ -109,7 +126,7 @@ int main(int argc, char** argv)
 
         uint64_t checked = 0, ruleBad = 0; int mapBad = 0;
         for (int neg1 = 0; neg1 < 2; ++neg1) for (int neg2 = 0; neg2 < 2; ++neg2) {
-            StateT s1 = makeFromBand(bandA, Coord(0), res), s2 = makeFromBand(bandB, Coord(0, 0, off), res);
+            StateT s1 = makeFromBand(bandA, Coord(0), res), s2 = makeFromBand(bandB, translation(off), res);
             if (neg1) complement(s1);
             if (neg2) complement(s2);
             const HostState h1 = download(s1), h2 = download(s2);

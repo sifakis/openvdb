@@ -27,6 +27,7 @@ def decode_slice(text, width, height):
     The text is a sequence of runs: one letter ('A' = code 0, 'B' = code 1, ...) followed by the run length.
     Row 0 is the top row of the picture; see README.md for the voxel each entry stands for.
     """
+
     flat = bytearray()
     i = 0
     while i < len(text):
@@ -38,6 +39,15 @@ def decode_slice(text, width, height):
     if len(flat) != width * height:
         raise ValueError(f"slice has {len(flat)} entries, expected {width * height}")
     return [bytes(flat[r * width:(r + 1) * width]) for r in range(height)]
+
+
+def slice_voxel(data, row, column):
+    """The (x, y, z) index coordinate of the entry at `row`, `column` of a slice of the slice file `data`."""
+    voxel = [0, 0, 0]
+    voxel[data["sliceAxis"]] = data["sliceIndex"]
+    voxel[data["uAxis"]] = data["x0"] + column
+    voxel[data["vAxis"]] = data["y0"] + data["h"] - 1 - row
+    return tuple(voxel)
 
 
 def slice_result(frame, operation, negate1, negate2):

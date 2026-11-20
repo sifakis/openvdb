@@ -14,8 +14,9 @@ describes every field.
 
 ## The scene
 
-Input 1 stays in place. Input 2 is the second mesh, translated by a whole number of voxels along +z; the
-translation shrinks linearly to 0 over the frames, so in the last frame both meshes are centered at the origin.
+Input 1 stays in place. Input 2 is the second mesh, translated by a whole number of voxels along one axis; the
+translation shrinks linearly to 0 over the frames, so in the last frame both meshes are where their band files put
+them (`mesh_to_band` centers a mesh at the origin).
 Both are narrow bands with a half-width of 3 voxels (the constant `W` in `../CsgExampleUtil.cuh`), read from band
 files written by `mesh_to_band`. The voxel size is 1, so index coordinates and world coordinates coincide.
 
@@ -24,14 +25,28 @@ For every frame, three operations run for each of the four sign pairs of the bac
 - operations: union (`csgUnion`), intersection (`csgIntersection`), difference 1 − 2 (`csgDifference`);
 - an input is used as it is, or negated with `csgComplement` first.
 
-The generators' scene parameters are constants in their `main()`:
+Nothing about the scene depends on the meshes or their resolution: the generators take it from options, and
+from the bounding boxes of the two inputs where an option is not given.
 
-| | `csg_viewer_slices` | `csg_viewer_voxels` |
-|---|---|---|
-| frames | 30 | 15 |
-| translation of input 2 in frame k | `round(210 * (29 - k) / 29)` voxels | `round(105 * (14 - k) / 14)` voxels |
-| meant for meshes scaled to | 220 voxels along the longest side | 110 voxels along the longest side |
-| what is written | the slice x = 0, for z in [-120, 303] and y in [-120, 119] | all stored voxels and bits |
+| option | `csg_viewer_slices` | `csg_viewer_voxels` | default |
+|---|---|---|---|
+| `--frames N` | yes | yes | 30 for slices, 15 for voxels |
+| `--move-axis x\|y\|z` | yes | yes | `z`: input 2 is translated along +z |
+| `--start S` | yes | yes | the translation that puts input 2 one leaf (8 voxels) beyond input 1 along the move axis |
+| `--slice-axis x\|y\|z` | yes | | `x`: the slice is a plane normal to x |
+| `--slice-index I` | yes | | `0` |
+
+The translation of input 2 in frame `k` of `N` is `round(S * (N - 1 - k) / (N - 1))` voxels, so it is `S` in the
+first frame and 0 in the last. With `--frames 1` the single frame uses the translation `S`, which is how to get one
+chosen configuration, for example for a figure.
+
+The slice covers the bounding box of both inputs over all frames, padded by 8 voxels. Its horizontal axis is the
+move axis if that lies in the plane, and its vertical axis is the remaining one. The voxel file records the same
+bounding box, which the page uses to place the camera and the cut plane; its coordinates are 16-bit, so every
+voxel must lie within 32767 of the origin.
+
+The band half-width is not an option: it is 3 voxels in `mesh_to_band` and in `CsgExampleUtil.cuh` (`W`), and
+the two must agree.
 
 ## Commands
 
@@ -42,9 +57,12 @@ The generators' scene parameters are constants in their `main()`:
 ./ex_csg_nanovdb_cuda_mesh_to_band dragon.obj    110 dragon_110.band
 ./ex_csg_nanovdb_cuda_mesh_to_band armadillo.obj 110 armadillo_110.band
 
-# data: fixed input, moving input, output
+# data: fixed input, moving input, output, then options
 ./ex_csg_nanovdb_cuda_csg_viewer_slices dragon.band     armadillo.band     slices.json
 ./ex_csg_nanovdb_cuda_csg_viewer_voxels dragon_110.band armadillo_110.band voxels.json
+
+# for example: one frame with input 2 moved 60 voxels along x, sliced by the plane z = 4
+./ex_csg_nanovdb_cuda_csg_viewer_slices dragon.band armadillo.band one.json --frames 1 --move-axis x --start 60 --slice-axis z --slice-index 4
 
 # check the files, then build the page
 python3 viewer/read_frames.py --slices slices.json --voxels voxels.json
@@ -83,21 +101,26 @@ Top level:
 | key | meaning |
 |---|---|
 | `band` | band half-width in voxels (also the magnitude of every background) |
+| `moveAxis` | axis along which input 2 is translated (0 = x, 1 = y, 2 = z) |
+| `sliceAxis`, `sliceIndex` | the slice is the plane where the coordinate along `sliceAxis` equals `sliceIndex` |
+| `uAxis`, `vAxis` | the axes that run along the columns (horizontal) and the rows (vertical) of a slice |
 | `w`, `h` | width and height of a slice in voxels |
-| `x0` | z coordinate of the first column |
-| `y0` | y coordinate of the bottom row |
+| `x0` | coordinate along `uAxis` of the first column |
+| `y0` | coordinate along `vAxis` of the bottom row |
 | `flipY` | always `true`: row 0 is the top row |
 | `in1` | `{leaves, active}` of input 1 (whole level set, not the slice) |
 | `i1` | the slice of input 1, encoded (see below); it is the same in every frame |
 | `frames` | list of frames |
 
-The entry at row `j`, column `i` of a slice is the voxel `(x, y, z) = (0, y0 + h - 1 - j, x0 + i)`.
+The entry at row `j`, column `i` of a slice is the voxel whose coordinate is `sliceIndex` along `sliceAxis`,
+`x0 + i` along `uAxis` and `y0 + h - 1 - j` along `vAxis`. `read_frames.slice_voxel` computes it. With the default
+options the plane is x = 0, the horizontal axis is z and the vertical axis is y.
 
 Each frame:
 
 | key | meaning |
 |---|---|
-| `off` | translation of input 2 along +z, in voxels |
+| `off` | translation of input 2 along the move axis, in voxels |
 | `in2` | `{leaves, active}` of input 2 |
 | `i2` | the slice of input 2, encoded, as it is (not negated) |
 | `u00` ... `d11` | the 12 results: a letter for the operation (`u` union, `i` intersection, `d` difference), then `1` if input 1 was negated, then `1` if input 2 was negated |
@@ -133,13 +156,14 @@ active codes (1 and 2 trade places) and read the bits with a negative background
 
 ## Voxel file (`csg_viewer_voxels`)
 
-Top level: `band` as above, `i1` (input 1, a level-set record) and `frames`.
+Top level: `band` and `moveAxis` as above, `lo` and `hi` (the corners of the bounding box of both inputs over all
+frames), `i1` (input 1, a level-set record) and `frames`.
 
 Each frame:
 
 | key | meaning |
 |---|---|
-| `off` | translation of input 2 along +z, in voxels |
+| `off` | translation of input 2 along the move axis, in voxels |
 | `i2` | input 2, as it is |
 | `u`, `i`, `d`, `e` | four results computed from the inputs as they are: `1 ∪ 2`, `1 ∩ 2`, `1 − 2`, `2 − 1` |
 | `checked`, `ruleBad` | as in the slice file; here every voxel of a box around both inputs is compared |
@@ -213,5 +237,6 @@ The page uses these colors in its light theme; a figure does not have to follow 
 | outside, bit of a leaf / lower / upper mask (negative background) | `#dde6e1` / `#b4c7bd` / `#86a193` |
 | leaf boundary | `#1a1f2b`, blended one third into the voxel color |
 
-In the 3D view, a lower-node or upper-node bit is drawn as slabs one voxel thick along x, so that the cut plane
-`x < c` hides part of it. The unbounded inside of a level set with a negative background is not drawn.
+In the 3D view the cut plane is normal to x, or to z when input 2 moves along x, and the camera looks along that
+axis. A lower-node or upper-node bit is drawn as slabs one voxel thick along it, so that the cut plane hides part
+of the block. The unbounded inside of a level set with a negative background is not drawn.

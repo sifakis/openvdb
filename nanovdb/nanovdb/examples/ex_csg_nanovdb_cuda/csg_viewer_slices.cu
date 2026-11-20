@@ -4,12 +4,19 @@
 /// @file csg_viewer_slices.cu
 ///
 /// @brief Data for the slice view of the CSG viewer (viewer/) and for figures: one mesh level set stays in place,
-///        a second one moves toward it along +z in 30 steps, and for every step csgUnion, csgIntersection and
-///        csgDifference run for each of the four sign pairs of the backgrounds (an input is negated with
-///        csgComplement). The program writes, as JSON, one slice of the two inputs and of each of the 12 results
-///        per step, and checks every result against the per-voxel rule. viewer/README.md describes the file.
+///        a second one moves toward it in steps, and for every step csgUnion, csgIntersection and csgDifference
+///        run for each of the four sign pairs of the backgrounds (an input is negated with csgComplement). The
+///        program writes, as JSON, one slice of the two inputs and of each of the 12 results per step, and checks
+///        every result against the per-voxel rule. viewer/README.md describes the file.
 ///
-/// usage: csg_viewer_slices fixed.band moving.band out.json   (band files: see mesh_to_band.cu)
+/// usage: csg_viewer_slices fixed.band moving.band out.json [options]   (band files: see mesh_to_band.cu)
+///   --frames N        number of steps (default 30)
+///   --move-axis A     x, y or z: the moving input is translated along +A (default z)
+///   --start S         translation in the first step, in voxels; it shrinks linearly to 0 in the last step
+///                     (default: the moving input starts one leaf beyond the fixed one)
+///   --slice-axis A    x, y or z: the slice is a plane normal to A (default x)
+///   --slice-index I   coordinate of the slice plane along its normal (default 0)
+/// The slice covers the bounding box of both inputs over all steps, padded by 8 voxels.
 
 #include "CsgExampleUtil.cuh"
 
@@ -45,14 +52,36 @@ static void rle(FILE* f, const std::vector<unsigned char>& v)
 
 int main(int argc, char** argv)
 {
-    if (argc < 4) { printf("usage: %s fixed.band moving.band out.json\n", argv[0]); return 1; }
+    if (argc < 4) {
+        printf("usage: %s fixed.band moving.band out.json [--frames N] [--move-axis x|y|z] [--start S] [--slice-axis x|y|z] [--slice-index I]\n", argv[0]);
+        return 1;
+    }
     ResourceT& res = nanovdb::cuda::default_resource<ResourceT>();
-    // slice plane x = 0; picture axes: horizontal = z, vertical = y (up)
-    const int Z0 = -120, Y0 = -120, WZ = 424, WY = 240, FRAMES = 30, START = 210;
     const Band bandA = loadBand(argv[1]), bandB = loadBand(argv[2]);
-    const auto slice = [&](const HostState& h) {
-        std::vector<unsigned char> v(WZ * WY);
-        for (int j = 0; j < WY; ++j) for (int i = 0; i < WZ; ++i) v[j * WZ + i] = codeOf(h, Coord(0, Y0 + WY - 1 - j, Z0 + i));
+
+    // The scene: how the moving input travels, and which plane is written.
+    const int FRAMES     = std::max(1, intOption(argc, argv, "--frames", 30));
+    const int moveAxis   = axisOption(argc, argv, "--move-axis", 2);
+    const int START      = intOption(argc, argv, "--start", separatingOffset(bandA, bandB, moveAxis));
+    const int sliceAxis  = axisOption(argc, argv, "--slice-axis", 0);
+    const int sliceIndex = intOption(argc, argv, "--slice-index", 0);
+    // Picture axes: horizontal u is the direction of motion if it lies in the plane, vertical v is the other one.
+    const int uAxis = moveAxis != sliceAxis ? moveAxis : (sliceAxis + 1) % 3;
+    const int vAxis = 3 - sliceAxis - uAxis;
+    // The window: both inputs over all steps, padded by one leaf.
+    nanovdb::CoordBBox window = bandBBox(bandA), boxB = bandBBox(bandB);
+    window.expand(boxB);
+    Coord farthest = boxB.max(); farthest[moveAxis] += START;
+    window.expand(farthest);
+    const int U0 = window.min()[uAxis] - 8, V0 = window.min()[vAxis] - 8;
+    const int WU = window.max()[uAxis] + 8 - U0 + 1, WV = window.max()[vAxis] + 8 - V0 + 1;
+    // The voxel at column i of the row at height j above the bottom row.
+    const auto at = [&](int i, int j) { Coord c; c[sliceAxis] = sliceIndex; c[uAxis] = U0 + i; c[vAxis] = V0 + j; return c; };
+    const auto translation = [&](int off) { Coord t(0); t[moveAxis] = off; return t; };
+
+    const auto slice = [&](const HostState& h) { // row 0 is the top row
+        std::vector<unsigned char> v(size_t(WU) * WV);
+        for (int j = 0; j < WV; ++j) for (int i = 0; i < WU; ++i) v[size_t(j) * WU + i] = codeOf(h, at(i, WV - 1 - j));
         return v;
     };
     // the full-space field: the stored value, or the background with the sign told by the invert bit
@@ -68,18 +97,19 @@ int main(int argc, char** argv)
     {
         StateT s1 = makeFromBand(bandA, Coord(0), res);
         const HostState h1 = download(s1);
-        fprintf(f, "{\"band\":%g,\"x0\":%d,\"y0\":%d,\"w\":%d,\"h\":%d,\"flipY\":true,\"in1\":{\"leaves\":%u,\"active\":%llu},\"i1\":", W, Z0, Y0, WZ, WY,
+        fprintf(f, "{\"band\":%g,\"moveAxis\":%d,\"sliceAxis\":%d,\"sliceIndex\":%d,\"uAxis\":%d,\"vAxis\":%d,\"x0\":%d,\"y0\":%d,\"w\":%d,\"h\":%d,"
+                   "\"flipY\":true,\"in1\":{\"leaves\":%u,\"active\":%llu},\"i1\":", W, moveAxis, sliceAxis, sliceIndex, uAxis, vAxis, U0, V0, WU, WV,
                 h1.g()->tree().nodeCount(0), (unsigned long long)h1.g()->activeVoxelCount());
         rle(f, slice(h1));
         fprintf(f, ",\"frames\":[\n");
     }
     bool allOk = true;
     for (int fr = 0; fr < FRAMES; ++fr) {
-        const int off = int(std::lround(double(START) * (FRAMES - 1 - fr) / (FRAMES - 1)));
+        const int off = FRAMES > 1 ? int(std::lround(double(START) * (FRAMES - 1 - fr) / (FRAMES - 1))) : START;
         uint64_t checked = 0, ruleBad = 0;
         fprintf(f, "%s{\"off\":%d,", fr ? ",\n" : "", off);
         for (int neg1 = 0; neg1 < 2; ++neg1) for (int neg2 = 0; neg2 < 2; ++neg2) {
-            StateT s1 = makeFromBand(bandA, Coord(0), res), s2 = makeFromBand(bandB, Coord(0, 0, off), res);
+            StateT s1 = makeFromBand(bandA, Coord(0), res), s2 = makeFromBand(bandB, translation(off), res);
             if (!neg1 && !neg2) {
                 const HostState h2 = download(s2);
                 fprintf(f, "\"in2\":{\"leaves\":%u,\"active\":%llu},\"i2\":", h2.g()->tree().nodeCount(0), (unsigned long long)h2.g()->activeVoxelCount());
@@ -101,7 +131,7 @@ int main(int argc, char** argv)
                 };
                 // the rule on every second voxel (in each direction) of a box around both inputs, and on the whole slice
                 for (int i = bb.min()[0] - 4; i <= bb.max()[0] + 4; i += 2) for (int j = bb.min()[1] - 4; j <= bb.max()[1] + 4; j += 2) for (int k = bb.min()[2] - 4; k <= bb.max()[2] + 4; k += 2) rule(Coord(i, j, k));
-                for (int j = 0; j < WY; ++j) for (int i = 0; i < WZ; ++i) rule(Coord(0, Y0 + j, Z0 + i));
+                for (int j = 0; j < WV; ++j) for (int i = 0; i < WU; ++i) rule(at(i, j));
                 fprintf(f, "\"%c%d%d\":{\"bg\":%g,\"leaves\":%u,\"lowers\":%u,\"uppers\":%u,\"active\":%llu,\"bits\":[%llu,%llu,%llu],\"v\":", "uid"[o], neg1, neg2, h.phi[0],
                         h.g()->tree().nodeCount(0), h.g()->tree().nodeCount(1), h.g()->tree().nodeCount(2), (unsigned long long)h.g()->activeVoxelCount(),
                         (unsigned long long)bitsOn(h.leaf), (unsigned long long)bitsOn(h.lower), (unsigned long long)bitsOn(h.upper));

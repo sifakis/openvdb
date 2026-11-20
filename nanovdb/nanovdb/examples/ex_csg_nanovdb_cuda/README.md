@@ -82,8 +82,9 @@ byte for byte: commutativity, idempotence, double complement, associativity, abs
 Morgan, and the difference identities. Identities that do not hold for narrow-band fields, such as `A & ~A` being
 empty, are left out: inside the band `max(f, -f)` is `|f|`. Empty level sets as operands are checked as well.
 
-With band files, the rule and structure checks run at five offsets of the second mesh, and the identities run on
-the three meshes.
+With band files, the rule and structure checks run at five translations of the second mesh along +z, from one leaf
+beyond the first mesh to no translation, and the identities run on the three meshes. The translations follow from
+the bounding boxes of the bands, so any meshes and resolutions work.
 
 ## Notes
 

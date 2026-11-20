@@ -147,4 +147,37 @@ inline StateT makeFromBand(const Band& b, const Coord& offset, ResourceT& res)
     return tracker.release();
 }
 
+// ---- scene parameters of the programs that take mesh inputs ----
+
+/// @brief The index bounding box of the voxels of a band.
+inline nanovdb::CoordBBox bandBBox(const Band& b)
+{
+    nanovdb::CoordBBox box;
+    for (const Coord& c : b.coords) box.expand(c);
+    return box;
+}
+
+/// @brief The translation along +axis that puts @a moving one leaf (8 voxels) beyond @a fixed: the two bands do
+///        not touch there, and they come together as the translation shrinks to 0.
+inline int separatingOffset(const Band& fixed, const Band& moving, int axis)
+{
+    return bandBBox(fixed).max()[axis] - bandBBox(moving).min()[axis] + 8;
+}
+
+/// @brief The integer after the option @a name on the command line, or @a fallback if the option is not given.
+inline int intOption(int argc, char** argv, const char* name, int fallback)
+{
+    for (int i = 1; i + 1 < argc; ++i)
+        if (std::strcmp(argv[i], name) == 0) return std::atoi(argv[i + 1]);
+    return fallback;
+}
+
+/// @brief The axis (0 = x, 1 = y, 2 = z) after the option @a name on the command line, or @a fallback.
+inline int axisOption(int argc, char** argv, const char* name, int fallback)
+{
+    for (int i = 1; i + 1 < argc; ++i)
+        if (std::strcmp(argv[i], name) == 0 && argv[i + 1][0] >= 'x' && argv[i + 1][0] <= 'z') return argv[i + 1][0] - 'x';
+    return fallback;
+}
+
 #endif // NANOVDB_EXAMPLES_CSG_EXAMPLE_UTIL_CUH_HAS_BEEN_INCLUDED

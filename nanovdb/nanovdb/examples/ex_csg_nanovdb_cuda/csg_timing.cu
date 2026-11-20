@@ -28,6 +28,6 @@ int main(int argc, char** argv)
     ResourceT& res = nanovdb::cuda::default_resource<ResourceT>();
     { StateT a = makeSphere({64, 64, 64, 120}, res), b = makeSphere({190.3f, 70.1f, 64, 100}, res); timeAll("spheres r=120, 100", a, b, res); }
     { StateT a = makeSphere({10, 20, 30, 300}, res), b = makeSphere({260.5f, 100.2f, 30, 250}, res); timeAll("spheres r=300, 250", a, b, res); }
-    if (argc >= 3) { StateT a = makeFromBand(loadBand(argv[1]), Coord(0), res), b = makeFromBand(loadBand(argv[2]), Coord(0, 0, 60), res); timeAll("dragon, armadillo z+60", a, b, res); }
+    if (argc >= 3) { StateT a = makeFromBand(loadBand(argv[1]), Coord(0), res), b = makeFromBand(loadBand(argv[2]), Coord(0, 0, separatingOffset(loadBand(argv[1]), loadBand(argv[2]), 2) * 2 / 7), res); timeAll("meshes, partly overlapping", a, b, res); }
     return 0;
 }

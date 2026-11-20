@@ -277,11 +277,13 @@ int main(int argc, char** argv)
     // meshes: narrow bands of OpenVDB level sets, written by mesh_to_band; the second one at several offsets
     if (argc >= 4) {
         const Band bands[3] = {loadBand(argv[1]), loadBand(argv[2]), loadBand(argv[3])};
-        for (int off : {210, 120, 60, 20, 0}) {
+        // the second mesh from one leaf beyond the first to the same place, along +z
+        const int start = separatingOffset(bands[0], bands[1], 2);
+        for (int off : {start, start * 4 / 7, start * 2 / 7, start / 10, 0}) {
             char name[64]; snprintf(name, sizeof(name), "mesh z+%d", off);
             ok &= runMeshCase(name, bands[0], bands[1], Coord(0, 0, off), res);
         }
-        const Coord offsets[3] = {Coord(0), Coord(0, 0, 60), Coord(0, 20, 30)};
+        const Coord offsets[3] = {Coord(0), Coord(0, 0, start * 2 / 7), Coord(0, start / 10, start / 7)};
         ok &= runIdentities([&](int i) { return makeFromBand(bands[i], offsets[i], res); }, res);
     }
     printf(ok ? "ALL PASS\n" : "FAIL\n");

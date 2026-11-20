@@ -1,0 +1,22 @@
+{
+  "character": "../output/character",
+  "h": 0.032,
+  "obstacle_h": 0.016,
+  "duration": 6,
+  "fps": 30,
+  "ppc": 8,
+  "dt": 0.004,
+  "emitter_radius": 0.15,
+  "emitter_speed": 0.9,
+  "emitter_x": 1.62,
+  "emitter_z": 1,
+  "whitewater_rate": 120000,
+  "animation_offset": 0,
+  "mesh_h": 0.01,
+  "mesh_isovalue": 0.4,
+  "mesh_support": 2.4,
+  "mesh_smoothing": 0.12,
+  "width": 1600,
+  "height": 1200,
+  "samples": 96
+}

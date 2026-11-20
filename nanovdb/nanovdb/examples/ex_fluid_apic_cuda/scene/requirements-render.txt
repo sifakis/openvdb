@@ -1,0 +1,8 @@
+# Tested rendering/analysis environment; keep the SDK pair on the same release train.
+ovrtx==0.5.1.385782
+ovstage==0.2.1.385922
+numpy==2.5.3
+pillow==12.3.0
+matplotlib==3.11.2
+usd-core==26.8
+scipy==1.18.1

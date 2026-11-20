@@ -119,6 +119,14 @@ nanovdb_example(NAME "ex_connected_components_cuda")
 nanovdb_example(NAME "ex_partition_grid_cuda" OPENVDB)
 nanovdb_example(NAME "ex_propagate_sign_nanovdb_cuda" OPENVDB)
 
+# ex_csg_nanovdb_cuda holds several programs, so each is a target of its own.
+if(NANOVDB_USE_CUDA)
+  foreach(program csg_operations_test csg_union_baselines csg_timing mesh_to_band)
+    add_executable(ex_csg_nanovdb_cuda_${program} ex_csg_nanovdb_cuda/${program}.cu)
+    target_link_libraries(ex_csg_nanovdb_cuda_${program} PRIVATE nanovdb)
+  endforeach()
+endif()
+
 if(CUDAToolkit_FOUND)
   # ex_make_mgpu_nanovdb uses TF32 WMMA which requires SM_80+ (Ampere or newer).
   # Gate on CMAKE_CUDA_ARCHITECTURES (what the build actually targets) rather than

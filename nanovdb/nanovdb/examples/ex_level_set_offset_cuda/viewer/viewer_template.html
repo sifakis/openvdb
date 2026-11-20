@@ -1,0 +1,306 @@
+<title>Level Set Offset Viewer</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+:root {
+  --bg: #f6f5f2; --panel: #ffffff; --fg: #1d1c1a; --muted: #6b6860; --line: #dedbd3;
+  --accent: #b4532a; --grow: #c2410c; --shrink: #1d5fa8; --zero: #55524b; --canvas: #ecebe6;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #17171a; --panel: #202024; --fg: #ecebe8; --muted: #a09d96; --line: #36363c;
+  --accent: #e58a5c; --grow: #f08a4b; --shrink: #6aa8ea; --zero: #c9c6be; --canvas: #101012; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #17171a; --panel: #202024; --fg: #ecebe8; --muted: #a09d96; --line: #36363c;
+  --accent: #e58a5c; --grow: #f08a4b; --shrink: #6aa8ea; --zero: #c9c6be; --canvas: #101012; color-scheme: dark }
+body { background: var(--bg); color: var(--fg); font: 15px/1.55 system-ui, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif; }
+.wrap { max-width: 1180px; margin: 0 auto; padding-block: 20px 40px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: flex; flex-direction: column; gap: 16px; }
+h1 { font-size: 22px; margin: 0; text-wrap: balance; }
+h2 { font-size: 14px; margin: 0; color: var(--muted); font-weight: 600; }
+.sub { color: var(--muted); margin: 0; max-width: 75ch; }
+.views { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 16px; }
+@media (max-width: 760px) { .views { grid-template-columns: minmax(0, 1fr); } }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; min-width: 0;
+  display: flex; flex-direction: column; gap: 8px; }
+canvas { width: 100%; display: block; border-radius: 6px; background: var(--canvas); touch-action: none; }
+#gl { aspect-ratio: 4 / 3; cursor: grab; }
+#slice { aspect-ratio: 4 / 3; }
+.hint { color: var(--muted); font-size: 12.5px; margin: 0; }
+.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.controls input[type=range] { flex: 1 1 260px; min-width: 0; accent-color: var(--accent); }
+button { font: inherit; padding: 6px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel);
+  color: var(--fg); cursor: pointer; }
+button:hover { border-color: var(--accent); }
+.offset { font-variant-numeric: tabular-nums; font-weight: 700; font-size: 18px; min-width: 9ch; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+.tile { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+.tile .k { color: var(--muted); font-size: 12.5px; }
+.tile .v { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.tile .u { font-size: 12.5px; font-weight: 400; color: var(--muted); }
+.legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12.5px; color: var(--muted); }
+.sw { display: inline-block; width: 18px; height: 3px; vertical-align: middle; margin-right: 5px; border-radius: 2px; }
+details { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+summary { cursor: pointer; font-weight: 600; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; margin-top: 8px; }
+th, td { padding: 3px 10px; text-align: right; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--muted); font-weight: 600; }
+tr.cur td { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+ul { margin: 6px 0 0; padding-left: 20px; max-width: 80ch; }
+</style>
+
+<div class="wrap">
+  <div>
+    <h1>Offsetting a level set step by step with track()</h1>
+    <p class="sub" id="lead"></p>
+  </div>
+
+  <div class="controls panel" style="flex-direction: row">
+    <button id="play">Play</button>
+    <span class="offset" id="offsetLabel"></span>
+    <input type="range" id="frame" min="0" max="0" step="1" value="0" aria-label="offset step">
+    <span class="hint">Left: shrink · middle: original · right: grow</span>
+  </div>
+
+  <div class="views">
+    <div class="panel">
+      <h2>Surface (points where the value is 0)</h2>
+      <canvas id="gl"></canvas>
+      <p class="hint">Drag to rotate, wheel to zoom. One point = one voxel within 0.6 voxel of the surface, moved onto the surface.</p>
+    </div>
+    <div class="panel">
+      <h2 id="sliceTitle">Slice</h2>
+      <canvas id="slice"></canvas>
+      <div class="legend">
+        <span><span class="sw" style="background: var(--shrink)"></span>Shrunk surfaces</span>
+        <span><span class="sw" style="background: var(--zero)"></span>Original</span>
+        <span><span class="sw" style="background: var(--grow)"></span>Grown surfaces</span>
+        <span><span class="sw" style="background: var(--fg); height: 4px"></span>Current step</span>
+      </div>
+      <p class="hint">The surfaces of all steps are drawn on top of one another. Evenly spaced lines mean that every step moved the surface by the same distance.</p>
+    </div>
+  </div>
+
+  <div class="tiles" id="tiles"></div>
+
+  <details>
+    <summary>Numbers for every step</summary>
+    <div class="scroll"><table id="table"></table></div>
+  </details>
+
+  <details open>
+    <summary>How this was made and what the numbers mean</summary>
+    <ul id="notes"></ul>
+  </details>
+</div>
+
+<script>
+const META = /*META*/;
+const B64 = "/*B64*/";
+
+const frames = META.frames, N = frames.length;
+const zeroIndex = frames.findIndex(f => f.offset === 0);
+const maxOffset = Math.max(...frames.map(f => Math.abs(f.offset)));
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const hex = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16) / 255);
+const mix = (a, b, t) => a.map((x, i) => x + (b[i] - x) * t);
+const rgb = c => `rgb(${c.map(x => Math.round(x * 255)).join(",")})`;
+function frameColor(f) { // gray at 0, toward the grow or the shrink hue with |offset|
+  const zero = hex(css("--zero")), end = hex(css(f.offset > 0 ? "--grow" : "--shrink"));
+  return mix(zero, end, f.offset === 0 ? 0 : 0.35 + 0.65 * Math.abs(f.offset) / maxOffset);
+}
+
+// ---- data
+const raw = Uint8Array.from(atob(B64), c => c.charCodeAt(0));
+let total = 0;
+for (const f of frames) { f.first = total; total += f.pointCount; }
+const points = new Uint8Array(total * 8);
+for (const f of frames) points.set(raw.subarray(f.pointsAt, f.pointsAt + f.pointCount * 8), f.first * 8);
+const W = META.sliceW, H = META.sliceH;
+for (const f of frames) f.slice = new Int8Array(raw.buffer, f.sliceAt, W * H);
+
+// center of the original surface, in the unit box of the stored positions
+const center = [0, 0, 0];
+{
+  const f0 = frames[zeroIndex], u16 = new DataView(points.buffer);
+  for (let k = 0; k < f0.pointCount; ++k)
+    for (let a = 0; a < 3; ++a) center[a] += u16.getUint16((f0.first + k) * 8 + a * 2, true) / 65535;
+  for (let a = 0; a < 3; ++a) center[a] /= f0.pointCount;
+}
+
+// ---- 3D view (WebGL points)
+const glCanvas = document.getElementById("gl");
+const gl = glCanvas.getContext("webgl", {antialias: true});
+let program = null;
+const cam = {yaw: 0.6, pitch: 0.25, dist: 1.45};
+if (gl) {
+  const vs = `attribute vec3 aPos; attribute vec2 aOct; uniform mat4 uMV, uP; uniform vec3 uCenter; uniform float uSize;
+    varying vec3 vN;
+    void main() {
+      vec3 n = vec3(aOct, 1.0 - abs(aOct.x) - abs(aOct.y));
+      if (n.z < 0.0) n.xy = (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+      vN = mat3(uMV) * normalize(n);
+      vec4 v = uMV * vec4(aPos - uCenter, 1.0);
+      gl_Position = uP * v;
+      gl_PointSize = uSize / -v.z;
+    }`;
+  const fs = `precision mediump float; varying vec3 vN; uniform vec3 uColor;
+    void main() {
+      vec2 d = gl_PointCoord - 0.5;
+      if (dot(d, d) > 0.25) discard;
+      vec3 n = normalize(vN);
+      float light = 0.28 + 0.72 * abs(dot(n, normalize(vec3(0.35, 0.5, 0.8))));
+      gl_FragColor = vec4(uColor * light, 1.0);
+    }`;
+  const compile = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); return s; };
+  program = gl.createProgram();
+  gl.attachShader(program, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(program, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(program);
+  gl.useProgram(program);
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ARRAY_BUFFER, points, gl.STATIC_DRAW);
+  const aPos = gl.getAttribLocation(program, "aPos"), aOct = gl.getAttribLocation(program, "aOct");
+  gl.enableVertexAttribArray(aPos);
+  gl.enableVertexAttribArray(aOct);
+  gl.vertexAttribPointer(aPos, 3, gl.UNSIGNED_SHORT, true, 8, 0);
+  gl.vertexAttribPointer(aOct, 2, gl.BYTE, true, 8, 6);
+  gl.enable(gl.DEPTH_TEST);
+}
+function draw3D() {
+  if (!gl) return;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(glCanvas.clientWidth * dpr), h = Math.round(glCanvas.clientHeight * dpr);
+  if (glCanvas.width !== w || glCanvas.height !== h) { glCanvas.width = w; glCanvas.height = h; }
+  gl.viewport(0, 0, w, h);
+  const bg = hex(css("--canvas"));
+  gl.clearColor(bg[0], bg[1], bg[2], 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  const f = 1 / Math.tan(17.5 * Math.PI / 180), near = 0.05, far = 20;
+  const P = [f * h / w, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) / (near - far), -1, 0, 0, 2 * far * near / (near - far), 0];
+  const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw), cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+  // view = translate(0, 0, -dist) * rotateX(pitch) * rotateY(yaw), column-major
+  const MV = [cy, sp * sy, -cp * sy, 0, 0, cp, sp, 0, sy, -sp * cy, cp * cy, 0, 0, 0, -cam.dist, 1];
+  gl.uniformMatrix4fv(gl.getUniformLocation(program, "uMV"), false, MV);
+  gl.uniformMatrix4fv(gl.getUniformLocation(program, "uP"), false, P);
+  gl.uniform3fv(gl.getUniformLocation(program, "uCenter"), center);
+  gl.uniform1f(gl.getUniformLocation(program, "uSize"), 1.9 / META.extent * f * h / 2);
+  const fr = frames[current];
+  gl.uniform3fv(gl.getUniformLocation(program, "uColor"), mix(frameColor(fr), [1, 1, 1], 0.25));
+  gl.drawArrays(gl.POINTS, fr.first, fr.pointCount);
+}
+{
+  let drag = null;
+  glCanvas.addEventListener("pointerdown", e => { drag = [e.clientX, e.clientY]; glCanvas.setPointerCapture(e.pointerId); });
+  glCanvas.addEventListener("pointermove", e => {
+    if (!drag) return;
+    cam.yaw += (e.clientX - drag[0]) * 0.008;
+    cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch + (e.clientY - drag[1]) * 0.008));
+    drag = [e.clientX, e.clientY];
+    draw3D();
+  });
+  glCanvas.addEventListener("pointerup", () => { drag = null; });
+  glCanvas.addEventListener("pointercancel", () => { drag = null; });
+  glCanvas.addEventListener("wheel", e => {
+    e.preventDefault();
+    cam.dist = Math.max(0.4, Math.min(6, cam.dist * Math.exp(e.deltaY * 0.001)));
+    draw3D();
+  }, {passive: false});
+}
+
+// ---- slice view: the surface of every frame on one plane (marching squares)
+function contour(slice) {
+  const seg = [];
+  for (let j = 0; j + 1 < H; ++j)
+    for (let i = 0; i + 1 < W; ++i) {
+      const a = slice[j * W + i], b = slice[j * W + i + 1], c = slice[(j + 1) * W + i + 1], d = slice[(j + 1) * W + i];
+      if (a === -128 || b === -128 || c === -128 || d === -128) continue;
+      const p = [];
+      if ((a < 0) !== (b < 0)) p.push([i + a / (a - b), j]);
+      if ((b < 0) !== (c < 0)) p.push([i + 1, j + b / (b - c)]);
+      if ((d < 0) !== (c < 0)) p.push([i + d / (d - c), j + 1]);
+      if ((a < 0) !== (d < 0)) p.push([i, j + a / (a - d)]);
+      for (let k = 0; k + 1 < p.length; k += 2) seg.push(p[k][0], p[k][1], p[k + 1][0], p[k + 1][1]);
+    }
+  return seg;
+}
+for (const f of frames) f.seg = contour(f.slice);
+const sliceCanvas = document.getElementById("slice");
+function drawSlice() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(sliceCanvas.clientWidth * dpr), h = Math.round(sliceCanvas.clientHeight * dpr);
+  if (sliceCanvas.width !== w || sliceCanvas.height !== h) { sliceCanvas.width = w; sliceCanvas.height = h; }
+  const ctx = sliceCanvas.getContext("2d");
+  ctx.clearRect(0, 0, w, h);
+  const s = Math.min(w / W, h / H) * 0.96, ox = (w - s * (W - 1)) / 2, oy = (h - s * (H - 1)) / 2;
+  const X = i => ox + s * i, Y = j => h - (oy + s * j); // the second axis points up
+  const stroke = (f, color, width) => {
+    ctx.strokeStyle = color; ctx.lineWidth = width * dpr; ctx.lineCap = "round";
+    ctx.beginPath();
+    for (let k = 0; k < f.seg.length; k += 4) { ctx.moveTo(X(f.seg[k]), Y(f.seg[k + 1])); ctx.lineTo(X(f.seg[k + 2]), Y(f.seg[k + 3])); }
+    ctx.stroke();
+  };
+  frames.forEach((f, i) => { if (i !== current && f.offset % 1 === 0) stroke(f, rgb(frameColor(f)), f.offset === 0 ? 1.4 : 0.9); });
+  stroke(frames[current], css("--fg"), 2.2);
+}
+
+// ---- numbers
+const fmt = (x, d) => x.toLocaleString("en-US", {minimumFractionDigits: d, maximumFractionDigits: d});
+const sign = x => (x > 0 ? "+" : x < 0 ? "−" : "") + fmt(Math.abs(x), 1);
+function drawNumbers() {
+  const f = frames[current];
+  document.getElementById("offsetLabel").textContent = sign(f.offset) + " voxel";
+  const tile = (k, v, u) => `<div class="tile"><div class="k">${k}</div><div class="v">${v} <span class="u">${u}</span></div></div>`;
+  document.getElementById("tiles").innerHTML =
+    tile("Active voxels", fmt(f.voxels, 0), "") +
+    tile("track() time of this step", f.offset === 0 ? "–" : fmt(f.trackMs, 1), f.offset === 0 ? "" : "ms") +
+    tile("Median error", fmt(f.errMedian, 3), "voxel") +
+    tile("99th percentile error", fmt(f.err99, 3), "voxel") +
+    tile("Largest error", fmt(f.errMax, 2), "voxel") +
+    tile("Voxels with the wrong sign", fmt(f.wrongSign, 0), "");
+  document.querySelectorAll("#table tr[data-i]").forEach(tr => tr.classList.toggle("cur", +tr.dataset.i === current));
+}
+document.getElementById("table").innerHTML =
+  "<tr><th>offset (voxel)</th><th>active voxels</th><th>track() ms</th><th>median error</th><th>99th percentile error</th><th>largest error</th>" +
+  "<th>voxels compared</th><th>wrong sign</th><th>|value| ≥ background</th></tr>" +
+  frames.map((f, i) => `<tr data-i="${i}"><td>${sign(f.offset)}</td><td>${fmt(f.voxels, 0)}</td><td>${f.offset === 0 ? "–" : fmt(f.trackMs, 2)}</td>` +
+    `<td>${fmt(f.errMedian, 4)}</td><td>${fmt(f.err99, 4)}</td><td>${fmt(f.errMax, 3)}</td><td>${fmt(f.errorCount, 0)}</td>` +
+    `<td>${f.wrongSign}</td><td>${f.outOfBand}</td></tr>`).join("");
+
+const axisName = "xyz";
+document.getElementById("sliceTitle").textContent =
+  `Slice (voxel plane ${axisName[META.sliceAxis]} = ${META.sliceIndex}, horizontal ${axisName[META.uAxis]}, vertical ${axisName[META.vAxis]})`;
+document.getElementById("lead").textContent =
+  `The ${META.mesh} was turned into an SDF with MeshToSDF (longest side ${META.res} voxels, band half-width ${fmt(META.backgroundVoxels, 0)} voxels), ` +
+  `then grown ${(N - 1) / 2} times and shrunk ${(N - 1) / 2} times by ${META.stepVoxels} voxel at a time. Every step is "subtract a constant from the values, then call track() once". ` +
+  `GPU: ${META.gpu}.`;
+document.getElementById("notes").innerHTML = [
+  `One step: subtract ${META.stepVoxels} voxel from every value (grow) or add it (shrink), then call LevelSetTracker::track() once. ` +
+    `track() runs dilate, normalize, prune, in this order. The background was not changed.`,
+  `Reference for the error: the SDF of the same mesh at the same resolution with a band half-width of ${META.wideBand} voxels, minus the offset. ` +
+    `This is the exact distance only on the side the surface moved toward (outside when growing, inside when shrinking), so only the voxels on that side within 1 voxel of the new surface were compared.`,
+  `"Voxels with the wrong sign": the number of voxels that are on the other side of the surface than in the reference and farther than 0.25 voxel from the reference surface (both sides counted).`,
+  `"|value| ≥ background" is the number of voxels that should not remain after prune; it must be 0 at every step.`,
+  `The track() time covers the track() call alone and was measured once per step. A grid of this size is not meant as a performance measurement.`,
+  `Code: tools/cuda/LevelSetTracker.cuh (${META.commit}); the input SDF comes from tools/cuda/MeshToSDF.cuh.`
+].map(t => `<li>${t}</li>`).join("");
+
+// ---- frame control
+let current = zeroIndex, timer = null;
+const slider = document.getElementById("frame"), playButton = document.getElementById("play");
+slider.max = N - 1;
+function show(i) { current = i; slider.value = i; drawNumbers(); draw3D(); drawSlice(); }
+slider.addEventListener("input", () => show(+slider.value));
+let direction = 1;
+playButton.addEventListener("click", () => {
+  if (timer) { clearInterval(timer); timer = null; playButton.textContent = "Play"; return; }
+  playButton.textContent = "Stop";
+  timer = setInterval(() => {
+    if (current + direction < 0 || current + direction >= N) direction = -direction;
+    show(current + direction);
+  }, 220);
+});
+window.addEventListener("resize", () => show(current));
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => show(current));
+show(current);
+</script>

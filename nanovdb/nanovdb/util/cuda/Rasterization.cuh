@@ -186,6 +186,55 @@ struct ComputeUDFFunctor
     }
 };
 
+/// @brief ComputeUDFFunctor that also records which triangle is nearest, from the candidate triangles grouped by
+///        leaf: one block per leaf, whose candidates are dTriangleIDs[dOffsets[leafID] .. dOffsets[leafID + 1]).
+///        Each active voxel keeps, in registers, the smallest (squared distance bits, triangle) over the candidates
+///        within the band, so ties go to the smaller triangle index (non-negative float bits order as the floats
+///        do, see ComputeUDFFunctor). It writes the squared distance to @a dUDF and the triangle to @a dIndex, or
+///        the bits 0x7F7FFFFF and 0xFFFFFFFF when no candidate is within the band; slot 0 is not written.
+template<typename BuildT, typename TriangleT>
+struct ComputeUDFAndIndexByLeafFunctor
+{
+    static constexpr int MaxThreadsPerBlock = NanoLeaf<BuildT>::SIZE;
+    static constexpr int MinBlocksPerMultiprocessor = 1;
+
+    const uint32_t *dTriangleIDs;
+    const uint64_t *dOffsets;
+    const TriangleT *dTriangles;
+    const NanoGrid<BuildT> *dGrid;
+    float *dUDF;
+    uint32_t *dIndex;
+    float bandWidthSqr;
+
+    __device__ void operator()() const
+    {
+        const uint32_t leafID = blockIdx.x;
+        const int threadID = threadIdx.x;
+
+        const auto &leaf = dGrid->tree().template getFirstNode<0>()[leafID];
+        if (!leaf.isActive(threadID)) return;
+
+        const nanovdb::Vec3f voxelCenter = leaf.offsetToGlobalCoord(threadID).asVec3s();
+
+        uint32_t bestBits = 0x7F7FFFFFu, bestTriangle = 0xFFFFFFFFu;
+        for (uint64_t i = dOffsets[leafID], end = dOffsets[leafID + 1]; i < end; ++i) {
+            const uint32_t triangleID = dTriangleIDs[i];
+            const auto &tri = dTriangles[triangleID];
+            const float distSqr = nanovdb::math::pointToTriangleDistSqr(tri[0], tri[1], tri[2], voxelCenter);
+            if (distSqr >= bandWidthSqr) continue;
+            const uint32_t bits = __float_as_uint(distSqr);
+            if (bits < bestBits || (bits == bestBits && triangleID < bestTriangle)) {
+                bestBits = bits;
+                bestTriangle = triangleID;
+            }
+        }
+
+        const uint64_t sidecarIdx = leaf.getValue(threadID);
+        dUDF[sidecarIdx]   = __uint_as_float(bestBits);
+        dIndex[sidecarIdx] = bestTriangle;
+    }
+};
+
 } // namespace cuda
 
 } // namespace rasterization

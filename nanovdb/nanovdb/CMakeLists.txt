@@ -403,6 +403,7 @@ set(NANOVDB_INCLUDE_TOOLS_CUDA_FILES
   tools/cuda/ConnectedComponents.cuh
   tools/cuda/PropagateSign.cuh
   tools/cuda/LevelSetTracker.cuh
+  tools/cuda/MeshToSDF.cuh
 )
 
 # NanoVDB util header files

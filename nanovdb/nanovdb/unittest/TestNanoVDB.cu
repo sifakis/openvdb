@@ -17,6 +17,7 @@
 #include <nanovdb/tools/cuda/IndexToGrid.cuh>
 #include <nanovdb/tools/cuda/ConnectedComponents.cuh>
 #include <nanovdb/tools/cuda/PropagateSign.cuh>
+#include <nanovdb/tools/cuda/SignCertifier.cuh>
 #include <nanovdb/tools/cuda/AddBlindData.cuh>
 #include <nanovdb/tools/cuda/GridChecksum.cuh>
 #include <nanovdb/tools/cuda/GridValidator.cuh>
@@ -5427,6 +5428,7 @@ TEST(TestNanoVDBCUDA, PartitionGrid_ValueOnIndex)
         EXPECT_EQ(0, std::memcmp(hostOutput.data(), hostOutput16.data(), hostOutput.bufferSize()));
     }
 }// PartitionGrid_ValueOnIndex
+
 // PropagateSign on the narrow band of a sphere: the level set from createLevelSetSphere, active where the signed
 // distance d satisfies |d| < 3, converted to a ValueOnIndex grid whose blind data channel 0, the SDF sidecar, holds
 // d at the active voxels' value indices and the background 3 at index 0; the level set's inactive values are
@@ -5595,3 +5597,108 @@ TEST(TestNanoVDBCUDA, PropagateSign_RootFill)
     auto open = buildGrid(nanovdb::Coord(0, 1, 1));
     EXPECT_THROW(run(open, {{nanovdb::Coord(3, 1, 1), Face::minusX}}), std::runtime_error);
 }// PropagateSign_RootFill
+
+TEST(TestNanoVDBCUDA, SignCertifierSphere)
+{
+    // The narrow band of a sphere with an analytic UDF: with no mesh, the distance error is float rounding, far below
+    // the overlap tolerance, and inside/outside is exact. Lengths are in voxels.
+    using BuildT     = nanovdb::ValueOnIndex;
+    using CertifierT = nanovdb::tools::cuda::SignCertifier<BuildT>;
+    const float          W = CertifierT::MaxBandWidth, R = 24.f;
+    const nanovdb::Vec3f c(0.37f, 0.21f, 0.64f); // centre, off the lattice
+    const double         voxelSize = 0.1;         // the certifier reads the UDF in world units
+    auto distanceToCentre = [&](const nanovdb::Coord& ijk) { return (ijk.asVec3s() - c).length(); };
+    auto udf              = [&](const nanovdb::Coord& ijk) { return std::fabs(distanceToCentre(ijk) - R); };
+
+    // The band udf <= W as an index grid, its UDF sidecar (slot 0 is the background) and one seed outside the sphere
+    nanovdb::tools::build::Grid<float> band(0.f);
+    band.setTransform(voxelSize);
+    auto      acc = band.getAccessor();
+    const int n   = int(R + W) + 1;
+    for (int i = -n; i <= n; ++i)
+        for (int j = -n; j <= n; ++j)
+            for (int k = -n; k <= n; ++k)
+                if (udf(nanovdb::Coord(i, j, k)) <= W) acc.setValueOn(nanovdb::Coord(i, j, k));
+    auto handle = nanovdb::tools::createNanoGrid<nanovdb::tools::build::Grid<float>, BuildT>(band, 0u, false, false);
+    const auto*    grid      = handle.grid<BuildT>();
+    const auto*    leaves    = grid->tree().getFirstLeaf();
+    const uint32_t leafCount = grid->tree().nodeCount(0);
+    std::vector<float> hostUDF(grid->valueCount(), float(W * voxelSize));
+    for (uint32_t l = 0; l < leafCount; ++l)
+        for (auto it = leaves[l].valueMask().beginOn(); it; ++it)
+            hostUDF[leaves[l].getValue(*it)] = float(udf(leaves[l].offsetToGlobalCoord(*it)) * voxelSize);
+    const nanovdb::Coord seed(-int(R) - 2, 0, 0); // on the -x axis, udf about 2.4
+    ASSERT_TRUE(grid->tree().isActive(seed));
+    std::vector<nanovdb::Mask<3>> hostSeeds(leafCount);
+    hostSeeds[grid->tree().root().probeLeaf(seed) - leaves].setOn(nanovdb::NanoLeaf<BuildT>::CoordToOffset(seed));
+
+    nanovdb::cuda::Buffer<std::byte>        deviceGrid(0, handle.bufferSize(), nanovdb::cuda::noInit);
+    nanovdb::cuda::Buffer<float>            deviceUDF(0, hostUDF.size(), nanovdb::cuda::noInit);
+    nanovdb::cuda::Buffer<nanovdb::Mask<3>> deviceSeeds(0, hostSeeds.size(), nanovdb::cuda::noInit);
+    cudaCheck(cudaMemcpy(deviceGrid.data(), handle.data(), handle.bufferSize(), cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(deviceUDF.data(), hostUDF.data(), deviceUDF.size_bytes(), cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(deviceSeeds.data(), hostSeeds.data(), deviceSeeds.size_bytes(), cudaMemcpyHostToDevice));
+
+    auto download = [](const auto& deviceBuffer) {
+        std::vector<typename std::decay_t<decltype(deviceBuffer)>::ElementType> host(deviceBuffer.size());
+        cudaCheck(cudaMemcpy(host.data(), deviceBuffer.data(), deviceBuffer.size_bytes(), cudaMemcpyDeviceToHost));
+        return host;
+    };
+    const auto* d_grid = reinterpret_cast<const nanovdb::NanoGrid<BuildT>*>(deviceGrid.data());
+    CertifierT pedanticCertifier(d_grid, deviceUDF.data(), deviceSeeds.data());
+    pedanticCertifier.setPedantic();
+    const auto byPedantic = download(pedanticCertifier.getCertifiedMasks());
+    // Last, since it writes the signed distances over deviceUDF
+    const auto byDefault = download(CertifierT(d_grid, deviceUDF.data(), deviceSeeds.data()).signDistances());
+    const auto sdf = download(deviceUDF);
+
+    // Soundness: no inside voxel is certified. Completeness: every outside voxel with udf > 0.1 is certified; closer
+    // to the surface (below about 0.04 on a plane) a ball can be too small to overlap a certified one, and 0.1 also
+    // covers the curvature and the tolerance. Modes agree: a sphere has no pockets, so the pedantic pass adds nothing.
+    // Inside distances: |phi| of an inside voxel is at least its udf, since the certified balls contain no surface,
+    // and exceeds it by at most 0.1, how loosely the balls follow a smooth surface. The sidecar matches the pass
+    // recomputed on the host from the same UDF values and certified voxels: the UDF where certified, else phi.
+    auto gridAcc        = grid->getAccessor();
+    auto insideDistance = [&](const nanovdb::Coord& p) { // phi(p) in voxels, by brute force over |w| < 2W
+        const int reach = int(2 * W);
+        float     best  = W;
+        for (int dx = -reach; dx <= reach; ++dx)
+            for (int dy = -reach; dy <= reach; ++dy)
+                for (int dz = -reach; dz <= reach; ++dz) {
+                    const int lengthSqr = dx * dx + dy * dy + dz * dz;
+                    if (lengthSqr == 0 || float(lengthSqr) >= 4.f * W * W) continue;
+                    const nanovdb::Coord v    = p.offsetBy(dx, dy, dz);
+                    const auto*          leaf = gridAcc.probeLeaf(v);
+                    const uint32_t       n    = nanovdb::NanoLeaf<BuildT>::CoordToOffset(v);
+                    if (!leaf || !byDefault[leaf - leaves].isOn(n)) continue; // certified voxels only
+                    best = std::min(best, std::sqrt(float(lengthSqr)) - hostUDF[leaf->getValue(n)] / float(voxelSize));
+                }
+        return -std::max(best, 0.f);
+    };
+    uint64_t unsound = 0, missed = 0, differ = 0, belowUDF = 0, mismatched = 0;
+    float    smallestMissed = std::numeric_limits<float>::max(), largestExcess = 0.f;
+    for (uint32_t l = 0; l < leafCount; ++l)
+        for (auto it = leaves[l].valueMask().beginOn(); it; ++it) {
+            const nanovdb::Coord ijk       = leaves[l].offsetToGlobalCoord(*it);
+            const bool           certified = byDefault[l].isOn(*it);
+            const uint64_t       index     = leaves[l].getValue(*it);
+            const float          expected  = certified ? hostUDF[index] : insideDistance(ijk) * float(voxelSize);
+            mismatched += std::fabs(sdf[index] - expected) > 1e-5f * float(voxelSize);
+            if (distanceToCentre(ijk) < R) {
+                unsound += certified;
+                const float magnitude = -sdf[index] / float(voxelSize);
+                belowUDF += magnitude < udf(ijk) - 1e-5f;
+                largestExcess = std::max(largestExcess, magnitude - udf(ijk));
+            } else if (udf(ijk) > 0.1f && !certified) {
+                ++missed;
+                smallestMissed = std::min(smallestMissed, udf(ijk));
+            }
+            differ += certified != byPedantic[l].isOn(*it);
+        }
+    EXPECT_EQ(unsound, 0u) << "inside voxels certified";
+    EXPECT_EQ(missed, 0u) << "outside voxels with udf > 0.1 left uncertified; smallest udf " << smallestMissed;
+    EXPECT_EQ(differ, 0u) << "voxels certified by one mode only";
+    EXPECT_EQ(belowUDF, 0u) << "inside voxels with |phi| below their udf";
+    EXPECT_LE(largestExcess, 0.1f) << "largest |phi| - udf over the inside voxels";
+    EXPECT_EQ(mismatched, 0u) << "sidecar values that differ from the host recomputation by more than 1e-5 voxel";
+}// SignCertifierSphere

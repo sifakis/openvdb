@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CSG Operations Viewer</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<style>
+/* Basics that a standalone page needs. */
+body { margin: 0; } img { max-width: 100%; } [hidden] { display: none !important; }
+/* Layout: controls on top, then input 1, input 2 and the result side by side (stacked when narrow). */
+:root {
+  --bg: #f6f7f9; --surface: #ffffff; --fg: #1a1f2b; --muted: #5b6475; --line: #d3d8e2; --soft: #eef0f4;
+  --out: #eef0f4; --actn: #c9781f; --actp: #f2c878; --in1: #c4b6f2; --in2: #7b5fd0; --in3: #3b2787;
+  --inbg: #b9b3cf; --ob1: #dde6e1; --ob2: #b4c7bd; --ob3: #86a193;
+  --leafline: #1a1f2b; --outline: #1f8a70; --sel: #1f8a70; --bad: #c2453a;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #12151c; --surface: #1b1f29; --fg: #e6e9f0; --muted: #9aa3b5; --line: #343b4a; --soft: #262b37;
+  --out: #222733; --actn: #e3a341; --actp: #8c6a2a; --in1: #cabdf7; --in2: #8f78e0; --in3: #5540b5;
+  --inbg: #4a4468; --ob1: #2b3833; --ob2: #3c544a; --ob3: #55796b;
+  --leafline: #05070b; --outline: #4fc3a5; --sel: #4fc3a5; --bad: #ef7a6d; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #12151c; --surface: #1b1f29; --fg: #e6e9f0; --muted: #9aa3b5; --line: #343b4a; --soft: #262b37;
+  --out: #222733; --actn: #e3a341; --actp: #8c6a2a; --in1: #cabdf7; --in2: #8f78e0; --in3: #5540b5;
+  --inbg: #4a4468; --ob1: #2b3833; --ob2: #3c544a; --ob3: #55796b;
+  --leafline: #05070b; --outline: #4fc3a5; --sel: #4fc3a5; --bad: #ef7a6d; color-scheme: dark }
+
+body { background: var(--bg); color: var(--fg); font-family: var(--sans); font-size: 15px; line-height: 1.65;
+  padding-block: 28px 56px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+.wrap { max-width: 1280px; margin: 0 auto; display: flex; flex-direction: column; gap: 24px; }
+h1 { font-size: 26px; line-height: 1.25; margin: 0; font-weight: 600; text-wrap: balance; }
+h2 { font-size: 17px; margin: 0; font-weight: 600; text-wrap: balance; }
+p { margin: 0; max-width: 72ch; }
+.lede { color: var(--muted); }
+.prose { display: flex; flex-direction: column; gap: 10px; }
+code { font-family: var(--mono); font-size: 0.92em; background: var(--soft); padding: 1px 5px; border-radius: 4px; }
+ul.plain { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 6px; max-width: 76ch; }
+
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 16px; display: flex; flex-direction: column; gap: 14px; }
+.bar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 18px; }
+.bar label.frame { flex: 1 1 280px; display: flex; flex-direction: column; gap: 2px; min-width: 0; font-size: 13.5px; }
+.bar input[type=range] { width: 100%; accent-color: var(--sel); }
+.val { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+button { font: inherit; font-size: 13.5px; padding: 6px 14px; border-radius: 999px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); cursor: pointer; }
+button.scene[aria-pressed="true"], button.op[aria-pressed="true"], button.scene3d[aria-pressed="true"] { border-color: var(--sel); box-shadow: inset 0 0 0 1px var(--sel); }
+button:focus-visible, input:focus-visible { outline: 2px solid var(--sel); outline-offset: 2px; }
+.check { display: inline-flex; align-items: center; gap: 8px; font-size: 13.5px; }
+.check input { accent-color: var(--sel); width: 16px; height: 16px; }
+.verdict { font-size: 14px; display: flex; flex-wrap: wrap; gap: 6px 22px; }
+.verdict b { font-weight: 600; }
+.ok { color: var(--sel); font-weight: 600; } .no { color: var(--bad); font-weight: 600; }
+
+.legend { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 13.5px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 14px; height: 14px; border-radius: 3px; border: 1px solid var(--line); display: inline-block; }
+.sw.out { background: var(--out); } .sw.actn { background: var(--actn); } .sw.actp { background: var(--actp); }
+.sw.in1 { background: var(--in1); } .sw.in2 { background: var(--in2); } .sw.in3 { background: var(--in3); }
+.sw.inbg { background: var(--inbg); } .sw.ob1 { background: var(--ob1); } .sw.ob2 { background: var(--ob2); } .sw.ob3 { background: var(--ob3); }
+.sw.ring { background: transparent; border: 2px solid var(--outline); border-radius: 50%; }
+
+.views { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+.view { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.view .sub { color: var(--muted); font-size: 13.5px; }
+canvas { width: 100%; height: auto; display: block; border: 1px solid var(--line); border-radius: 6px; image-rendering: pixelated; background: var(--out); }
+dl.stats { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 14px; font-size: 13.5px; }
+dl.stats dt { color: var(--muted); } dl.stats dd { margin: 0; font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
+#status { color: var(--muted); font-size: 14px; }
+#panel3d { display: flex; flex-direction: column; gap: 10px; }
+#gl { width: 100%; display: block; border: 1px solid var(--line); border-radius: 6px; touch-action: none; image-rendering: auto; }
+.heads { display: grid; gap: 0; font-size: 13.5px; font-weight: 600; text-align: center; }
+.hint { color: var(--muted); font-size: 13px; }
+label.cut { flex: 1 1 240px; display: flex; flex-direction: column; gap: 2px; min-width: 0; font-size: 13.5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="prose">
+    <h1>CSG operations on NanoVDB level sets</h1>
+    <p class="lede">One level set stays in place and a second one moves toward it. At every step <code>csgUnion</code>, <code>csgIntersection</code> and <code>csgDifference</code> of <code>tools/cuda/CSG.cuh</code> ran on the GPU, for each combination of negated inputs. The page draws what the results store.</p>
+  </header>
+
+  <section class="panel" aria-label="Controls">
+    <div class="bar" id="scenes" role="group" aria-label="View"></div>
+    <p id="scenetext"></p>
+    <div class="bar">
+      <button type="button" id="play">Play</button>
+      <label class="frame" for="frame">frame <span class="val" id="frameval"></span><input type="range" id="frame" min="0" max="29" value="0"></label>
+      <label class="check" for="leaflines"><input type="checkbox" id="leaflines" checked> leaf boundaries</label>
+    </div>
+    <div class="bar">
+      <div class="bar" id="ops" role="group" aria-label="Operation"></div>
+      <label class="check" for="neg1"><input type="checkbox" id="neg1"> negate input 1</label>
+      <label class="check" for="neg2"><input type="checkbox" id="neg2"> negate input 2</label>
+    </div>
+    <div class="legend">
+      <span><i class="sw actn"></i>active, negative value</span>
+      <span><i class="sw actp"></i>active, positive value</span>
+      <span><i class="sw in1"></i>inside: bit of a leaf mask (1 voxel)</span>
+      <span><i class="sw in2"></i>inside: bit of a lower-node mask (8×8×8 voxels)</span>
+      <span><i class="sw in3"></i>inside: bit of an upper-node mask (128×128×128 voxels)</span>
+      <span><i class="sw out"></i>outside</span>
+    </div>
+    <div class="legend">
+      <span><i class="sw inbg"></i>inside: negative background, bit off</span>
+      <span><i class="sw ob1"></i>outside: negative background, bit of a leaf mask</span>
+      <span><i class="sw ob2"></i>outside: negative background, bit of a lower-node mask</span>
+      <span><i class="sw ob3"></i>outside: negative background, bit of an upper-node mask</span>
+    </div>
+    <div class="verdict" id="verdict" aria-live="polite"></div>
+    <p id="status" hidden></p>
+  </section>
+
+  <section class="panel" id="panel3d" aria-label="3D view" hidden>
+    <div class="bar" id="modes" role="group" aria-label="Panes"></div>
+    <div class="bar">
+      <label class="cut" for="cut">cut position <span class="val" id="cutval"></span><input type="range" id="cut" min="-50" max="50" value="0"></label>
+      <label class="check" for="showpos"><input type="checkbox" id="showpos" checked> draw the active voxels with a positive value</label>
+    </div>
+    <div class="heads" id="heads"></div>
+    <canvas id="gl" role="img" aria-label="The stored voxels drawn as boxes"></canvas>
+    <p class="hint">Drag to rotate, wheel to zoom. One box is one voxel; a large slab is an 8×8×8 block covered by one bit of a lower node, cut into slices one voxel thick. The panes share one camera.</p>
+    <p id="status3d" class="hint" hidden></p>
+  </section>
+
+  <section class="views" id="opsviews" aria-label="The two inputs and the result">
+    <article class="view">
+      <h2 id="oh1">Input 1</h2>
+      <p class="sub" id="os1"></p>
+      <canvas id="o1" width="848" height="480" role="img" aria-label="Slice of input 1"></canvas>
+    </article>
+    <article class="view">
+      <h2 id="oh2">Input 2</h2>
+      <p class="sub" id="os2"></p>
+      <canvas id="o2" width="848" height="480" role="img" aria-label="Slice of input 2"></canvas>
+    </article>
+    <article class="view">
+      <h2 id="oh3">Result</h2>
+      <p class="sub" id="os3"></p>
+      <canvas id="o3" width="848" height="480" role="img" aria-label="Slice of the result"></canvas>
+      <dl class="stats" id="so"></dl>
+    </article>
+  </section>
+
+  <section class="prose">
+    <h2>How to read the pictures</h2>
+    <ul class="plain">
+      <li>The orange band is the narrow band: the voxels that store a value. Its darker half holds negative values, its lighter half positive ones.</li>
+      <li>A mask bit says "the sign here is the opposite of the background". With a positive background the bits mark the inside (purple); with a negative background the inside is everything whose bit is off (grey purple) and the bits mark the outside (grey green).</li>
+      <li>The shade of a bit tells the tree level that stores it: one bit per voxel in a leaf, one bit per childless slot of a lower node (a leaf-sized block), or one bit per childless slot of an upper node.</li>
+      <li>In the slices one pixel is one voxel, and the thin grid marks leaf boundaries (every 8 voxels) where a leaf exists.</li>
+      <li>Negating a level set (<code>csgComplement</code>) flips the sign of its values and of its background; the masks stay as they are.</li>
+    </ul>
+  </section>
+
+  <section class="prose">
+    <h2>About the data</h2>
+    <ul class="plain" id="notes"></ul>
+  </section>
+</div>
+
+<script>
+// Data written by csg_viewer_voxels (3D) and csg_viewer_slices (slices), embedded by make_viewer.py. Either may be null.
+const DATA_VOXELS = /*VOXELS*/null;
+const DATA_SLICES = /*SLICES*/null;
+const NAMES = /*NAMES*/["input 1", "input 2"];
+(function () {
+  const $ = id => document.getElementById(id);
+  const SCALE = 2;
+  let D = null, cache = {}, timer = null, scene = 0;
+  const RULE = "The rule: the value of the result is min (union), max (intersection) or max(value 1, −value 2) (difference) of the values of the inputs, where an inactive voxel takes the background or its negation as its mask bit says.";
+  const SCENES = [
+    { name: "3D", data: DATA_VOXELS, kind: "ops3d",
+      text: `${NAMES[0]} (input 1) stays in place and ${NAMES[1]} (input 2) moves toward it along +z. Choose an operation and which inputs to negate; the three panes draw input 1, input 2 and the result as voxel boxes. Voxels with x below the cut position are hidden to show the inside.`,
+      notes: ["Only what is stored is drawn: the voxels with a value, and the places where a mask bit is on. A level set with a negative background is inside everywhere far away; that unbounded inside is not stored and is not drawn.",
+              "The data holds four results per frame, computed from the inputs as they are: 1 ∪ 2, 1 ∩ 2, 1 − 2 and 2 − 1. Each of the 12 results (3 operations × 4 sign pairs of the backgrounds) is one of these four or its negation. The generator computed all 12 and compared each with that result byte for byte (grid, values and the masks of the three levels); the line above shows how many differed in this frame.",
+              "Every one of the 12 results was also compared with the rule at every voxel of a box around both inputs. " + RULE] },
+    { name: "Slices", data: DATA_SLICES, kind: "ops",
+      text: `${NAMES[0]} (input 1) stays in place and ${NAMES[1]} (input 2) moves toward it. Choose an operation and which inputs to negate. The slice is the plane x = 0: horizontal is z, vertical is y (up is +y).`,
+      notes: ["The sign of the result's background follows from the operation and the backgrounds of the inputs: a union, for example, has a negative background if either input has one.",
+              "The pictures of the inputs are one slice each, recolored when the input is negated. The picture of the result is a slice of the result computed for that combination.",
+              "Every one of the 12 results of a frame was compared with the rule on every second voxel (in each direction) of a box around both inputs, and on every voxel of this slice. " + RULE,
+              "A picture is one slice of a 3D result; the numbers below it are those of the whole result."] }
+  ].filter(sc => sc.data);
+  const COMMON_NOTES = ["The inputs are narrow bands made from meshes by <code>MeshToSDF</code>, with a band half-width of " + ((DATA_SLICES || DATA_VOXELS || {}).band || 3) + " voxels. Input 2 is moved by whole voxels.",
+                        "Root-level mask entries are not written by this draft of the operations, and these scenes have none."];
+  const OPS = [{ name: "union", sym: "∪", fn: "csgUnion" }, { name: "intersection", sym: "∩", fn: "csgIntersection" }, { name: "difference", sym: "−", fn: "csgDifference" }];
+  let op = 0;
+  const nf = n => n.toLocaleString("en-US");
+
+  // A slice is run-length encoded: a letter (A = code 0, B = code 1, ...) followed by the run length.
+  function decode(str, n) {
+    const out = new Uint8Array(n);
+    let pos = 0;
+    const re = /([A-Z])(\d+)/g;
+    let m;
+    while ((m = re.exec(str))) { const c = m[1].charCodeAt(0) - 65, run = +m[2]; out.fill(c, pos, pos + run); pos += run; }
+    return out;
+  }
+  function rgb(name) {
+    const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    const h = v.replace("#", "");
+    return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+  }
+  // Colors by slice code: 0 bit off, 1 active negative, 2 active positive, 3 / 4 / 5 bit of a leaf / lower / upper mask.
+  function palette() {
+    return { c: [rgb("--out"), rgb("--actn"), rgb("--actp"), rgb("--in1"), rgb("--in2"), rgb("--in3"), rgb("--in3"), rgb("--out")], line: rgb("--leafline") };
+  }
+  // The same codes for a level set with a negative background: a bit that is off is inside, a bit that is on is outside.
+  // swap: the codes are those of the level set before it was negated, so the two active colors trade places.
+  function paletteNegative(swap) {
+    const n = rgb("--actn"), p = rgb("--actp");
+    return { c: [rgb("--inbg"), swap ? p : n, swap ? n : p, rgb("--ob1"), rgb("--ob2"), rgb("--ob3"), rgb("--ob3"), rgb("--inbg")], line: rgb("--leafline") };
+  }
+  function codes(key, str) {
+    if (!cache[key]) cache[key] = decode(str, D.w * D.h);
+    return cache[key];
+  }
+  // The 3D data holds the four results on the plain inputs: u = 1 | 2, i = 1 & 2, d = 1 - 2, e = 2 - 1. Each of the 12
+  // results is one of them or its complement: [neg1 neg2][operation] -> [stored result, complemented].
+  const BASE3D = { "00": [["u", 0], ["i", 0], ["d", 0]], "01": [["e", 1], ["d", 0], ["i", 0]], "10": [["d", 1], ["e", 0], ["u", 1]], "11": [["i", 1], ["u", 1], ["e", 0]] };
+  function opsChoice(f) {
+    const n1 = $("neg1").checked, n2 = $("neg2").checked, signs = "" + (+n1) + (+n2);
+    if (SCENES[scene].kind !== "ops3d") return { n1, n2, key: "uid"[op] + signs, r: f["uid"[op] + signs] };
+    const [base, comp] = BASE3D[signs][op];
+    return { n1, n2, key: "uid"[op] + signs, base, comp, r: Object.assign({}, f[base], { bg: comp ? -1 : 1 }) };
+  }
+  function renderOps(fi, f, showLeaf) {
+    const c = opsChoice(f), n1 = c.n1, n2 = c.n2, key = c.key, r = c.r, is3d = SCENES[scene].kind === "ops3d";
+    const pal = palette(), o = OPS[op];
+    if (is3d) update3d(fi, f);
+    else {
+      draw($("o1"), codes("i1", D.i1), n1 ? paletteNegative(true) : pal, showLeaf);
+      draw($("o2"), codes(fi + "i2", f.i2), n2 ? paletteNegative(true) : pal, showLeaf);
+      draw($("o3"), codes(fi + key, r.v), r.bg < 0 ? paletteNegative(false) : pal, showLeaf);
+    }
+    const bgText = neg => neg ? "negative background: inside at infinity" : "positive background: outside at infinity";
+    const a = n1 ? "¬" + NAMES[0] : NAMES[0], b = n2 ? "¬" + NAMES[1] : NAMES[1];
+    $("oh1").textContent = "Input 1: " + a; $("os1").textContent = bgText(n1);
+    $("oh2").textContent = "Input 2: " + b; $("os2").textContent = bgText(n2);
+    $("oh3").textContent = `Result: ${a} ${o.sym} ${b}`;
+    $("os3").innerHTML = `<code>${o.fn}</code>. ` + bgText(r.bg < 0);
+    $("so").innerHTML = row("leaves", nf(r.leaves)) + row("lower / upper nodes", nf(r.lowers) + " / " + nf(r.uppers)) + row("active voxels", nf(r.active)) +
+      row("bits on: leaf masks", nf(r.bits[0])) + row("bits on: lower masks", nf(r.bits[1])) + row("bits on: upper masks", nf(r.bits[2]));
+    $("verdict").innerHTML =
+      `<span>inputs: <b>${nf((D.in1 || D.i1).leaves)}</b> + <b>${nf((f.in2 || f.i2).leaves)}</b> leaves</span>` +
+      (is3d ? `<span>of the 12 results, not byte-identical to a stored result or its negation: <span class="${f.mapBad === 0 ? "ok" : "no"}">${nf(f.mapBad)}</span></span>` : "") +
+      `<span>the 12 results of this frame against the rule (${nf(f.checked)} points): mismatches <span class="${f.ruleBad === 0 ? "ok" : "no"}">${nf(f.ruleBad)}</span></span>`;
+  }
+
+  function draw(canvas, codes, pal, showLeaf) {
+    const W = D.w, H = D.h, ctx = canvas.getContext("2d");
+    const img = ctx.createImageData(W * SCALE, H * SCALE), px = img.data;
+    for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
+      const code = codes[j * W + i], col = pal.c[code & 7];
+      const gy = D.flipY ? D.y0 + H - 1 - j : D.y0 + j;
+      const onX = showLeaf && (code & 8) && ((D.x0 + i) & 7) === 0, onY = showLeaf && (code & 8) && (gy & 7) === (D.flipY ? 7 : 0);
+      for (let dy = 0; dy < SCALE; dy++) for (let dx = 0; dx < SCALE; dx++) {
+        const o = ((j * SCALE + dy) * W * SCALE + i * SCALE + dx) * 4;
+        const lineHere = (onX && dx === 0) || (onY && dy === 0);
+        const c = lineHere ? [(col[0] * 2 + pal.line[0]) / 3, (col[1] * 2 + pal.line[1]) / 3, (col[2] * 2 + pal.line[2]) / 3] : col;
+        px[o] = c[0]; px[o + 1] = c[1]; px[o + 2] = c[2]; px[o + 3] = 255;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+  }
+  const row = (k, v) => `<dt>${k}</dt><dd>${v}</dd>`;
+
+  function render() {
+    if (!D) return;
+    const fi = +$("frame").value, f = D.frames[fi];
+    $("frameval").textContent = `${fi + 1} / ${D.frames.length} · ${NAMES[1]} moved ${f.off} voxels along z`;
+    renderOps(fi, f, $("leaflines").checked);
+  }
+
+  function stop() { if (timer) { clearInterval(timer); timer = null; $("play").textContent = "Play"; } }
+  $("play").addEventListener("click", () => {
+    if (timer) { stop(); return; }
+    $("play").textContent = "Pause";
+    timer = setInterval(() => { const s = $("frame"); s.value = (+s.value + 1) % D.frames.length; render(); }, 260);
+  });
+  $("frame").addEventListener("input", () => { stop(); render(); });
+  $("leaflines").addEventListener("change", render);
+  if (window.matchMedia) window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
+
+  // ---- 3D view: one box per voxel, drawn with one instanced draw call per kind of voxel ----
+  let G = null, built = -1, mode = 0;
+  const PANES = ["Input 1", "Input 2", "Result"], MODES = ["All three"].concat(PANES);
+  let trees = {};
+  function bytes(b64) { const s = atob(b64), a = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i); return a; }
+  const i16 = (a, o) => { const v = a[o] | (a[o + 1] << 8); return v & 0x8000 ? v - 0x10000 : v; };
+  // leaves: origin (3 x int16), then three 64-byte masks: value, negative, invert
+  function decodeLeaves(a) {
+    const rec = 198, n = a.length / rec, neg = [], pos = [], inv = [];
+    for (let l = 0; l < n; l++) {
+      const o = l * rec, ox = i16(a, o), oy = i16(a, o + 2), oz = i16(a, o + 4);
+      for (let v = 0; v < 512; v++) {
+        const by = v >> 3, bit = 1 << (v & 7);
+        if (a[o + 6 + by] & bit) (a[o + 70 + by] & bit ? neg : pos).push(ox + (v >> 6), oy + ((v >> 3) & 7), oz + (v & 7));
+        else if (a[o + 134 + by] & bit) inv.push(ox + (v >> 6), oy + ((v >> 3) & 7), oz + (v & 7));
+      }
+    }
+    return { neg, pos, inv };
+  }
+  // childless slots: origin (3 x int16) each, cut into slabs one voxel thick along x
+  function decodeSlabs(a, dim) {
+    const out = [];
+    for (let o = 0; o < a.length; o += 6) { const ox = i16(a, o), oy = i16(a, o + 2), oz = i16(a, o + 4); for (let d = 0; d < dim; d++) out.push(ox + d, oy, oz); }
+    return out;
+  }
+  function decodeTree(t) {
+    const L = decodeLeaves(bytes(t.t));
+    return { neg: L.neg, pos: L.pos, in1: L.inv, in2: decodeSlabs(bytes(t.l), 8), in3: decodeSlabs(bytes(t.u), 128) };
+  }
+  // A decoded level set as drawn: as is, or negated (the active colors trade places, and the bits mark the outside).
+  function asRead(t, negated) {
+    const none = [];
+    return negated ? { neg: t.pos, pos: t.neg, in1: none, in2: none, in3: none, ob1: t.in1, ob2: t.in2, ob3: t.in3 }
+                   : { neg: t.neg, pos: t.pos, in1: t.in1, in2: t.in2, in3: t.in3, ob1: none, ob2: none, ob3: none };
+  }
+  // what the three panes draw for a frame: input 1, input 2 and the chosen result
+  function opsLists(fi, f) {
+    const c = opsChoice(f), get = (k, t) => trees[k] || (trees[k] = decodeTree(t));
+    return [asRead(get("i1", D.i1), c.n1), asRead(get(fi + "i2", f.i2), c.n2), asRead(get(fi + c.base, f[c.base]), !!c.comp)];
+  }
+
+  const KINDS = [["neg", "--actn", [1, 1, 1]], ["pos", "--actp", [1, 1, 1]], ["in1", "--in1", [1, 1, 1]], ["in2", "--in2", [1, 8, 8]], ["in3", "--in3", [1, 128, 128]],
+                 ["ob1", "--ob1", [1, 1, 1]], ["ob2", "--ob2", [1, 8, 8]], ["ob3", "--ob3", [1, 128, 128]]];
+  function init3d() {
+    if (G) { layout3d(); return; }
+    if (!window.THREE) { $("status3d").hidden = false; $("status3d").textContent = "The 3D library could not be loaded (it comes from a CDN)."; return; }
+    let renderer;
+    try { renderer = new THREE.WebGLRenderer({ canvas: $("gl"), antialias: true }); }
+    catch (e) { $("status3d").hidden = false; $("status3d").textContent = "WebGL is not available in this browser."; return; }
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    const camera = new THREE.PerspectiveCamera(32, 1, 5, 3000);
+    camera.position.set(-250, 70, 30);
+    const controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0, 30); controls.update();
+    const box = new THREE.BoxGeometry(1, 1, 1);
+    const uniforms = { cut: { value: 0 } };
+    const panes = PANES.map(() => {
+      const scene = new THREE.Scene(), meshes = {};
+      KINDS.forEach(([key, , size]) => {
+        const mat = new THREE.ShaderMaterial({
+          uniforms: { cut: uniforms.cut, size: { value: new THREE.Vector3(size[0], size[1], size[2]) }, color: { value: new THREE.Color() } },
+          vertexShader: "attribute vec3 offset; uniform vec3 size; uniform float cut; varying vec3 vN;\n" +
+            "void main() { vN = normalMatrix * normal; vec3 p = (position * 0.94 + 0.5) * size + offset;\n" +
+            "  gl_Position = offset.x < cut ? vec4(2.0, 2.0, 2.0, 1.0) : projectionMatrix * modelViewMatrix * vec4(p, 1.0); }",
+          fragmentShader: "uniform vec3 color; varying vec3 vN;\n" +
+            "void main() { float d = max(dot(normalize(vN), normalize(vec3(0.35, 0.55, 0.75))), 0.0); gl_FragColor = vec4(color * (0.42 + 0.58 * d), 1.0); }"
+        });
+        const mesh = new THREE.Mesh(new THREE.InstancedBufferGeometry(), mat);
+        mesh.frustumCulled = false; scene.add(mesh); meshes[key] = mesh;
+      });
+      return { scene, meshes };
+    });
+    G = { renderer, camera, controls, box, uniforms, panes };
+    controls.addEventListener("change", draw3d);
+    if (window.ResizeObserver) new ResizeObserver(layout3d).observe($("gl").parentElement);
+    mode = $("panel3d").clientWidth >= 760 ? 0 : 1;
+    MODES.forEach((name, i) => {
+      const b = document.createElement("button");
+      b.type = "button"; b.className = "scene3d"; b.id = "mode" + i; b.textContent = name;
+      b.addEventListener("click", () => { mode = i; layout3d(); });
+      $("modes").appendChild(b);
+    });
+    layout3d();
+  }
+  function layout3d() {
+    if (!G) return;
+    const w = $("gl").parentElement.clientWidth - 2, n = mode === 0 ? PANES.length : 1;
+    const h = Math.round(mode === 0 ? Math.max(240, w / n * 0.95) : Math.min(560, Math.max(280, w * 0.72)));
+    G.renderer.setSize(w, h, false); $("gl").style.height = h + "px";
+    $("heads").style.gridTemplateColumns = `repeat(${n}, 1fr)`;
+    $("heads").innerHTML = (mode === 0 ? PANES : [PANES[mode - 1]]).map(t => `<span>${t}</span>`).join("");
+    document.querySelectorAll("#modes button").forEach((b, k) => b.setAttribute("aria-pressed", String(k === mode)));
+    draw3d();
+  }
+  function update3d(fi, f) {
+    if (!G) return;
+    const tag = fi + ":" + op + "," + $("neg1").checked + "," + $("neg2").checked;
+    if (built !== tag) {
+      const lists = opsLists(fi, f);
+      G.panes.forEach((p, k) => KINDS.forEach(([key]) => {
+        const arr = lists[k][key], old = p.meshes[key].geometry, geo = new THREE.InstancedBufferGeometry();
+        geo.setIndex(G.box.index); geo.setAttribute("position", G.box.attributes.position); geo.setAttribute("normal", G.box.attributes.normal);
+        geo.setAttribute("offset", new THREE.InstancedBufferAttribute(new Float32Array(arr), 3));
+        geo.instanceCount = arr.length / 3;
+        p.meshes[key].geometry = geo; p.meshes[key].visible = arr.length > 0; old.dispose();
+      }));
+      built = tag;
+    }
+    draw3d();
+  }
+  function draw3d() {
+    if (!G || built === -1) return;
+    const css = getComputedStyle(document.documentElement), cut = +$("cut").value, showPos = $("showpos").checked;
+    $("cutval").textContent = cut <= -50 ? "no cut" : `voxels with x < ${cut} are hidden`;
+    G.uniforms.cut.value = cut <= -50 ? -1e6 : cut;
+    G.panes.forEach(p => KINDS.forEach(([key, token]) => {
+      p.meshes[key].material.uniforms.color.value.set(css.getPropertyValue(token).trim());
+      if (key === "pos") p.meshes[key].visible = showPos && p.meshes[key].geometry.instanceCount > 0;
+    }));
+    const r = G.renderer, size = r.getSize(new THREE.Vector2()), list = mode === 0 ? PANES.map((_, k) => k) : [mode - 1], w = size.x / list.length;
+    r.setScissorTest(true);
+    list.forEach((k, i) => {
+      r.setViewport(i * w, 0, w, size.y); r.setScissor(i * w + (i ? 1 : 0), 0, w - (i ? 1 : 0), size.y);
+      r.setClearColor(css.getPropertyValue("--out").trim()); r.clear();
+      G.camera.aspect = w / size.y; G.camera.updateProjectionMatrix();
+      r.render(G.panes[k].scene, G.camera);
+    });
+  }
+  $("cut").addEventListener("input", draw3d);
+  $("showpos").addEventListener("change", draw3d);
+
+  function load(i) {
+    stop(); scene = i; cache = {}; trees = {};
+    const sc = SCENES[i], is3d = sc.kind === "ops3d";
+    D = sc.data;
+    document.querySelectorAll("button.scene").forEach((b, k) => b.setAttribute("aria-pressed", String(k === i)));
+    $("scenetext").textContent = sc.text;
+    $("notes").innerHTML = sc.notes.concat(COMMON_NOTES).map(t => `<li>${t}</li>`).join("");
+    ["o1", "o2", "o3"].forEach(id => { $(id).hidden = is3d; if (!is3d) { $(id).width = D.w * SCALE; $(id).height = D.h * SCALE; } });
+    $("panel3d").hidden = !is3d;
+    $("frame").max = D.frames.length - 1; $("frame").value = Math.round((D.frames.length - 1) * 0.6);
+    $("leaflines").disabled = is3d;
+    built = -1;
+    if (is3d) init3d();
+    render();
+  }
+  if (!SCENES.length) { $("status").hidden = false; $("status").textContent = "No data is embedded in this page. Build it with make_viewer.py."; return; }
+  SCENES.forEach((sc, i) => {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "scene"; b.id = "scene" + i; b.textContent = sc.name;
+    b.addEventListener("click", () => load(i));
+    $("scenes").appendChild(b);
+  });
+  OPS.forEach((o, i) => {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "op"; b.id = "op" + i; b.textContent = o.name; b.setAttribute("aria-pressed", String(i === op));
+    b.addEventListener("click", () => { op = i; document.querySelectorAll("button.op").forEach((x, k) => x.setAttribute("aria-pressed", String(k === i))); render(); });
+    $("ops").appendChild(b);
+  });
+  $("neg1").addEventListener("change", render);
+  $("neg2").addEventListener("change", render);
+  load(0);
+})();
+</script>
+</body>
+</html>

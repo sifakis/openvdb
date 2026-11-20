@@ -14,9 +14,14 @@ voxel (slot 0 holds the background), and the invert masks of `PropagateSign`.
 | `ex_csg_nanovdb_cuda_csg_union_baselines` | `csg_union_baselines.cu` | Compares `csgUnion` with the two baselines `csgUnionPropagateSign` and `csgUnionLeafResolved` on seven sphere pairs. Prints `ALL PASS` or `FAIL`. |
 | `ex_csg_nanovdb_cuda_csg_timing` | `csg_timing.cu` | Wall time of each operation: minimum and median over 41 runs after 2 warm-up runs. |
 | `ex_csg_nanovdb_cuda_mesh_to_band` | `mesh_to_band.cu` | Converts an OBJ mesh to a narrow-band level set with `tools::cuda::MeshToSDF` and writes it as a band file, the mesh input of the other programs. |
+| `ex_csg_nanovdb_cuda_csg_viewer_slices` | `csg_viewer_slices.cu` | Writes slices of the inputs and of all 12 results while one mesh moves through another. |
+| `ex_csg_nanovdb_cuda_csg_viewer_voxels` | `csg_viewer_voxels.cu` | Writes every stored voxel and mask bit of the inputs and the results of the same scene. |
 
 `CsgExampleUtil.cuh` holds what they share: level sets of analytic spheres and of band files, host copies of a
 level set, and the timer.
+
+The last two programs write the data of an interactive viewer and of static figures. [viewer/README.md](viewer/README.md)
+describes the scene, the commands, every field of the two files, and a Python reader.
 
 ## Build
 
@@ -24,7 +29,8 @@ The targets are part of the NanoVDB examples and need CUDA:
 
 ```
 cmake --build <build dir> --target ex_csg_nanovdb_cuda_csg_operations_test ex_csg_nanovdb_cuda_csg_union_baselines \
-    ex_csg_nanovdb_cuda_csg_timing ex_csg_nanovdb_cuda_mesh_to_band
+    ex_csg_nanovdb_cuda_csg_timing ex_csg_nanovdb_cuda_mesh_to_band \
+    ex_csg_nanovdb_cuda_csg_viewer_slices ex_csg_nanovdb_cuda_csg_viewer_voxels
 ```
 
 The executables are written to `<build dir>/nanovdb/nanovdb/examples/`.

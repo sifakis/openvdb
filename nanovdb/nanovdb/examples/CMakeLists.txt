@@ -121,7 +121,7 @@ nanovdb_example(NAME "ex_propagate_sign_nanovdb_cuda" OPENVDB)
 
 # These examples hold several programs each, so every program is a target of its own.
 if(NANOVDB_USE_CUDA)
-  foreach(program csg_operations_test csg_union_baselines csg_timing mesh_to_band)
+  foreach(program csg_operations_test csg_union_baselines csg_timing mesh_to_band csg_viewer_slices csg_viewer_voxels)
     add_executable(ex_csg_nanovdb_cuda_${program} ex_csg_nanovdb_cuda/${program}.cu)
     target_link_libraries(ex_csg_nanovdb_cuda_${program} PRIVATE nanovdb)
   endforeach()

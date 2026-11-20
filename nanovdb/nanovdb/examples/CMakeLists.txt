@@ -119,7 +119,7 @@ nanovdb_example(NAME "ex_connected_components_cuda")
 nanovdb_example(NAME "ex_partition_grid_cuda" OPENVDB)
 nanovdb_example(NAME "ex_propagate_sign_nanovdb_cuda" OPENVDB)
 
-# ex_csg_nanovdb_cuda and ex_level_set_offset_cuda hold several programs, so each is a target of its own.
+# These examples hold several programs each, so every program is a target of its own.
 if(NANOVDB_USE_CUDA)
   foreach(program csg_operations_test csg_union_baselines csg_timing mesh_to_band)
     add_executable(ex_csg_nanovdb_cuda_${program} ex_csg_nanovdb_cuda/${program}.cu)
@@ -129,6 +129,12 @@ if(NANOVDB_USE_CUDA)
     add_executable(ex_level_set_offset_cuda_${program} ex_level_set_offset_cuda/${program}.cu)
     target_link_libraries(ex_level_set_offset_cuda_${program} PRIVATE nanovdb)
   endforeach()
+  add_executable(ex_cloth_collision_cuda_probe_sphere ex_cloth_collision_cuda/probe_sphere.cu)
+  target_link_libraries(ex_cloth_collision_cuda_probe_sphere PRIVATE nanovdb)
+  if(NANOVDB_USE_OPENVDB) # sdf_check compares with OpenVDB
+    add_executable(ex_cloth_collision_cuda_sdf_check ex_cloth_collision_cuda/sdf_check.cu)
+    target_link_libraries(ex_cloth_collision_cuda_sdf_check PRIVATE nanovdb)
+  endif()
 endif()
 
 if(CUDAToolkit_FOUND)

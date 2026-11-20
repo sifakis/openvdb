@@ -27,6 +27,7 @@
 #include <nanovdb/tools/cuda/PartitionGrid.cuh>
 #include <nanovdb/tools/cuda/PropagateSign.cuh>
 #include <nanovdb/tools/cuda/PruneGrid.cuh>
+#include <nanovdb/tools/cuda/SignCertifier.cuh>
 #include <nanovdb/util/cuda/Injection.cuh>             // InjectGridDataFunctor
 #include <nanovdb/util/cuda/DeviceGridTraits.cuh>
 #include <nanovdb/util/cuda/Timer.h>
@@ -105,7 +106,9 @@ public:
     /// @brief Policy for signing voxels in the surface barrier.
     enum class BarrierSigning {
         Interior,   ///< classify all barrier voxels as interior
-        Heuristic   ///< use the OpenVDB intersecting-voxel heuristic
+        Heuristic,  ///< use the OpenVDB intersecting-voxel heuristic
+        Ball        ///< sign every voxel by ball certification (SignCertifier), which also recomputes the
+                    ///< interior distances; needs a band width SignCertifier accepts
     };
 
     /// @brief Choose the barrier signing method (default Heuristic).
@@ -177,8 +180,13 @@ private:
     void signSingleComponent(const GridT* dComponentGrid, float* dComponentSDF,
                              const uint32_t* dComponentNearestTriangle);
 
-    // Stage 3a: the grid of the component without its barrier, the voxels nearest the mesh.
+    // Stages 3a-3c with BarrierSigning::Ball: sign every distance of one component by ball certification.
+    void signByBallCertification(const GridT* dComponentGrid, float* dComponentSDF);
+
+    // Stage 3a: the grid of the component without its barrier, the voxels within threshold voxels of the mesh
+    // (sdf::detail::BarrierThreshold when not given).
     HandleT pruneBarrier(const GridT* dComponentGrid, const float* dComponentUDF);
+    HandleT pruneBarrier(const GridT* dComponentGrid, const float* dComponentUDF, float threshold);
 
     // Stage 3b: negate the distances outside the barrier that are not in the exterior barrier-free component.
     BufferT<unsigned long long> findExteriorLabel(const GridT* dBarrierPrunedGrid, uint32_t leaves,
@@ -238,6 +246,8 @@ void MeshToSDF<BuildT, ResourceT>::rasterize()
     converter.setNarrowBandWidth(mBandWidth);
     std::tie(mGridHandle, mSDF, mNearestTriangle) =
         converter.template getHandleAndUDFAndIndex<BufferT<std::byte>, BufferT<std::byte>>(mGridHandle.buffer(), mSDF);
+    // Ball certification does not read the nearest triangles.
+    if (mBarrierSigning == BarrierSigning::Ball) mNearestTriangle.destroy();
     mTreeData = TraitsT::getTreeData(mGridHandle.template deviceGrid<BuildT>(), mStream);
 } // MeshToSDF<BuildT, ResourceT>::rasterize
 
@@ -301,15 +311,19 @@ void MeshToSDF<BuildT, ResourceT>::signComponents()
 
     for (ComponentLabelT componentID = 0; componentID < mComponentCount; ++componentID) {
         // The distances and nearest triangles of the component, indexed by its own grid. The copies write every
-        // slot but slot 0, the background, which the memsets define.
+        // slot but slot 0, the background, which the memsets define. Ball certification does not read the
+        // nearest triangles, so they are left empty for it.
         const auto*    dComponentGrid = mComponentGrids[componentID].template deviceGrid<BuildT>();
         const uint64_t slots          = TraitsT::getTreeData(dComponentGrid, mStream).mVoxelCount + 1;
+        const bool     ball           = mBarrierSigning == BarrierSigning::Ball;
         BufferT<float>    componentSDF(mStream, this->ref(), slots, nanovdb::cuda::noInit);
-        BufferT<uint32_t> componentNearestTriangle(mStream, this->ref(), slots, nanovdb::cuda::noInit);
+        BufferT<uint32_t> componentNearestTriangle(mStream, this->ref(), ball ? 0 : slots, nanovdb::cuda::noInit);
         cudaCheck(cudaMemsetAsync(componentSDF.data(), 0, sizeof(float), mStream));
-        cudaCheck(cudaMemsetAsync(componentNearestTriangle.data(), 0xFF, sizeof(uint32_t), mStream));
         copySidecar(dFullGrid, dComponentGrid, dFullSDF, componentSDF.data());
-        copySidecar(dFullGrid, dComponentGrid, dFullNearestTriangle, componentNearestTriangle.data());
+        if (!ball) {
+            cudaCheck(cudaMemsetAsync(componentNearestTriangle.data(), 0xFF, sizeof(uint32_t), mStream));
+            copySidecar(dFullGrid, dComponentGrid, dFullNearestTriangle, componentNearestTriangle.data());
+        }
 
         signSingleComponent(dComponentGrid, componentSDF.data(), componentNearestTriangle.data());
         accumulateNesting(dComponentGrid, componentSDF.data(), componentID);
@@ -319,11 +333,16 @@ void MeshToSDF<BuildT, ResourceT>::signComponents()
 } // MeshToSDF<BuildT, ResourceT>::signComponents
 
 /// @brief Sign the distances @a dComponentSDF of one component, the voxels of @a dComponentGrid: first the non-barrier
-///        voxels, then the barrier voxels.
+///        voxels, then the barrier voxels; or all of them by ball certification.
 template <typename BuildT, typename ResourceT>
 void MeshToSDF<BuildT, ResourceT>::signSingleComponent(const GridT* dComponentGrid, float* dComponentSDF,
                                                      const uint32_t* dComponentNearestTriangle)
 {
+    if (mBarrierSigning == BarrierSigning::Ball) {
+        signByBallCertification(dComponentGrid, dComponentSDF);
+        return;
+    }
+
     HandleT     barrierPrunedHandle = pruneBarrier(dComponentGrid, dComponentSDF);
     const auto* dBarrierPrunedGrid  = barrierPrunedHandle.template deviceGrid<BuildT>();
 
@@ -349,13 +368,13 @@ namespace sdf::detail {
 ///        sides outside it; the 0.001 margin covers float error in the distances.
 static constexpr float BarrierThreshold = 0.501f;
 
-/// @brief Whether a voxel at unsigned distance @a udf from the mesh lies in the barrier: within BarrierThreshold
-///        voxels of the mesh. All values are in world units.
+/// @brief Whether a voxel at unsigned distance @a udf from the mesh lies in the barrier: within @a threshold
+///        voxels of the mesh. @a udf and @a voxelSize are in world units.
 /// @note Pruning and barrier signing must classify a voxel alike, so both use this test. Signing negates the
 ///       distance exactly, so the test gives the same answer on the magnitude of a signed distance.
-__hostdev__ inline bool isBarrier(float udf, float voxelSize)
+__hostdev__ inline bool isBarrier(float udf, float voxelSize, float threshold = BarrierThreshold)
 {
-    return udf < BarrierThreshold * voxelSize;
+    return udf < threshold * voxelSize;
 }
 
 /// @brief Retain the voxels outside the barrier.
@@ -370,13 +389,14 @@ struct BarrierPruneMaskFunctor
         const NanoGrid<BuildT>* dComponentGrid,
         const float*            dComponentUDF,           // unsigned distance of each voxel slot, world
         float                   voxelSize,      // world
+        float                   threshold,      // of the barrier, voxels
         nanovdb::Mask<3>*       dDstLeafMasks)  // one per leaf: the voxels to retain
     {
         const int leafID = blockIdx.x, warpID = threadIdx.x >> 5, laneID = threadIdx.x & 31;
         const auto& leaf = dComponentGrid->tree().template getFirstNode<0>()[leafID];
         auto selectNonBarrier = [&](uint32_t offset) {
             return leaf.isActive(offset) &&
-                   !isBarrier(dComponentUDF[leaf.getValue(offset)], voxelSize);
+                   !isBarrier(dComponentUDF[leaf.getValue(offset)], voxelSize, threshold);
         };
 
         // Lane i in warp w tests voxel offsets 64*w + i and 64*w + i + 32.
@@ -394,7 +414,7 @@ struct BarrierPruneMaskFunctor
 
 template <typename BuildT, typename ResourceT>
 typename MeshToSDF<BuildT, ResourceT>::HandleT
-MeshToSDF<BuildT, ResourceT>::pruneBarrier(const GridT* dComponentGrid, const float* dComponentUDF)
+MeshToSDF<BuildT, ResourceT>::pruneBarrier(const GridT* dComponentGrid, const float* dComponentUDF, float threshold)
 {
     using FunctorT = sdf::detail::BarrierPruneMaskFunctor<BuildT>;
 
@@ -403,12 +423,19 @@ MeshToSDF<BuildT, ResourceT>::pruneBarrier(const GridT* dComponentGrid, const fl
     BufferT<nanovdb::Mask<3>> barrierMask(mStream, this->ref(), leaves, nanovdb::cuda::noInit);
 
     util::cuda::operatorKernel<FunctorT><<<leaves, FunctorT::MaxThreadsPerBlock, 0, mStream>>>(
-        dComponentGrid, dComponentUDF, mVoxelSize, barrierMask.data());
+        dComponentGrid, dComponentUDF, mVoxelSize, threshold, barrierMask.data());
     cudaCheckError();
 
     PruneGrid<BuildT, ResourceT> barrierPruner(dComponentGrid, barrierMask.data(), mStream, *mResource);
     return barrierPruner.getHandle(BufferT<std::byte>(mStream, this->ref(), 0, nanovdb::cuda::noInit));
 } // MeshToSDF<BuildT, ResourceT>::pruneBarrier
+
+template <typename BuildT, typename ResourceT>
+typename MeshToSDF<BuildT, ResourceT>::HandleT
+MeshToSDF<BuildT, ResourceT>::pruneBarrier(const GridT* dComponentGrid, const float* dComponentUDF)
+{
+    return pruneBarrier(dComponentGrid, dComponentUDF, sdf::detail::BarrierThreshold);
+}
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -686,6 +713,81 @@ void MeshToSDF<BuildT, ResourceT>::signBarrier(const GridT* dComponentGrid, floa
         slots, sdf::detail::NegateMarkedFunctor{}, negate.data(), dComponentSDF);
     cudaCheckError();
 } // MeshToSDF<BuildT, ResourceT>::signBarrier
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+namespace sdf::detail {
+
+// Stages 3a-3c with BarrierSigning::Ball: ball certification.
+
+/// @brief Write the seed masks of SignCertifier: the voxels of the exterior component of the barrier-free grid
+///        @a dBarrierPrunedGrid, found by FindExteriorLabelFunctor in @a dMinKey. The masks are indexed by the
+///        leaves of @a dComponentGrid, which holds every voxel of @a dBarrierPrunedGrid; the masks of its other
+///        leaves are not written.
+template <typename BuildT>
+struct ExteriorSeedMaskFunctor
+{
+    // One block per leaf: 8 warps cover its 512 voxels, one warp per 64-bit mask word.
+    static constexpr int MaxThreadsPerBlock         = 256;
+    static constexpr int MinBlocksPerMultiprocessor = 1;
+
+    __device__ void operator()(const NanoGrid<BuildT>* dBarrierPrunedGrid, const uint32_t* dVoxelLabel,
+                               const unsigned long long* dMinKey, const NanoGrid<BuildT>* dComponentGrid,
+                               nanovdb::Mask<3>* dSeedMasks)
+    {
+        const int leafID = blockIdx.x, warpID = threadIdx.x >> 5, laneID = threadIdx.x & 31;
+        const auto& leaf = dBarrierPrunedGrid->tree().template getFirstNode<0>()[leafID];
+        const uint32_t exteriorLabel = uint32_t(*dMinKey);  // low 32 bits of the key
+        auto isSeed = [&](uint32_t offset) {
+            return leaf.isActive(offset) && dVoxelLabel[leaf.getValue(offset)] == exteriorLabel;
+        };
+
+        // Lane i in warp w tests voxel offsets 64*w + i and 64*w + i + 32.
+        // Two ballots form the low/high halves of mask word w; lane 0 writes the word.
+        // All lanes participate; inactive voxels contribute zero bits.
+        const uint32_t offset   = 64 * warpID + laneID;
+        const uint32_t lowHalf  = __ballot_sync(0xFFFFFFFFu, isSeed(offset));
+        const uint32_t highHalf = __ballot_sync(0xFFFFFFFFu, isSeed(offset + 32));
+        if (laneID == 0) {
+            const auto* componentLeaf = dComponentGrid->tree().root().probeLeaf(leaf.origin());
+            dSeedMasks[componentLeaf - dComponentGrid->tree().getFirstLeaf()].words()[warpID] =
+                uint64_t(lowHalf) | (uint64_t(highHalf) << 32);
+        }
+    }
+};
+
+} // namespace sdf::detail
+
+/// @brief Sign the distances @a dComponentSDF of one component, the voxels of @a dComponentGrid, by ball
+///        certification. The seeds are the exterior component of the voxels at least SignCertifier::BarrierThreshold
+///        voxels from the mesh. The voxels SignCertifier certifies from them are exterior and keep their distance;
+///        every other voxel is interior and gets the distance SignCertifier recomputes for it.
+template <typename BuildT, typename ResourceT>
+void MeshToSDF<BuildT, ResourceT>::signByBallCertification(const GridT* dComponentGrid, float* dComponentSDF)
+{
+    using CertifierT = SignCertifier<BuildT, ResourceT>;
+    const uint32_t leaves = TraitsT::getTreeData(dComponentGrid, mStream).mNodeCount[0];
+
+    BufferT<nanovdb::Mask<3>> seedMasks(mStream, this->ref(), leaves, nanovdb::cuda::noInit);
+    cudaCheck(cudaMemsetAsync(seedMasks.data(), 0, seedMasks.size_bytes(), mStream));
+    {
+        HandleT     barrierPrunedHandle = pruneBarrier(dComponentGrid, dComponentSDF, CertifierT::BarrierThreshold);
+        const auto* dBarrierPrunedGrid  = barrierPrunedHandle.template deviceGrid<BuildT>();
+        if (const uint32_t barrierPrunedLeaves = TraitsT::getTreeData(dBarrierPrunedGrid, mStream).mNodeCount[0]) {
+            ConnectedComponents<BuildT, ResourceT> barrierPrunedCC(dBarrierPrunedGrid, mStream, *mResource);
+            const auto barrierPrunedLabels = barrierPrunedCC.getVoxelLabelsAndCount().first;
+            const auto minKey = findExteriorLabel(dBarrierPrunedGrid, barrierPrunedLeaves, barrierPrunedLabels.data());
+            using FunctorT = sdf::detail::ExteriorSeedMaskFunctor<BuildT>;
+            util::cuda::operatorKernel<FunctorT><<<barrierPrunedLeaves, FunctorT::MaxThreadsPerBlock, 0, mStream>>>(
+                dBarrierPrunedGrid, barrierPrunedLabels.data(), minKey.data(), dComponentGrid, seedMasks.data());
+            cudaCheckError();
+        }
+    } // the barrier-free grid and its labels are released here, before the certification
+
+    CertifierT certifier(dComponentGrid, dComponentSDF, seedMasks.data(), mStream, *mResource);
+    certifier.setBandWidth(mBandWidth);
+    certifier.signDistances(); // writes the signed distances over dComponentSDF
+} // MeshToSDF<BuildT, ResourceT>::signByBallCertification
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 

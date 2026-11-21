@@ -7,8 +7,9 @@
 ///        analytic spheres, for every sign pair of the backgrounds: the full-space field of the result against the
 ///        per-voxel rule (min, max, max with the negated second field) and against the analytic distance, the
 ///        structure of the result, and the identities 1 - 2 = 1 & ~2 and 1 | 2 = ~(~1 & ~2). Then 17 set
-///        identities on three inputs, each side built independently and compared byte for byte. With three band
-///        files as arguments (see mesh_to_band.cu) the same checks run on mesh level sets.
+///        identities on three inputs, each side built independently and compared byte for byte, and the
+///        pruneCancelledLeaves option of csgDifference. With three band files as arguments (see mesh_to_band.cu)
+///        the same checks run on mesh level sets.
 ///
 /// usage: csg_operations_test [a.band b.band c.band]
 
@@ -270,6 +271,22 @@ int main(int argc, char** argv)
             t.check("E - A = E", t.D(E, A), E);
             t.check("~E & A = A", t.I(Identities::N(t.I(A, B)), A), A);
             t.check("~E | A = ~E", t.U(Identities::N(t.I(A, B)), A), Identities::N(t.I(A, B)));
+        } catch (const std::exception& e) { printf("  EXCEPTION: %s\n", e.what()); t.ok = false; }
+        ok &= t.ok;
+    }
+
+    // csgDifference with pruneCancelledLeaves: equal inputs leave nothing, a leaf that the inputs share with the
+    // same field is left out, and inputs with no such leaf give the plain difference
+    {
+        printf("difference with pruneCancelledLeaves\n");
+        Identities t{res, [&](int i) { return makeSphere(i == 0 ? Sphere{0, 0, 0, 20} : i == 1 ? Sphere{70.5f, 0, 0, 25} : Sphere{15, 0, 0, 20}, res); }, {false, false, false}};
+        const auto pruned = [&](const StateT& x, const StateT& y) { return tools::cuda::csgDifference<BuildT, float, ResourceT>(x, y, 0, res, true); };
+        try {
+            const StateT A = t.make(0), B = t.make(1), C = t.make(2), E = t.I(A, B);
+            t.check("A - A = E", pruned(A, A), E);
+            t.check("A - (A | B) = E", pruned(A, t.U(A, B)), E);
+            t.check("(A | B) - A = B", pruned(t.U(A, B), A), B);
+            t.check("A - C = A - C unpruned", pruned(A, C), t.D(A, C));
         } catch (const std::exception& e) { printf("  EXCEPTION: %s\n", e.what()); t.ok = false; }
         ok &= t.ok;
     }

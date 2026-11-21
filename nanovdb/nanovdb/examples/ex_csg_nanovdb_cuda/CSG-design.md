@@ -221,23 +221,48 @@ Intersection is the same structure with the roles of `in` and `out` exchanged: `
 the identity, the order is `in < act < out`, active values combine with `max`, and
 `neg_out = neg1 AND neg2`.
 
-Difference `1 \ 2` is the intersection of input 1 with the complement of input 2. The complement is
-never materialized: read input 2 with `neg_2` flipped and its active `phi` negated (section 3.2), then
-intersect. Then `neg_out = neg1 AND (NOT neg2)`, matching the last column of the table in section 4.
+Difference `1 \ 2` is, as a set, the intersection of input 1 with the complement of input 2, so its value
+is `max(phi1, -phi2)` and `neg_out = neg1 AND (NOT neg2)`, matching the last column of the table in
+section 4. Written on the states of the two inputs as they are stored:
 
-| slot 1 | slot 2 (as read, complemented) | result |
+| slot 1 | slot 2 | result |
 |---|---|---|
 | `out` | any | `out` |
-| any | `out` | `out` |
-| `in` | `act` | `act`, values `phi2'` (the negated `phi2`) |
-| `act` | `in` | `act`, values `phi1` |
-| `act` | `act` | `act`, `max(phi1, phi2')` |
-| `in` | `in` | `in` |
+| any | `in` | `out` |
+| `in` | `act` | `act`, values `-phi2` |
+| `act` | `out` | `act`, values `phi1` |
+| `act` | `act` | `act`, `max(phi1, -phi2)` |
+| `in` | `out` | `in` |
 
-Intersection and difference are only sketched here; the per-voxel tables and the existence condition of
-section 8 follow by the symmetry above and must be checked in the verification of section 12. The
-difference is kept as its own entry point for the first version (it is not just intersection with a
-flag), even though it shares the kernel.
+The per-voxel tables and the existence condition of section 8 follow for intersection and difference by
+the symmetry above, and are checked by the verification of section 12.
+
+### 6.1 How the three operations share code
+
+Union, intersection and difference are three primitives of equal standing. They share the steps (retain
+masks, one topology build, values, invert masks; section 9.2), and the kernel of each step states the rule
+of each operation side by side, selected by an operation tag:
+
+| step | union | intersection | difference `1 \ 2` |
+|---|---|---|---|
+| an active voxel is dropped where | the other input is `in` | the other input is `out` | of input 1: input 2 is `in`; of input 2: input 1 is `out` |
+| value | `min(phi1, phi2)` | `max(phi1, phi2)` | `max(phi1, -phi2)` |
+| an unstored slot is | `out` if `out` in both, else `in` | `in` if `in` in both, else `out` | `in` if `in` in 1 and `out` in 2, else `out` |
+| at infinity | `in` if either is | `in` if both are | `in` if 1 is and 2 is not |
+
+No operation is computed by complementing the inputs or the result of another. The identities
+`1 | 2 = ~(~1 & ~2)` and `1 \ 2 = 1 & ~2` are therefore tests of independent computations (section 12).
+
+### 6.2 Coinciding surfaces: cancelled leaves
+
+Where the surfaces of the two inputs of a difference coincide, `max(phi, -phi) = |phi|`: the band stays
+active, with values near zero and none negative. The set is right (no interior), the values are not a
+distance to anything. `openvdb::tools::csgDifference` behaves the same way by default and offers
+`pruneCancelledTiles`, which resets a leaf whose 512 values are equal in the two inputs to the inactive
+background. The counterpart here is the argument `pruneCancelledLeaves` of `csgDifference`: a leaf over
+which the two inputs hold the same field (equal value masks, equal `in` masks, equal active values) retains
+no voxel, so it does not exist in the result and its extent is `out`. It is off by default. It acts on
+whole leaves: fields that differ in one voxel of a leaf keep that leaf.
 
 ## 7. The tree levels
 
@@ -377,6 +402,11 @@ survive, and fill the masks by 8.2 and 8.3. This is one topology operator in the
 with the invert masks as an additional input and output. Faster in principle; more code. To be considered
 after route A is verified. The sign handling of 5.2 and the copy-with-flip of 7.2 apply here.
 
+This is what `csgUnion`, `csgIntersection` and `csgDifference` of `tools/cuda/CSG.cuh` do, through
+`csg::detail::combine(operation, ...)`: retain masks per leaf of each input, one topology build from them,
+values, then invert masks per node of the result at each level, each kernel selecting its rule by the
+operation (section 6.1). The root list of 8.3 is not written yet.
+
 ## 10. Preconditions to check at the entry point
 
 - Same transform (assumption 1); same `|gamma|` or pre-pruned (assumption 3).
@@ -406,7 +436,9 @@ the same inputs, comparing the full-space field of section 3.1:
    and the torus as the difference of two positive-gamma inputs.
 6. Identities: `1 | 2 = ~(~1 & ~2)`, `1 \ 2 = 1 & ~2`, double complement, and union of equal inputs
    equals the input.
-7. For each: active set identical, active values identical, sign of every inactive voxel and tile
+7. Difference of inputs whose surfaces coincide, entirely (equal inputs) and in part, with and without
+   `pruneCancelledLeaves`, against `csgDifference` with and without `pruneCancelledTiles` (section 6.2).
+8. For each: active set identical, active values identical, sign of every inactive voxel and tile
    identical; the node set equals the existence condition of 8.1; `PropagateSign` on the result reproduces
    the derived masks of 8.2 and the root list of 8.3; and the leaf-resolved reference of section 7.3
    agrees with the multi-level output.

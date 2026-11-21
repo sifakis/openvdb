@@ -142,22 +142,23 @@ struct LeafResolvedRetainMaskFunctor
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-// csgUnion, csgIntersection and csgDifference share the kernels below. Every operation is the intersection of its
-// two operands, each read as is or complemented, with the result stored as is or complemented:
-//     intersection(1, 2) = 1 & 2        difference(1, 2) = 1 & ~2        union(1, 2) = ~(~1 & ~2)
-// A voxel of a leaf, or a slot of a lower or upper node, is in one of three states in an operand:
+// csgUnion, csgIntersection and csgDifference share the steps of csg::detail::combine and the kernels below. Each
+// kernel states the rule of every operation side by side. With f1 and f2 the values of the two inputs at a point:
+//     union         min(f1,  f2)    inside if inside either input
+//     intersection  max(f1,  f2)    inside if inside both inputs
+//     difference    max(f1, -f2)    inside if inside input 1 and outside input 2
+// A voxel of a leaf, or a slot of a lower or upper node, is in one of three states in an input:
 //     stored   an active voxel, or a slot with a child node
-//     inside   inactive, where the operand is negative
-//     outside  inactive, where the operand is positive
-// In the intersection a point is inside if it is inside both operands, outside if it is outside either, and stored
-// otherwise.
+//     inside   inactive, where the input is negative
+//     outside  inactive, where the input is positive
 
-/// @brief One operand of the intersection: a level set and how to read it.
+enum class Operation { Union, Intersection, Difference };
+
+/// @brief One input of an operation: a level set and its side at infinity.
 template<typename BuildT, typename ValueT>
 struct Operand : LevelSetView<BuildT, ValueT>
 {
-    ValueT sign;             // +1 to read the level set as is, -1 to read its complement
-    bool   insideAtInfinity; // the operand, as read, is negative at infinity: its invert bits then mark the outside
+    bool insideAtInfinity; // the background is negative: the invert bits then mark the outside
 };
 
 /// @brief What a level set holds at the node of a given level (0 leaf, 1 lower, 2 upper) with a given origin:
@@ -232,17 +233,57 @@ __hostdev__ inline States states(const Operand<BuildT, ValueT>& operand, const C
     return operand.insideAtInfinity ? States{stored, plain, inverted} : States{stored, inverted, plain};
 }
 
-// One thread per leaf of an operand: retain its active voxels that are not outside the other operand.
+/// @brief True if two inputs hold the same field over the 512 voxels of a leaf that both have: the same active
+///        voxels with the same values, and the same side at every inactive voxel.
+template<typename BuildT, typename ValueT>
+__hostdev__ inline bool sameLeafField(const Operand<BuildT, ValueT>& input1, uint32_t leafID1,
+                                      const Operand<BuildT, ValueT>& input2, uint32_t leafID2)
+{
+    const auto& leaf1 = input1.grid->tree().template getFirstNode<0>()[leafID1];
+    const auto& leaf2 = input2.grid->tree().template getFirstNode<0>()[leafID2];
+    const Cover c1{true, leafID1, false}, c2{true, leafID2, false};
+    for (uint32_t w = 0; w < nanovdb::Mask<3>::WORD_COUNT; ++w) {
+        const States s1 = states<0>(input1, c1, w), s2 = states<0>(input2, c2, w);
+        if (s1.stored != s2.stored || s1.inside != s2.inside) return false;
+    }
+    for (uint32_t n = 0; n < NanoLeaf<BuildT>::SIZE; ++n)
+        if (leaf1.isActive(n) && input1.phi[leaf1.getValue(n)] != input2.phi[leaf2.getValue(n)]) return false;
+    return true;
+}
+
+// One thread per leaf of an input: retain its active voxels that stay active in the result. An active voxel is
+// dropped where the other input alone decides the result:
+//     union         where the other input is inside   (the point is inside the union)
+//     intersection  where the other input is outside  (the point is outside the intersection)
+//     difference    a voxel of input 1 where input 2 is inside, a voxel of input 2 where input 1 is outside
+//                   (the point is outside the difference)
+// With @a pruneCancelledLeaves, a leaf over which the two inputs hold the same field retains nothing: there the
+// difference max(f, -f) = |f| has no negative value, so the leaf is left out of the result, as outside.
 template<typename BuildT, typename ValueT>
 struct RetainMaskFunctor
 {
-    __device__ void operator()(size_t leafID, Operand<BuildT, ValueT> self, Operand<BuildT, ValueT> other,
+    /// @param isInput1 True if @a self is the first input of the operation and @a other the second.
+    /// @param pruneCancelledLeaves For a difference only (see above).
+    __device__ void operator()(size_t leafID, Operation operation, bool isInput1, bool pruneCancelledLeaves,
+                               Operand<BuildT, ValueT> self, Operand<BuildT, ValueT> other,
                                nanovdb::Mask<3>* retainMasks) const
     {
         const auto& leaf = self.grid->tree().template getFirstNode<0>()[leafID];
         const Cover c = cover(other, leaf.origin(), 0);
-        for (uint32_t w = 0; w < nanovdb::Mask<3>::WORD_COUNT; ++w)
-            retainMasks[leafID].words()[w] = leaf.valueMask().words()[w] & ~states<0>(other, c, w).outside;
+        if (pruneCancelledLeaves && c.exists && sameLeafField(self, uint32_t(leafID), other, c.index)) {
+            retainMasks[leafID].setOff();
+            return;
+        }
+        for (uint32_t w = 0; w < nanovdb::Mask<3>::WORD_COUNT; ++w) {
+            const States s = states<0>(other, c, w);
+            uint64_t dropped;
+            switch (operation) {
+            case Operation::Union:        dropped = s.inside; break;
+            case Operation::Intersection: dropped = s.outside; break;
+            default:                      dropped = isInput1 ? s.inside : s.outside; // Operation::Difference
+            }
+            retainMasks[leafID].words()[w] = leaf.valueMask().words()[w] & ~dropped;
+        }
     }
 }; // RetainMaskFunctor
 
@@ -263,52 +304,72 @@ struct MergePrunedLeafMasksFunctor
     }
 }; // MergePrunedLeafMasksFunctor
 
-// One thread per voxel of a leaf of the result: an active voxel takes the maximum of the two operands. An operand
-// in which it is inactive is inside there (the retain masks removed the other case) and holds -magnitude, the
-// negative background. @a resultSign is -1 to store the complement of the intersection.
+// One thread per voxel of a leaf of the result: the value of an active voxel, from the values f1 and f2 of the
+// two inputs there. An input in which the voxel is inactive holds its background, with the sign of the only side
+// that the retain masks left for it: inside (-magnitude) or outside (+magnitude).
 template<typename BuildT, typename ValueT>
-struct IntersectionValuesFunctor
+struct ValuesFunctor
 {
     static constexpr int MaxThreadsPerBlock = NanoLeaf<BuildT>::SIZE;
     static constexpr int MinBlocksPerMultiprocessor = 1;
 
     __device__ void operator()(const NanoGrid<BuildT>* resultGrid,
+                               Operation operation,
                                Operand<BuildT, ValueT> input1,
                                Operand<BuildT, ValueT> input2,
                                ValueT magnitude,
-                               ValueT resultSign,
                                ValueT* resultPhi) const
     {
         const auto&    leaf = resultGrid->tree().template getFirstNode<0>()[blockIdx.x];
         const uint32_t n    = threadIdx.x;
         if (!leaf.isActive(n)) return;
 
+        // Where inactive: outside both in a union, inside both in an intersection, inside input 1 and outside
+        // input 2 in a difference.
+        ValueT f1 = operation == Operation::Union ? magnitude : -magnitude;
+        ValueT f2 = operation == Operation::Intersection ? -magnitude : magnitude;
         const Coord ijk = leaf.offsetToGlobalCoord(n);
-        ValueT value = -magnitude;
         const auto* leaf1 = input1.grid->tree().root().probeLeaf(ijk);
-        if (leaf1 && leaf1->isActive(n)) value = math::Max(value, input1.sign * input1.phi[leaf1->getValue(n)]);
+        if (leaf1 && leaf1->isActive(n)) f1 = input1.phi[leaf1->getValue(n)];
         const auto* leaf2 = input2.grid->tree().root().probeLeaf(ijk);
-        if (leaf2 && leaf2->isActive(n)) value = math::Max(value, input2.sign * input2.phi[leaf2->getValue(n)]);
-        resultPhi[leaf.getValue(n)] = resultSign * value;
+        if (leaf2 && leaf2->isActive(n)) f2 = input2.phi[leaf2->getValue(n)];
+
+        ValueT value;
+        switch (operation) {
+        case Operation::Union:        value = math::Min(f1, f2); break;
+        case Operation::Intersection: value = math::Max(f1, f2); break;
+        default:                      value = math::Max(f1, -f2); // Operation::Difference
+        }
+        resultPhi[leaf.getValue(n)] = value;
     }
-}; // IntersectionValuesFunctor
+}; // ValuesFunctor
 
 // One thread per node of @a LEVEL of the result (0 leaf, 1 lower, 2 upper): its invert mask. A voxel or slot that
-// the result does not store is inside the intersection if it is inside both operands, and outside it otherwise.
-// The invert bits mark whichever of the two the intersection is not at infinity.
+// the result does not store is inside or outside the result:
+//     union         outside if outside both inputs, inside otherwise
+//     intersection  inside if inside both inputs, outside otherwise
+//     difference    inside if inside input 1 and outside input 2, outside otherwise
+// The invert bits mark whichever of the two the result is not at infinity.
 template<typename BuildT, typename ValueT, int LEVEL>
 struct InvertMaskFunctor
 {
     using MaskT = nanovdb::Mask<LEVEL + 3>;
 
-    __device__ void operator()(size_t nodeID, const NanoGrid<BuildT>* resultGrid, Operand<BuildT, ValueT> input1,
-                               Operand<BuildT, ValueT> input2, bool insideAtInfinity, MaskT* invertMasks) const
+    __device__ void operator()(size_t nodeID, const NanoGrid<BuildT>* resultGrid, Operation operation,
+                               Operand<BuildT, ValueT> input1, Operand<BuildT, ValueT> input2, bool insideAtInfinity,
+                               MaskT* invertMasks) const
     {
         const auto& node = resultGrid->tree().template getFirstNode<LEVEL>()[nodeID];
         const Cover c1 = cover(input1, node.origin(), LEVEL), c2 = cover(input2, node.origin(), LEVEL);
         for (uint32_t w = 0; w < MaskT::WORD_COUNT; ++w) {
-            const uint64_t stored  = storedMask<LEVEL>(node).words()[w];
-            const uint64_t inside  = states<LEVEL>(input1, c1, w).inside & states<LEVEL>(input2, c2, w).inside;
+            const uint64_t stored = storedMask<LEVEL>(node).words()[w];
+            const States   s1 = states<LEVEL>(input1, c1, w), s2 = states<LEVEL>(input2, c2, w);
+            uint64_t inside;
+            switch (operation) {
+            case Operation::Union:        inside = ~(stored | (s1.outside & s2.outside)); break;
+            case Operation::Intersection: inside = s1.inside & s2.inside; break;
+            default:                      inside = s1.inside & s2.outside; // Operation::Difference
+            }
             const uint64_t outside = ~(stored | inside);
             invertMasks[nodeID].words()[w] = insideAtInfinity ? outside : inside;
         }
@@ -394,19 +455,23 @@ mergePrunedGrids(const NanoGrid<BuildT>* grid1, const nanovdb::Mask<3>* retainMa
     return GridHandle<BufferT<std::byte, ResourceT>>(std::move(buffer));
 } // mergePrunedGrids
 
-/// @brief The intersection of two operands, each read as is or complemented, stored as is or complemented: the
-///        implementation of csgUnion, csgIntersection and csgDifference (see their documentation).
-/// @details 1. Retain masks, per leaf of each operand: its active voxels that are not outside the other operand.
+/// @brief The steps shared by csgUnion, csgIntersection and csgDifference (see their documentation); the rule of
+///        each operation is in the kernel of each step.
+/// @details 1. Retain masks, per leaf of each input: its active voxels that stay active in the result
+///             (RetainMaskFunctor).
 ///          2. One topology build: only the nodes that hold a retained voxel exist.
-///          3. Values: the maximum over the operands in which the voxel is active.
-///          4. Invert masks, per node of the result, from the states of the operands over that node.
-///          Where an operand has no node at the origin of a node being processed, its state there is read by one
+///          3. Values of the active voxels (ValuesFunctor).
+///          4. Invert masks, per node of the result, from the states of the inputs over that node
+///             (InvertMaskFunctor).
+///          Where an input has no node at the origin of a node being processed, its state there is read by one
 ///          tree descent per node, from the coarser level that holds it (see cover).
+/// @param pruneCancelledLeaves See csgDifference; false for the other operations.
 template<typename BuildT, typename ValueT, typename ResourceT>
 typename LevelSetTracker<BuildT, ValueT, ResourceT>::State
-intersect(const typename LevelSetTracker<BuildT, ValueT, ResourceT>::State& levelSet1, bool complement1,
-          const typename LevelSetTracker<BuildT, ValueT, ResourceT>::State& levelSet2, bool complement2,
-          bool complementResult, cudaStream_t stream, ResourceT& resource)
+combine(Operation operation,
+        const typename LevelSetTracker<BuildT, ValueT, ResourceT>::State& levelSet1,
+        const typename LevelSetTracker<BuildT, ValueT, ResourceT>::State& levelSet2,
+        cudaStream_t stream, ResourceT& resource, bool pruneCancelledLeaves = false)
 {
     using GridT    = NanoGrid<BuildT>;
     using StateT   = typename LevelSetTracker<BuildT, ValueT, ResourceT>::State;
@@ -429,35 +494,38 @@ intersect(const typename LevelSetTracker<BuildT, ValueT, ResourceT>::State& leve
     if (magnitude == ValueT(0) || magnitude != math::Abs(background2))
         throw std::runtime_error("nanovdb::tools::cuda::csg: the backgrounds must be nonzero and equal in magnitude");
 
-    // The operands as the intersection reads them, and the side the intersection is on at infinity: it is negative
-    // there only if both operands are.
-    const auto operand = [](const StateT& s, ValueT background, bool complement) {
-        const ValueT sign = complement ? ValueT(-1) : ValueT(1);
+    const auto operand = [](const StateT& s, ValueT background) {
         return OperandT{{s.grid.template deviceGrid<BuildT>(), s.phi.data(), s.leafMasks.data(), s.lowerMasks.data(),
                          s.upperMasks.data(), s.rootOrigins.data(), s.rootOrigins.size()},
-                        sign, sign * background < ValueT(0)};
+                        background < ValueT(0)};
     };
-    const OperandT input1 = operand(levelSet1, background1, complement1);
-    const OperandT input2 = operand(levelSet2, background2, complement2);
-    const bool   insideAtInfinity = input1.insideAtInfinity && input2.insideAtInfinity;
-    const ValueT resultSign       = complementResult ? ValueT(-1) : ValueT(1);
-    const ValueT resultBackground = resultSign * (insideAtInfinity ? -magnitude : magnitude);
+    const OperandT input1 = operand(levelSet1, background1);
+    const OperandT input2 = operand(levelSet2, background2);
+
+    // The side of the result at infinity, by the same rule as at any other point.
+    bool insideAtInfinity;
+    switch (operation) {
+    case Operation::Union:        insideAtInfinity = input1.insideAtInfinity || input2.insideAtInfinity; break;
+    case Operation::Intersection: insideAtInfinity = input1.insideAtInfinity && input2.insideAtInfinity; break;
+    default:                      insideAtInfinity = input1.insideAtInfinity && !input2.insideAtInfinity; // Operation::Difference
+    }
+    const ValueT resultBackground = insideAtInfinity ? -magnitude : magnitude;
 
     const uint32_t leafCount1 = TraitsT::getTreeData(input1.grid, stream).mNodeCount[0];
     const uint32_t leafCount2 = TraitsT::getTreeData(input2.grid, stream).mNodeCount[0];
 
-    // 1. The active voxels of each operand that stay active in the result.
+    // 1. The active voxels of each input that stay active in the result.
     BufferT<nanovdb::Mask<3>, ResourceT> retainMasks1(stream, ref, leafCount1, nanovdb::cuda::noInit);
     BufferT<nanovdb::Mask<3>, ResourceT> retainMasks2(stream, ref, leafCount2, nanovdb::cuda::noInit);
     using RetainOp = RetainMaskFunctor<BuildT, ValueT>;
     if (leafCount1) {
         util::cuda::lambdaKernel<<<util::cuda::blocksPerGrid(leafCount1, threadsPerBlock), threadsPerBlock, 0, stream>>>(
-            leafCount1, RetainOp(), input1, input2, retainMasks1.data());
+            leafCount1, RetainOp(), operation, true, pruneCancelledLeaves, input1, input2, retainMasks1.data());
         cudaCheckError();
     }
     if (leafCount2) {
         util::cuda::lambdaKernel<<<util::cuda::blocksPerGrid(leafCount2, threadsPerBlock), threadsPerBlock, 0, stream>>>(
-            leafCount2, RetainOp(), input2, input1, retainMasks2.data());
+            leafCount2, RetainOp(), operation, false, pruneCancelledLeaves, input2, input1, retainMasks2.data());
         cudaCheckError();
     }
 
@@ -472,25 +540,25 @@ intersect(const typename LevelSetTracker<BuildT, ValueT, ResourceT>::State& leve
     BufferT<ValueT, ResourceT> resultPhi(stream, ref, treeData.mVoxelCount + 1, nanovdb::cuda::noInit);
     cudaCheck(cudaMemcpyAsync(resultPhi.data(), &resultBackground, sizeof(ValueT), cudaMemcpyHostToDevice, stream));
     if (leafCount) {
-        using ValuesOp = IntersectionValuesFunctor<BuildT, ValueT>;
+        using ValuesOp = ValuesFunctor<BuildT, ValueT>;
         util::cuda::operatorKernel<ValuesOp><<<leafCount, ValuesOp::MaxThreadsPerBlock, 0, stream>>>(
-            resultGrid, input1, input2, magnitude, resultSign, resultPhi.data());
+            resultGrid, operation, input1, input2, magnitude, resultPhi.data());
         cudaCheckError();
     }
 
-    // 4. The invert masks of the result, level by level. Complementing the result leaves them as they are.
+    // 4. The invert masks of the result, level by level.
     BufferT<nanovdb::Mask<3>, ResourceT> leafMasks(stream, ref, leafCount, nanovdb::cuda::noInit);
     BufferT<nanovdb::Mask<4>, ResourceT> lowerMasks(stream, ref, lowerCount, nanovdb::cuda::noInit);
     BufferT<nanovdb::Mask<5>, ResourceT> upperMasks(stream, ref, upperCount, nanovdb::cuda::noInit);
     if (leafCount) {
         util::cuda::lambdaKernel<<<util::cuda::blocksPerGrid(leafCount, threadsPerBlock), threadsPerBlock, 0, stream>>>(
-            leafCount, InvertMaskFunctor<BuildT, ValueT, 0>(), resultGrid, input1, input2, insideAtInfinity, leafMasks.data());
+            leafCount, InvertMaskFunctor<BuildT, ValueT, 0>(), resultGrid, operation, input1, input2, insideAtInfinity, leafMasks.data());
         cudaCheckError();
         util::cuda::lambdaKernel<<<util::cuda::blocksPerGrid(lowerCount, threadsPerBlock), threadsPerBlock, 0, stream>>>(
-            lowerCount, InvertMaskFunctor<BuildT, ValueT, 1>(), resultGrid, input1, input2, insideAtInfinity, lowerMasks.data());
+            lowerCount, InvertMaskFunctor<BuildT, ValueT, 1>(), resultGrid, operation, input1, input2, insideAtInfinity, lowerMasks.data());
         cudaCheckError();
         util::cuda::lambdaKernel<<<util::cuda::blocksPerGrid(upperCount, threadsPerBlock), threadsPerBlock, 0, stream>>>(
-            upperCount, InvertMaskFunctor<BuildT, ValueT, 2>(), resultGrid, input1, input2, insideAtInfinity, upperMasks.data());
+            upperCount, InvertMaskFunctor<BuildT, ValueT, 2>(), resultGrid, operation, input1, input2, insideAtInfinity, upperMasks.data());
         cudaCheckError();
     }
     cudaCheck(cudaStreamSynchronize(stream));
@@ -498,7 +566,7 @@ intersect(const typename LevelSetTracker<BuildT, ValueT, ResourceT>::State& leve
     // todo: the root origins of the result (section 8.3 of CSG-design.md); empty here.
     return StateT{std::move(resultHandle), std::move(resultPhi), std::move(leafMasks), std::move(lowerMasks),
                   std::move(upperMasks), decltype(levelSet1.rootOrigins)(stream, ref, 0, nanovdb::cuda::noInit)};
-} // intersect
+} // combine
 
 } // namespace csg::detail
 
@@ -679,7 +747,7 @@ csgUnionLeafResolved(const NanoGrid<BuildT>* grid1, const ValueT* phi1, const Na
 // - The inputs are not modified. They must share one index space (the same transform), and their backgrounds must
 //   be equal in magnitude; the signs may differ.
 // - The result is built in one pass from the masks of the inputs: no merged-then-pruned grid, no PropagateSign, no
-//   per-voxel query of the invert state (see csg::detail::intersect).
+//   per-voxel query of the invert state (see csg::detail::combine).
 // - std::runtime_error is thrown if the backgrounds differ in magnitude, or if an input has root-level inverted
 //   regions (root origins), which this draft does not write for the result.
 // - The stream is synchronized before returning.
@@ -698,7 +766,7 @@ csgUnion(const typename LevelSetTracker<BuildT, ValueT, ResourceT>::State& level
          cudaStream_t stream = 0,
          ResourceT& resource = nanovdb::cuda::default_resource<ResourceT>())
 {
-    return csg::detail::intersect<BuildT, ValueT, ResourceT>(levelSet1, true, levelSet2, true, true, stream, resource);
+    return csg::detail::combine<BuildT, ValueT, ResourceT>(csg::detail::Operation::Union, levelSet1, levelSet2, stream, resource);
 }// csgUnion
 
 /// @brief Intersection of two level sets: the maximum of the two at every point of space.
@@ -710,20 +778,27 @@ csgIntersection(const typename LevelSetTracker<BuildT, ValueT, ResourceT>::State
                 cudaStream_t stream = 0,
                 ResourceT& resource = nanovdb::cuda::default_resource<ResourceT>())
 {
-    return csg::detail::intersect<BuildT, ValueT, ResourceT>(levelSet1, false, levelSet2, false, false, stream, resource);
+    return csg::detail::combine<BuildT, ValueT, ResourceT>(csg::detail::Operation::Intersection, levelSet1, levelSet2, stream, resource);
 }// csgIntersection
 
 /// @brief Difference of two level sets, @a levelSet1 minus @a levelSet2: the maximum of the first and the negation
 ///        of the second at every point of space.
 /// @param levelSet1, levelSet2, stream, resource As for csgUnion.
+/// @param pruneCancelledLeaves If true, a leaf over which the two inputs hold the same field (the same active
+///        voxels with the same values, and the same side at every inactive voxel) is left out of the result, as
+///        outside. Without it, where the surfaces of the two inputs coincide the result keeps their band with the
+///        values |f|: active voxels near zero with no surface between them. The counterpart of pruneCancelledTiles
+///        of openvdb::tools::csgDifference, and off by default as it is there.
 template<typename BuildT, typename ValueT, typename ResourceT = nanovdb::cuda::DeviceResource>
 typename LevelSetTracker<BuildT, ValueT, ResourceT>::State
 csgDifference(const typename LevelSetTracker<BuildT, ValueT, ResourceT>::State& levelSet1,
               const typename LevelSetTracker<BuildT, ValueT, ResourceT>::State& levelSet2,
               cudaStream_t stream = 0,
-              ResourceT& resource = nanovdb::cuda::default_resource<ResourceT>())
+              ResourceT& resource = nanovdb::cuda::default_resource<ResourceT>(),
+              bool pruneCancelledLeaves = false)
 {
-    return csg::detail::intersect<BuildT, ValueT, ResourceT>(levelSet1, false, levelSet2, true, false, stream, resource);
+    return csg::detail::combine<BuildT, ValueT, ResourceT>(csg::detail::Operation::Difference, levelSet1, levelSet2, stream, resource,
+                                                         pruneCancelledLeaves);
 }// csgDifference
 
 /// @brief Complement of a level set, in place: every sidecar value is negated, the background in slot 0 included.

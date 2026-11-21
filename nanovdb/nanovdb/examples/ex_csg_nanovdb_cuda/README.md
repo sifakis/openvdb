@@ -75,7 +75,8 @@ backgrounds and each of the three operations:
 - **Structure.** No leaf without an active voxel, no lower or upper node without a child, no invert bit where a
   voxel or a child is stored, and the field at a far point equal to the stored background.
 - **De Morgan.** `1 - 2` against `1 & ~2`, and `1 | 2` against `~(~1 & ~2)`, byte for byte (grid, values and the
-  three levels of invert masks).
+  three levels of invert masks). The header computes each operation by its own rule, so each of these compares
+  two independent computations.
 
 Then 17 identities on three inputs, for all eight sign combinations, each side built independently and compared
 byte for byte: commutativity, idempotence, double complement, associativity, absorption, distributivity, De
@@ -85,6 +86,19 @@ empty, are left out: inside the band `max(f, -f)` is `|f|`. Empty level sets as 
 With band files, the rule and structure checks run at five translations of the second mesh along +z, from one leaf
 beyond the first mesh to no translation, and the identities run on the three meshes. The translations follow from
 the bounding boxes of the bands, so any meshes and resolutions work.
+
+## Coinciding surfaces and `pruneCancelledLeaves`
+
+Where the surfaces of the two inputs of a difference coincide, the result keeps their band with the values
+`max(f, -f) = |f|`: active voxels near zero, none negative, with no surface between them. `A - A` is the empty
+set, stored as the whole band of `A` with positive values. `openvdb::tools::csgDifference` does the same by
+default.
+
+`csgDifference(levelSet1, levelSet2, stream, resource, /*pruneCancelledLeaves=*/true)` leaves out every leaf over
+which the two inputs hold the same field (the same active voxels with the same values, and the same side at every
+inactive voxel). `A - A` then has no voxel. It is the counterpart of the `pruneCancelledTiles` argument of the
+OpenVDB function, and off by default as it is there. It acts on whole leaves only: a leaf that the two inputs
+share with fields that differ in one voxel is kept.
 
 ## Notes
 

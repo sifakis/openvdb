@@ -9,6 +9,7 @@ Sections:
 
 - [City flood scene](#city-flood-scene)
 - [Constructive solid geometry](#constructive-solid-geometry)
+- [Mean curvature flow](#mean-curvature-flow)
 
 ## City flood scene
 
@@ -290,3 +291,121 @@ bands, prunes them and reruns `PropagateSign`.
 All of the above was run from this branch on the laptop: the tests and the two viewer programs with the binaries
 of the CMake build, the comparison with the binaries of `openvdb_comparison/build.sh`. The band files were made by
 this branch's `mesh_to_band`.
+
+## Mean curvature flow
+
+The Stanford dragon's level set moves by mean curvature with its volume preserved: the scales, the horns and the
+legs go first, the loop of the tail closes, and the body ends as a sphere of the dragon's volume. Every step is a
+curvature update on the GPU followed by `LevelSetTracker::track()`; the level set is made by `MeshToSDF`.
+
+| | |
+|---|---|
+| Code | `nanovdb/nanovdb/examples/ex_mean_curvature_flow_cuda/` (its `README.md` describes the method, the files, the checks and the method's limits) |
+| Result | `output/flow/movie.mp4`: 361 frames, 1920 x 1080, 24 frames per second, 15 s |
+| Hardware of everything below | NVIDIA RTX PRO 3000 Blackwell laptop GPU (12 GB), Intel Core Ultra 7 265H (16 threads) |
+| Simulation | 60,000 steps in 14.7 min (15.2 min with writing the frames) |
+| Rendering | about 10.6 s per frame, 64 min, while other programs used the same GPU |
+
+### Mesh to download
+
+| Mesh | Triangles | Link |
+|---|---|---|
+| `dragon.obj` | 871,306 | the Stanford dragon as an OBJ file with 435,545 vertices (SHA-256 `aaf8d5b5196a821625f3e6b375366d61983ad66f41ab90c722f4268ced32ca3d`); its download link was not recorded |
+
+Any closed mesh works; the numbers below are those of this file.
+
+### Requirements
+
+| | Needed | Used |
+|---|---|---|
+| GPU, simulation | 1 GB at resolution 512 (the flow's process peaked at 414 MiB, sampled every 50 ms) | RTX PRO 3000 Blackwell, 12 GB, driver 580.178.04 |
+| GPU, rendering | an RTX GPU supported by ovrtx | the same |
+| Disk | 9 GB: frames 3.8 GB, meshes 5.0 GB, images 0.14 GB | |
+| CUDA toolkit | 12.0 or newer | 12.0 |
+| CCCL | a checkout of https://github.com/NVIDIA/cccl, if the toolkit's Thrust has no `<cuda/std/...>` headers | v3.4.2 |
+| OpenVDB | an installation, for `mesh_band` (rendering) and `verify` | 13.0.1 |
+| Python | `ovrtx`, `ovstage`, `usd-core`, `numpy`, `Pillow`, for rendering | Python 3.12.3, ovrtx 0.5.1, ovstage 0.2.1, usd-core 26.8, numpy 2.5.3, Pillow 12.3.0 |
+| ffmpeg | for the movie | 6.1.1 |
+
+### Steps
+
+All commands run in `nanovdb/nanovdb/examples/ex_mean_curvature_flow_cuda/`.
+
+```
+CCCL=<cccl checkout> OPENVDB_ROOT=<OpenVDB installation> ./build.sh
+export RENDER_PYTHON=<python with the packages above>
+./make_movie.sh dragon.obj         # level set, 60000 steps, 361 frames, meshes, images -> output/flow/movie.mp4
+bin/verify                         # the checks against OpenVDB and exact solutions
+```
+
+With CUDA 12.0 and GCC 13.3, nvcc stops in the host compiler's AMX headers when it compiles `verify.cu` with OpenVDB;
+`build.sh`'s header gives the `EXTRA_FLAGS` that avoid it.
+
+### Settings
+
+`make_movie.sh` with only the mesh uses exactly these.
+
+| | |
+|---|---|
+| Level set (`mesh_to_sdf_file`) | 512 voxels along the mesh's longest side (voxel size 0.00195312), band of 5 voxels on either side |
+| Flow (`mean_curvature_flow`) | volume-preserving, 60,000 steps, time step `dx^2 / 3` |
+| Frames | 361; frame k after `round(60000 (k / 360)^3)` steps, so frames 0 to 10 are at step 0 or 1 |
+| Tracker | `LevelSetTracker` defaults: HJ-WENO5, TVD-RK2, 3 renormalization steps per `track()` |
+| Image | 1920 x 1080, path tracing, 64 samples per pixel, denoiser on, at most 8 bounces |
+| Camera | fixed, focal length 50 mm on a 36 mm aperture, 2.2 m from the middle of the first frame (scaled to 1 m along its longest side), from direction (1, 0.35, 0.6) in the mesh's axes, y up |
+| Look | body color (0.08, 0.42, 0.38), roughness 0.22; floor (0.78, 0.76, 0.72); three rect lights and a dome of intensity 450 |
+| Movie | ffmpeg, libx264, crf 17, 24 frames per second |
+
+### Numbers
+
+`output/flow/sdf.txt`: 4,511,290 active voxels, 2,073,699 of them negative.
+
+From `output/flow/run.log` (area and volume in voxels, from the band alone; the average curvature in 1 / voxel):
+
+| Frame | Step | Active voxels | Area | Volume against the start | Average curvature | Time per step |
+|---|---|---|---|---|---|---|
+| 0 | 0 | 4,511,290 | 451,238.0 | | | |
+| 60 | 278 | 3,780,674 | 377,096.3 | -0.014% | 0.013111 | 23.4 ms |
+| 120 | 2,222 | 3,064,057 | 305,794.7 | -0.030% | 0.011077 | 20.4 ms |
+| 180 | 7,500 | 2,548,340 | 254,251.4 | -0.048% | 0.009428 | 17.0 ms |
+| 240 | 17,778 | 2,096,000 | 209,160.6 | -0.069% | 0.008444 | 14.5 ms |
+| 300 | 34,722 | 1,910,888 | 190,651.2 | -0.092% | 0.008278 | 13.6 ms |
+| 360 | 60,000 | 1,858,057 | 185,330.0 | -0.115% | 0.008253 | 13.3 ms |
+
+The starting volume is 7,464,446.7 voxels. The sphere of that volume has radius 121.24 voxels, area 184,707 and
+curvature 0.008248, which the last frame approaches.
+
+`bin/verify` printed (radius 30 voxels, band of 5 voxels):
+
+| Check | Result |
+|---|---|
+| One update against `openvdb::math::CurvatureStencil::meanCurvatureNormGrad()` | largest difference 4.768e-07 voxel on a sphere and on two merged spheres |
+| Sphere after 1013 steps, exact radius 14.9889 voxels | 14.9927 (OpenVDB's filter: 14.9894) |
+| Two merged spheres after 1350 steps against OpenVDB's filter | largest difference 0.0067 voxel, rms 0.0039 |
+| Volume-preserving, sphere after 1000 steps | radius 29.99295 voxels |
+| Volume-preserving, two merged spheres after 5400 steps | volume -0.1891%, area 18045.3 -> 16674.4 |
+
+With a band of 3 voxels (`bin/verify 30 1 3`) the sphere's radius after 1013 steps is 14.8896 voxels and two merged
+spheres lose 2.3643% of their volume; that is why the band is 5 voxels.
+
+### How closely a reproduction matches
+
+- **The level set and the first 278 steps of the flow were the same byte for byte** between two runs on this GPU
+  (the level set file, and the frame file after 278 steps). Whether a whole run is was not checked.
+- **`verify` was run once from this branch.** The numbers of its GPU side equal those of the development version's
+  checks; OpenVDB's filter runs on CPU threads, and its numbers are from that one run.
+- **The times are not deterministic**, and the rendering time above includes other use of the GPU.
+
+### How this branch's copy was checked
+
+The movie's run was made with development copies of these files, before they were cleaned up for this branch: the
+same curvature kernel and driver, with the new values written by a Thrust call that this branch replaces with a
+kernel of its own. From this branch, on the laptop:
+
+- `build.sh` builds the four programs.
+- `bin/mesh_to_sdf_file` on the dragon at 512: the file is identical to the one the movie's run started from.
+- `bin/mean_curvature_flow` for 278 steps: the frame file is identical to frame 60 of the movie's run.
+- `bin/verify`: the numbers above; they equal those of the development version's checks.
+- `make_movie.sh` at resolution 128 with 8 frames, from the mesh to the movie.
+
+The 60,000-step run and its 361 images were not repeated from this branch.

@@ -88,7 +88,7 @@ The dragon at resolution 512, volume-preserving, 60000 steps (`./make_movie.sh d
 |---|---|
 | Active voxels | 4,511,290 at the start, 1,858,057 at the end |
 | Time | 14.7 minutes for the steps, 23 ms per step at the start and 13 ms at the end |
-| Area | 451,238 -> 185,330 voxels^2; the sphere of the same volume has 184,747 |
+| Area | 451,238 -> 185,330 voxels^2; the sphere of the same volume has 184,707 |
 | Volume | -0.115% over the run |
 
 `bin/mean_curvature_flow` gave the same frame files, byte for byte, in two runs of the first 278 steps.

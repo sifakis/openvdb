@@ -1,0 +1,285 @@
+=== dragon, armadillo moved by 205 along axis 2 ===
+nanovdb input 1      active 496764 leaves 2436
+nanovdb input 2      active 466322 leaves 2407
+nanovdb 1 | 2        active 963086 leaves 4843
+nanovdb 1 & 2        active 0 leaves 0
+nanovdb 1 - 2        active 496764 leaves 2436
+nanovdb 1 - 2 pruned active 496764 leaves 2436
+input 1                        openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+input 2                        openvdb active     466322, nanovdb active     466322 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  prune=false             openvdb active     963086, nanovdb active     963086 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  prune=false             openvdb active          0, nanovdb active          0 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  prune=false             openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  defaults                openvdb active     963086, nanovdb active     963086 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  defaults                openvdb active          0, nanovdb active          0 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  defaults                openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  pruneCancelledTiles     openvdb active     963086, nanovdb active     963086 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  pruneCancelledTiles     openvdb active          0, nanovdb active          0 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  pruneCancelledTiles     openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+IDENTICAL
+=== dragon, armadillo moved by 117 along axis 2 ===
+nanovdb input 1      active 496764 leaves 2436
+nanovdb input 2      active 466322 leaves 2407
+nanovdb 1 | 2        active 922751 leaves 4587
+nanovdb 1 & 2        active 40335 leaves 238
+nanovdb 1 - 2        active 483381 leaves 2377
+nanovdb 1 - 2 pruned active 483381 leaves 2377
+input 1                        openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+input 2                        openvdb active     466322, nanovdb active     466322 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  prune=false             openvdb active     922751, nanovdb active     922751 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  prune=false             openvdb active      40335, nanovdb active      40335 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  prune=false             openvdb active     483381, nanovdb active     483381 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  defaults                openvdb active     922751, nanovdb active     922751 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  defaults                openvdb active      40335, nanovdb active      40335 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  defaults                openvdb active     483381, nanovdb active     483381 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  pruneCancelledTiles     openvdb active     922751, nanovdb active     922751 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  pruneCancelledTiles     openvdb active      40335, nanovdb active      40335 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  pruneCancelledTiles     openvdb active     483381, nanovdb active     483381 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+IDENTICAL
+=== dragon, armadillo moved by 58 along axis 2 ===
+nanovdb input 1      active 496764 leaves 2436
+nanovdb input 2      active 466322 leaves 2413
+nanovdb 1 | 2        active 849236 leaves 4190
+nanovdb 1 & 2        active 113850 leaves 625
+nanovdb 1 - 2        active 469892 leaves 2301
+nanovdb 1 - 2 pruned active 469892 leaves 2301
+input 1                        openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+input 2                        openvdb active     466322, nanovdb active     466322 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  prune=false             openvdb active     849236, nanovdb active     849236 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  prune=false             openvdb active     113850, nanovdb active     113850 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  prune=false             openvdb active     469892, nanovdb active     469892 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  defaults                openvdb active     849236, nanovdb active     849236 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  defaults                openvdb active     113850, nanovdb active     113850 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  defaults                openvdb active     469892, nanovdb active     469892 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  pruneCancelledTiles     openvdb active     849236, nanovdb active     849236 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  pruneCancelledTiles     openvdb active     113850, nanovdb active     113850 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  pruneCancelledTiles     openvdb active     469892, nanovdb active     469892 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+IDENTICAL
+=== dragon, armadillo moved by 20 along axis 2 ===
+nanovdb input 1      active 496764 leaves 2436
+nanovdb input 2      active 466322 leaves 2400
+nanovdb 1 | 2        active 848288 leaves 4151
+nanovdb 1 & 2        active 114798 leaves 637
+nanovdb 1 - 2        active 468140 leaves 2302
+nanovdb 1 - 2 pruned active 468140 leaves 2302
+input 1                        openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+input 2                        openvdb active     466322, nanovdb active     466322 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  prune=false             openvdb active     848288, nanovdb active     848288 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  prune=false             openvdb active     114798, nanovdb active     114798 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  prune=false             openvdb active     468140, nanovdb active     468140 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  defaults                openvdb active     848288, nanovdb active     848288 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  defaults                openvdb active     114798, nanovdb active     114798 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  defaults                openvdb active     468140, nanovdb active     468140 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  pruneCancelledTiles     openvdb active     848288, nanovdb active     848288 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  pruneCancelledTiles     openvdb active     114798, nanovdb active     114798 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  pruneCancelledTiles     openvdb active     468140, nanovdb active     468140 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+IDENTICAL
+=== dragon, armadillo moved by 0 along axis 2 ===
+nanovdb input 1      active 496764 leaves 2436
+nanovdb input 2      active 466322 leaves 2410
+nanovdb 1 | 2        active 816091 leaves 4022
+nanovdb 1 & 2        active 146995 leaves 791
+nanovdb 1 - 2        active 463505 leaves 2251
+nanovdb 1 - 2 pruned active 463505 leaves 2251
+input 1                        openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+input 2                        openvdb active     466322, nanovdb active     466322 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  prune=false             openvdb active     816091, nanovdb active     816091 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  prune=false             openvdb active     146995, nanovdb active     146995 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  prune=false             openvdb active     463505, nanovdb active     463505 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  defaults                openvdb active     816091, nanovdb active     816091 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  defaults                openvdb active     146995, nanovdb active     146995 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  defaults                openvdb active     463505, nanovdb active     463505 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  pruneCancelledTiles     openvdb active     816091, nanovdb active     816091 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  pruneCancelledTiles     openvdb active     146995, nanovdb active     146995 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  pruneCancelledTiles     openvdb active     463505, nanovdb active     463505 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+IDENTICAL
+=== bunny, armadillo moved by 60 along axis 0 ===
+nanovdb input 1      active 681590 leaves 3525
+nanovdb input 2      active 466322 leaves 2402
+nanovdb 1 | 2        active 1037496 leaves 5273
+nanovdb 1 & 2        active 110416 leaves 610
+nanovdb 1 - 2        active 729613 leaves 3745
+nanovdb 1 - 2 pruned active 729613 leaves 3745
+input 1                        openvdb active     681590, nanovdb active     681590 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+input 2                        openvdb active     466322, nanovdb active     466322 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  prune=false             openvdb active    1037496, nanovdb active    1037496 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  prune=false             openvdb active     110416, nanovdb active     110416 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  prune=false             openvdb active     729613, nanovdb active     729613 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  defaults                openvdb active    1037496, nanovdb active    1037496 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  defaults                openvdb active     110416, nanovdb active     110416 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  defaults                openvdb active     729613, nanovdb active     729613 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  pruneCancelledTiles     openvdb active    1037496, nanovdb active    1037496 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  pruneCancelledTiles     openvdb active     110416, nanovdb active     110416 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  pruneCancelledTiles     openvdb active     729613, nanovdb active     729613 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+IDENTICAL
+=== bunny, armadillo moved by 25 along axis 0 ===
+nanovdb input 1      active 681590 leaves 3525
+nanovdb input 2      active 466322 leaves 2402
+nanovdb 1 | 2        active 947183 leaves 4778
+nanovdb 1 & 2        active 200729 leaves 1092
+nanovdb 1 - 2        active 739885 leaves 3799
+nanovdb 1 - 2 pruned active 739885 leaves 3799
+input 1                        openvdb active     681590, nanovdb active     681590 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+input 2                        openvdb active     466322, nanovdb active     466322 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  prune=false             openvdb active     947183, nanovdb active     947183 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  prune=false             openvdb active     200729, nanovdb active     200729 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  prune=false             openvdb active     739885, nanovdb active     739885 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  defaults                openvdb active     947183, nanovdb active     947183 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  defaults                openvdb active     200729, nanovdb active     200729 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  defaults                openvdb active     739885, nanovdb active     739885 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  pruneCancelledTiles     openvdb active     947183, nanovdb active     947183 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  pruneCancelledTiles     openvdb active     200729, nanovdb active     200729 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  pruneCancelledTiles     openvdb active     739885, nanovdb active     739885 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+IDENTICAL
+=== bunny, armadillo moved by 0 along axis 0 ===
+nanovdb input 1      active 681590 leaves 3525
+nanovdb input 2      active 466322 leaves 2410
+nanovdb 1 | 2        active 900652 leaves 4607
+nanovdb 1 & 2        active 247260 leaves 1293
+nanovdb 1 - 2        active 754113 leaves 3851
+nanovdb 1 - 2 pruned active 754113 leaves 3851
+input 1                        openvdb active     681590, nanovdb active     681590 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+input 2                        openvdb active     466322, nanovdb active     466322 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  prune=false             openvdb active     900652, nanovdb active     900652 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  prune=false             openvdb active     247260, nanovdb active     247260 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  prune=false             openvdb active     754113, nanovdb active     754113 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  defaults                openvdb active     900652, nanovdb active     900652 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  defaults                openvdb active     247260, nanovdb active     247260 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  defaults                openvdb active     754113, nanovdb active     754113 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  pruneCancelledTiles     openvdb active     900652, nanovdb active     900652 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  pruneCancelledTiles     openvdb active     247260, nanovdb active     247260 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  pruneCancelledTiles     openvdb active     754113, nanovdb active     754113 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+IDENTICAL
+=== armadillo, dragon moved by 30 along axis 1 ===
+nanovdb input 1      active 466322 leaves 2410
+nanovdb input 2      active 496764 leaves 2496
+nanovdb 1 | 2        active 764898 leaves 3857
+nanovdb 1 & 2        active 198188 leaves 1014
+nanovdb 1 - 2        active 508683 leaves 2564
+nanovdb 1 - 2 pruned active 508683 leaves 2564
+input 1                        openvdb active     466322, nanovdb active     466322 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+input 2                        openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  prune=false             openvdb active     764898, nanovdb active     764898 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  prune=false             openvdb active     198188, nanovdb active     198188 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  prune=false             openvdb active     508683, nanovdb active     508683 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  defaults                openvdb active     764898, nanovdb active     764898 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  defaults                openvdb active     198188, nanovdb active     198188 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  defaults                openvdb active     508683, nanovdb active     508683 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  pruneCancelledTiles     openvdb active     764898, nanovdb active     764898 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  pruneCancelledTiles     openvdb active     198188, nanovdb active     198188 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  pruneCancelledTiles     openvdb active     508683, nanovdb active     508683 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+IDENTICAL
+=== bunny, bunny moved by 1 along axis 2 ===
+nanovdb input 1      active 681590 leaves 3525
+nanovdb input 2      active 681590 leaves 3521
+nanovdb 1 | 2        active 687418 leaves 3567
+nanovdb 1 & 2        active 675762 leaves 3477
+nanovdb 1 - 2        active 681590 leaves 3523
+nanovdb 1 - 2 pruned active 681590 leaves 3523
+input 1                        openvdb active     681590, nanovdb active     681590 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+input 2                        openvdb active     681590, nanovdb active     681590 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  prune=false             openvdb active     687418, nanovdb active     687418 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  prune=false             openvdb active     675762, nanovdb active     675762 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  prune=false             openvdb active     681590, nanovdb active     681590 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  defaults                openvdb active     687418, nanovdb active     687418 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  defaults                openvdb active     675762, nanovdb active     675762 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  defaults                openvdb active     681590, nanovdb active     681590 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  pruneCancelledTiles     openvdb active     687418, nanovdb active     687418 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  pruneCancelledTiles     openvdb active     675762, nanovdb active     675762 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  pruneCancelledTiles     openvdb active     681590, nanovdb active     681590 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+IDENTICAL
+=== bunny, bunny moved by 0 along axis 0 ===
+nanovdb input 1      active 681590 leaves 3525
+nanovdb input 2      active 681590 leaves 3525
+nanovdb 1 | 2        active 681590 leaves 3525
+nanovdb 1 & 2        active 681590 leaves 3525
+nanovdb 1 - 2        active 681590 leaves 3525
+nanovdb 1 - 2 pruned active 0 leaves 0
+input 1                        openvdb active     681590, nanovdb active     681590 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+input 2                        openvdb active     681590, nanovdb active     681590 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  prune=false             openvdb active     681590, nanovdb active     681590 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  prune=false             openvdb active     681590, nanovdb active     681590 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  prune=false             openvdb active     681590, nanovdb active     681590 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  defaults                openvdb active     681590, nanovdb active     681590 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  defaults                openvdb active     681590, nanovdb active     681590 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  defaults                openvdb active     681590, nanovdb active     681590 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  pruneCancelledTiles     openvdb active     681590, nanovdb active     681590 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  pruneCancelledTiles     openvdb active     681590, nanovdb active     681590 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  pruneCancelledTiles     openvdb active          0, nanovdb active          0 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+IDENTICAL
+=== armadillo, armadillo moved by 0 along axis 2 ===
+nanovdb input 1      active 466322 leaves 2410
+nanovdb input 2      active 466322 leaves 2410
+nanovdb 1 | 2        active 466322 leaves 2410
+nanovdb 1 & 2        active 466322 leaves 2410
+nanovdb 1 - 2        active 466322 leaves 2410
+nanovdb 1 - 2 pruned active 0 leaves 0
+input 1                        openvdb active     466322, nanovdb active     466322 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+input 2                        openvdb active     466322, nanovdb active     466322 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  prune=false             openvdb active     466322, nanovdb active     466322 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  prune=false             openvdb active     466322, nanovdb active     466322 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  prune=false             openvdb active     466322, nanovdb active     466322 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  defaults                openvdb active     466322, nanovdb active     466322 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  defaults                openvdb active     466322, nanovdb active     466322 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  defaults                openvdb active     466322, nanovdb active     466322 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  pruneCancelledTiles     openvdb active     466322, nanovdb active     466322 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  pruneCancelledTiles     openvdb active     466322, nanovdb active     466322 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  pruneCancelledTiles     openvdb active          0, nanovdb active          0 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+IDENTICAL
+=== dragon, dragon moved by 0 along axis 2 ===
+nanovdb input 1      active 496764 leaves 2436
+nanovdb input 2      active 496764 leaves 2436
+nanovdb 1 | 2        active 496764 leaves 2436
+nanovdb 1 & 2        active 496764 leaves 2436
+nanovdb 1 - 2        active 496764 leaves 2436
+nanovdb 1 - 2 pruned active 0 leaves 0
+input 1                        openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+input 2                        openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  prune=false             openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  prune=false             openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  prune=false             openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  defaults                openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  defaults                openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  defaults                openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  pruneCancelledTiles     openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  pruneCancelledTiles     openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  pruneCancelledTiles     openvdb active          0, nanovdb active          0 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+IDENTICAL
+=== dragon, dragon_or_armadillo moved by 0 along axis 2 ===
+nanovdb input 1      active 496764 leaves 2436
+nanovdb input 2      active 849236 leaves 4190
+nanovdb 1 | 2        active 849236 leaves 4190
+nanovdb 1 & 2        active 496764 leaves 2436
+nanovdb 1 - 2        active 441667 leaves 2228
+nanovdb 1 - 2 pruned active 47384 leaves 306
+input 1                        openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+input 2                        openvdb active     849236, nanovdb active     849236 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  prune=false             openvdb active     849236, nanovdb active     849236 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  prune=false             openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  prune=false             openvdb active     441667, nanovdb active     441667 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  defaults                openvdb active     849236, nanovdb active     849236 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  defaults                openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  defaults                openvdb active     441667, nanovdb active     441667 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  pruneCancelledTiles     openvdb active     849236, nanovdb active     849236 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  pruneCancelledTiles     openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  pruneCancelledTiles     openvdb active      47384, nanovdb active      47384 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+IDENTICAL
+=== dragon_or_armadillo, dragon moved by 0 along axis 2 ===
+nanovdb input 1      active 849236 leaves 4190
+nanovdb input 2      active 496764 leaves 2436
+nanovdb 1 | 2        active 849236 leaves 4190
+nanovdb 1 & 2        active 496764 leaves 2436
+nanovdb 1 - 2        active 904333 leaves 4357
+nanovdb 1 - 2 pruned active 510050 leaves 2435
+input 1                        openvdb active     849236, nanovdb active     849236 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+input 2                        openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  prune=false             openvdb active     849236, nanovdb active     849236 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  prune=false             openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  prune=false             openvdb active     904333, nanovdb active     904333 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  defaults                openvdb active     849236, nanovdb active     849236 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  defaults                openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  defaults                openvdb active     904333, nanovdb active     904333 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 | 2  pruneCancelledTiles     openvdb active     849236, nanovdb active     849236 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 & 2  pruneCancelledTiles     openvdb active     496764, nanovdb active     496764 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+1 - 2  pruneCancelledTiles     openvdb active     510050, nanovdb active     510050 | value differs 0, sign differs 0 | active only in nanovdb 0, only in openvdb 0
+IDENTICAL

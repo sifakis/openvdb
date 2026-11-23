@@ -1,0 +1,141 @@
+NVIDIA RTX PRO 3000 Blackwell Generation Laptop GPU, 580.178.04
+=== dragon and armadillo at 220, armadillo moved by 58 along z ===
+nanovdb | 1 | 2                 | min     1.636 | median     1.659 | max     1.778 | active 849236
+nanovdb | 1 | 2 PropagateSign   | min     2.439 | median     2.477 | max     2.722 | active 849236
+nanovdb | 1 & 2                 | min     1.553 | median     1.572 | max     1.641 | active 113850
+nanovdb | 1 - 2                 | min     1.589 | median     1.607 | max     1.723 | active 469892
+nanovdb | 1 - 2 pruned          | min     1.586 | median     1.605 | max     1.738 | active 469892
+        steps, ms per call: setup 0.031 | 1 retain masks 0.018 | 2 topology 1.759 | 3 values 0.093 | 4 invert masks 0.118
+        topology, parts: root 0.719 | internal mask buffers 0.320 | stamp leaves 0.017 | count nodes 0.061 | buffer 0.013 | grid, upper, lower 0.353 | leaf masks 0.017 | leaf offsets, bbox, finish 0.042
+        steps, ms per call: setup 0.029 | 1 retain masks 0.018 | 2 topology 1.747 | 3 values 0.031 | 4 invert masks 0.110
+        topology, parts: root 0.664 | internal mask buffers 0.317 | stamp leaves 0.017 | count nodes 0.061 | buffer 0.013 | grid, upper, lower 0.379 | leaf masks 0.018 | leaf offsets, bbox, finish 0.040
+        steps, ms per call: setup 0.029 | 1 retain masks 0.018 | 2 topology 1.838 | 3 values 0.061 | 4 invert masks 0.109
+        topology, parts: root 0.695 | internal mask buffers 0.317 | stamp leaves 0.018 | count nodes 0.065 | buffer 0.014 | grid, upper, lower 0.427 | leaf masks 0.020 | leaf offsets, bbox, finish 0.042
+        steps, ms per call: setup 0.026 | 1 retain masks 0.017 | 2 topology 1.735 | 3 values 0.060 | 4 invert masks 0.109
+        topology, parts: root 0.622 | internal mask buffers 0.308 | stamp leaves 0.017 | count nodes 0.060 | buffer 0.012 | grid, upper, lower 0.435 | leaf masks 0.021 | leaf offsets, bbox, finish 0.043
+openvdb threads 16, input 1 active 496764, input 2 active 466322
+openvdb | 1 | 2 in place, prune=false          | min     0.361 | median     0.641 | max     0.755 | active 849236
+openvdb | 1 & 2 in place, prune=false          | min     0.386 | median     0.592 | max     0.688 | active 113850
+openvdb | 1 - 2 in place, prune=false          | min     0.274 | median     0.478 | max     0.642 | active 469892
+openvdb | 1 | 2 in place, defaults             | min     0.392 | median     0.471 | max     0.639 | active 849236
+openvdb | 1 & 2 in place, defaults             | min     0.444 | median     0.557 | max     0.731 | active 113850
+openvdb | 1 - 2 in place, defaults             | min     0.300 | median     0.383 | max     0.928 | active 469892
+openvdb | 1 | 2 in place, pruneCancelledTiles  | min     0.406 | median     0.461 | max     0.787 | active 849236
+openvdb | 1 & 2 in place, pruneCancelledTiles  | min     0.415 | median     0.483 | max     1.528 | active 113850
+openvdb | 1 - 2 in place, pruneCancelledTiles  | min     0.331 | median     0.390 | max     0.570 | active 469892
+openvdb | 1 | 2 copy                           | min     1.710 | median     2.277 | max     3.191 | active 849236
+openvdb | 1 & 2 copy                           | min     0.926 | median     1.342 | max     4.022 | active 113850
+openvdb | 1 - 2 copy                           | min     1.388 | median     1.643 | max     3.401 | active 469892
+=== dragon and armadillo at 1024, armadillo moved by 265 along z ===
+nanovdb | 1 | 2                 | min     4.478 | median     4.503 | max     4.599 | active 18544820
+nanovdb | 1 | 2 PropagateSign   | min     7.145 | median     8.307 | max     8.815 | active 18544820
+nanovdb | 1 & 2                 | min     1.915 | median     1.940 | max     1.988 | active 2468374
+nanovdb | 1 - 2                 | min     2.850 | median     3.007 | max     3.089 | active 10279575
+nanovdb | 1 - 2 pruned          | min     2.837 | median     3.003 | max     3.064 | active 10279575
+        steps, ms per call: setup 0.030 | 1 retain masks 0.068 | 2 topology 2.023 | 3 values 2.212 | 4 invert masks 0.240
+        topology, parts: root 0.486 | internal mask buffers 0.362 | stamp leaves 0.098 | count nodes 0.076 | buffer 0.033 | grid, upper, lower 0.475 | leaf masks 0.134 | leaf offsets, bbox, finish 0.153
+        steps, ms per call: setup 0.029 | 1 retain masks 0.050 | 2 topology 1.572 | 3 values 0.255 | 4 invert masks 0.122
+        topology, parts: root 0.483 | internal mask buffers 0.323 | stamp leaves 0.053 | count nodes 0.062 | buffer 0.014 | grid, upper, lower 0.357 | leaf masks 0.026 | leaf offsets, bbox, finish 0.055
+        steps, ms per call: setup 0.031 | 1 retain masks 0.064 | 2 topology 1.734 | 3 values 1.088 | 4 invert masks 0.156
+        topology, parts: root 0.487 | internal mask buffers 0.328 | stamp leaves 0.071 | count nodes 0.070 | buffer 0.021 | grid, upper, lower 0.394 | leaf masks 0.073 | leaf offsets, bbox, finish 0.092
+        steps, ms per call: setup 0.029 | 1 retain masks 0.065 | 2 topology 1.837 | 3 values 1.090 | 4 invert masks 0.156
+        topology, parts: root 0.553 | internal mask buffers 0.320 | stamp leaves 0.071 | count nodes 0.070 | buffer 0.021 | grid, upper, lower 0.390 | leaf masks 0.063 | leaf offsets, bbox, finish 0.088
+openvdb threads 16, input 1 active 10874985, input 2 active 10138209
+openvdb | 1 | 2 in place, prune=false          | min     1.249 | median     1.549 | max     2.301 | active 18544820
+openvdb | 1 & 2 in place, prune=false          | min     4.234 | median     5.390 | max     6.153 | active 2468374
+openvdb | 1 - 2 in place, prune=false          | min     1.258 | median     1.435 | max     6.282 | active 10279575
+openvdb | 1 | 2 in place, defaults             | min     1.501 | median     1.849 | max     2.792 | active 18544820
+openvdb | 1 & 2 in place, defaults             | min     4.483 | median     5.431 | max     6.860 | active 2468374
+openvdb | 1 - 2 in place, defaults             | min     1.296 | median     1.573 | max     2.015 | active 10279575
+openvdb | 1 | 2 in place, pruneCancelledTiles  | min     1.565 | median     1.726 | max     1.981 | active 18544820
+openvdb | 1 & 2 in place, pruneCancelledTiles  | min     3.667 | median     5.399 | max     7.785 | active 2468374
+openvdb | 1 - 2 in place, pruneCancelledTiles  | min     1.263 | median     1.515 | max     2.127 | active 10279575
+openvdb | 1 | 2 copy                           | min     9.426 | median    10.261 | max    11.335 | active 18544820
+openvdb | 1 & 2 copy                           | min     1.964 | median     2.697 | max     3.722 | active 2468374
+openvdb | 1 - 2 copy                           | min     5.591 | median     6.725 | max     8.496 | active 10279575
+=== dragon and armadillo at 2048, armadillo moved by 530 along z ===
+nanovdb | 1 | 2                 | min    14.989 | median    15.138 | max    15.262 | active 74205001
+nanovdb | 1 | 2 PropagateSign   | min    28.019 | median    28.475 | max    29.344 | active 74205001
+nanovdb | 1 & 2                 | min     3.124 | median     3.267 | max     3.377 | active 9869181
+nanovdb | 1 - 2                 | min     8.087 | median     8.178 | max     8.347 | active 41119229
+nanovdb | 1 - 2 pruned          | min     7.659 | median     8.176 | max     8.302 | active 41119229
+        steps, ms per call: setup 0.042 | 1 retain masks 0.269 | 2 topology 4.171 | 3 values 9.751 | 4 invert masks 0.621
+        topology, parts: root 0.685 | internal mask buffers 0.393 | stamp leaves 0.295 | count nodes 0.084 | buffer 0.342 | grid, upper, lower 0.635 | leaf masks 0.860 | leaf offsets, bbox, finish 0.613
+        steps, ms per call: setup 0.030 | 1 retain masks 0.191 | 2 topology 1.932 | 3 values 1.129 | 4 invert masks 0.161
+        topology, parts: root 0.523 | internal mask buffers 0.326 | stamp leaves 0.163 | count nodes 0.067 | buffer 0.021 | grid, upper, lower 0.303 | leaf masks 0.165 | leaf offsets, bbox, finish 0.090
+        steps, ms per call: setup 0.037 | 1 retain masks 0.201 | 2 topology 3.000 | 3 values 4.732 | 4 invert masks 0.353
+        topology, parts: root 0.683 | internal mask buffers 0.350 | stamp leaves 0.221 | count nodes 0.078 | buffer 0.126 | grid, upper, lower 0.480 | leaf masks 0.506 | leaf offsets, bbox, finish 0.274
+        steps, ms per call: setup 0.038 | 1 retain masks 0.209 | 2 topology 3.042 | 3 values 4.740 | 4 invert masks 0.389
+        topology, parts: root 0.724 | internal mask buffers 0.347 | stamp leaves 0.224 | count nodes 0.076 | buffer 0.112 | grid, upper, lower 0.417 | leaf masks 0.508 | leaf offsets, bbox, finish 0.278
+openvdb threads 16, input 1 active 43507506, input 2 active 40566676
+openvdb | 1 | 2 in place, prune=false          | min     3.837 | median     4.370 | max     7.333 | active 74205001
+openvdb | 1 & 2 in place, prune=false          | min    17.667 | median    22.543 | max    27.386 | active 9869181
+openvdb | 1 - 2 in place, prune=false          | min     4.110 | median     4.600 | max     5.720 | active 41119229
+openvdb | 1 | 2 in place, defaults             | min     4.957 | median     5.445 | max     6.187 | active 74205001
+openvdb | 1 & 2 in place, defaults             | min    19.594 | median    23.574 | max    27.798 | active 9869181
+openvdb | 1 - 2 in place, defaults             | min     4.903 | median     5.473 | max     6.208 | active 41119229
+openvdb | 1 | 2 in place, pruneCancelledTiles  | min     5.056 | median     5.764 | max     6.477 | active 74205001
+openvdb | 1 & 2 in place, pruneCancelledTiles  | min    21.096 | median    23.693 | max    29.841 | active 9869181
+openvdb | 1 - 2 in place, pruneCancelledTiles  | min     4.595 | median     5.302 | max     5.966 | active 41119229
+openvdb | 1 | 2 copy                           | min    44.514 | median    47.289 | max    49.134 | active 74205001
+openvdb | 1 & 2 copy                           | min     8.135 | median     8.944 | max    10.682 | active 9869181
+openvdb | 1 - 2 copy                           | min    25.919 | median    28.008 | max    29.053 | active 41119229
+=== dragon and armadillo at 3072, armadillo moved by 795 along z ===
+nanovdb | 1 | 2                 | min    32.928 | median    33.530 | max    36.019 | active 166981866
+nanovdb | 1 | 2 PropagateSign   | min    64.226 | median    66.865 | max    93.804 | active 166981866
+nanovdb | 1 & 2                 | min     5.755 | median     6.015 | max     7.301 | active 22204761
+nanovdb | 1 - 2                 | min    17.022 | median    17.733 | max    18.893 | active 92525341
+nanovdb | 1 - 2 pruned          | min    17.022 | median    17.570 | max    20.010 | active 92525341
+        steps, ms per call: setup 0.042 | 1 retain masks 0.572 | 2 topology 7.621 | 3 values 22.799 | 4 invert masks 0.963
+        topology, parts: root 0.722 | internal mask buffers 0.423 | stamp leaves 0.710 | count nodes 0.090 | buffer 0.490 | grid, upper, lower 0.984 | leaf masks 1.914 | leaf offsets, bbox, finish 1.523
+        steps, ms per call: setup 0.036 | 1 retain masks 0.454 | 2 topology 2.906 | 3 values 2.664 | 4 invert masks 0.217
+        topology, parts: root 0.816 | internal mask buffers 0.369 | stamp leaves 0.366 | count nodes 0.074 | buffer 0.059 | grid, upper, lower 0.397 | leaf masks 0.442 | leaf offsets, bbox, finish 0.158
+        steps, ms per call: setup 0.039 | 1 retain masks 0.524 | 2 topology 4.781 | 3 values 11.327 | 4 invert masks 0.533
+        topology, parts: root 0.755 | internal mask buffers 0.385 | stamp leaves 0.504 | count nodes 0.078 | buffer 0.255 | grid, upper, lower 0.717 | leaf masks 1.119 | leaf offsets, bbox, finish 0.730
+        steps, ms per call: setup 0.039 | 1 retain masks 0.527 | 2 topology 4.780 | 3 values 11.151 | 4 invert masks 0.500
+        topology, parts: root 0.615 | internal mask buffers 0.382 | stamp leaves 0.504 | count nodes 0.082 | buffer 0.335 | grid, upper, lower 0.641 | leaf masks 1.117 | leaf offsets, bbox, finish 0.732
+openvdb threads 16, input 1 active 97899716, input 2 active 91286911
+openvdb | 1 | 2 in place, prune=false          | min     7.039 | median     7.551 | max     9.728 | active 166981866
+openvdb | 1 & 2 in place, prune=false          | min    31.997 | median    40.219 | max    45.735 | active 22204761
+openvdb | 1 - 2 in place, prune=false          | min     8.641 | median     9.574 | max    10.480 | active 92525341
+openvdb | 1 | 2 in place, defaults             | min     9.664 | median    10.089 | max    11.051 | active 166981866
+openvdb | 1 & 2 in place, defaults             | min    41.296 | median    48.130 | max    56.814 | active 22204761
+openvdb | 1 - 2 in place, defaults             | min     9.405 | median    11.019 | max    12.785 | active 92525341
+openvdb | 1 | 2 in place, pruneCancelledTiles  | min     8.456 | median     9.840 | max    11.316 | active 166981866
+openvdb | 1 & 2 in place, pruneCancelledTiles  | min    39.017 | median    49.191 | max    51.368 | active 22204761
+openvdb | 1 - 2 in place, pruneCancelledTiles  | min     9.976 | median    11.208 | max    12.637 | active 92525341
+openvdb | 1 | 2 copy                           | min    86.537 | median    95.340 | max   108.904 | active 166981866
+openvdb | 1 & 2 copy                           | min    15.677 | median    16.748 | max    17.015 | active 22204761
+openvdb | 1 - 2 copy                           | min    51.017 | median    55.976 | max    58.954 | active 92525341
+=== dragon and dragon at 1024, same place ===
+nanovdb | 1 | 2                 | min     3.696 | median     3.789 | max     5.713 | active 10874985
+nanovdb | 1 | 2 PropagateSign   | min     5.718 | median     6.110 | max     8.454 | active 10874985
+nanovdb | 1 & 2                 | min     3.467 | median     3.682 | max     5.037 | active 10874985
+nanovdb | 1 - 2                 | min     3.410 | median     3.655 | max     5.222 | active 10874985
+nanovdb | 1 - 2 pruned          | min     4.761 | median     6.390 | max     7.591 | active 0
+        steps, ms per call: setup 0.036 | 1 retain masks 0.076 | 2 topology 2.091 | 3 values 1.657 | 4 invert masks 0.223
+        topology, parts: root 0.649 | internal mask buffers 0.407 | stamp leaves 0.088 | count nodes 0.072 | buffer 0.023 | grid, upper, lower 0.435 | leaf masks 0.110 | leaf offsets, bbox, finish 0.100
+        steps, ms per call: setup 0.029 | 1 retain masks 0.097 | 2 topology 2.177 | 3 values 1.586 | 4 invert masks 0.184
+        topology, parts: root 0.739 | internal mask buffers 0.334 | stamp leaves 0.084 | count nodes 0.071 | buffer 0.023 | grid, upper, lower 0.507 | leaf masks 0.113 | leaf offsets, bbox, finish 0.095
+        steps, ms per call: setup 0.031 | 1 retain masks 0.094 | 2 topology 1.956 | 3 values 1.577 | 4 invert masks 0.183
+        topology, parts: root 0.542 | internal mask buffers 0.330 | stamp leaves 0.084 | count nodes 0.071 | buffer 0.023 | grid, upper, lower 0.484 | leaf masks 0.110 | leaf offsets, bbox, finish 0.096
+        steps, ms per call: setup 0.030 | 1 retain masks 4.550 | 2 topology 1.799 | 3 values 0.007 | 4 invert masks 0.001
+        topology, parts: root 0.606 | internal mask buffers 0.389 | stamp leaves 0.061 | count nodes 0.078 | buffer 0.011 | grid, upper, lower 0.399 | leaf masks 0.012 | leaf offsets, bbox, finish 0.000
+openvdb threads 16, input 1 active 10874985, input 2 active 10874985
+openvdb | 1 | 2 in place, prune=false          | min     4.108 | median     5.010 | max     6.017 | active 10874985
+openvdb | 1 & 2 in place, prune=false          | min     3.833 | median     5.270 | max     6.400 | active 10874985
+openvdb | 1 - 2 in place, prune=false          | min     5.389 | median     6.411 | max     7.667 | active 10874985
+openvdb | 1 | 2 in place, defaults             | min     4.912 | median     5.474 | max     7.013 | active 10874985
+openvdb | 1 & 2 in place, defaults             | min     4.904 | median     5.335 | max     5.798 | active 10874985
+openvdb | 1 - 2 in place, defaults             | min     6.031 | median     6.813 | max     8.786 | active 10874985
+openvdb | 1 | 2 in place, pruneCancelledTiles  | min     4.905 | median     5.573 | max     6.198 | active 10874985
+openvdb | 1 & 2 in place, pruneCancelledTiles  | min     4.662 | median     5.468 | max     6.941 | active 10874985
+openvdb | 1 - 2 in place, pruneCancelledTiles  | min     8.484 | median     9.246 | max    10.941 | active 0
+openvdb | 1 | 2 copy                           | min     7.996 | median     9.312 | max    11.896 | active 10874985
+openvdb | 1 & 2 copy                           | min     8.065 | median     9.187 | max    11.054 | active 10874985
+openvdb | 1 - 2 copy                           | min     7.905 | median     9.510 | max    10.768 | active 10874985
+=== device copy ===
+device copy of 849236 floats: median 0.010 ms
+device copy of 18544820 floats: median 0.383 ms
+device copy of 74205001 floats: median 1.129 ms
+device copy of 166981866 floats: median 2.524 ms

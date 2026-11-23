@@ -23,6 +23,10 @@ level set, and the timer.
 The last two programs write the data of an interactive viewer and of static figures. [viewer/README.md](viewer/README.md)
 describes the scene, the commands, every field of the two files, and a Python reader.
 
+[openvdb_comparison/](openvdb_comparison/README.md) compares the operations with OpenVDB's on the same mesh level
+sets: every voxel of the results, and the wall times. Its programs need an OpenVDB installation and are built by
+its own `build.sh`.
+
 ## Build
 
 The targets are part of the NanoVDB examples and need CUDA:

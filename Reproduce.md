@@ -8,6 +8,7 @@ download links.
 Sections:
 
 - [City flood scene](#city-flood-scene)
+- [Constructive solid geometry](#constructive-solid-geometry)
 
 ## City flood scene
 
@@ -174,3 +175,118 @@ full 0.25 m run was not repeated from this branch. What was checked, on the lapt
   from the newest one. The paper's run finished in a single attempt.
 - A state file holds the water, its velocity and the grids, but not the drops in the air or the marker particles: a
   run that continued from one has almost no drops in the first frame after it.
+
+## Constructive solid geometry
+
+Union, intersection, difference and complement of narrow-band level sets on NanoVDB `ValueOnIndex` grids
+(`csgUnion`, `csgIntersection`, `csgDifference`, `csgComplement`). The result's band is built from the retained
+voxels of the inputs, and its invert masks from the inside and outside states of the inputs at the leaf, lower and
+upper levels, without a sign propagation pass.
+
+| | |
+|---|---|
+| Code | `nanovdb/nanovdb/tools/cuda/CSG.cuh`; the design is in `nanovdb/nanovdb/examples/ex_csg_nanovdb_cuda/CSG-design.md` |
+| Programs | `nanovdb/nanovdb/examples/ex_csg_nanovdb_cuda/` (its `README.md` describes each program and what the tests check) |
+| Figure data | `csg_viewer_slices` and `csg_viewer_voxels` of that example; `viewer/README.md` there describes the files |
+| Comparison with OpenVDB | `nanovdb/nanovdb/examples/ex_csg_nanovdb_cuda/openvdb_comparison/` (its `README.md` has the method, the full tables and the limits; `results/` the output of the runs quoted here) |
+| Hardware of the numbers below | NVIDIA RTX PRO 3000 Blackwell laptop GPU (12 GB), Intel Core Ultra 7 265H (16 threads) |
+
+### Meshes to download
+
+| Mesh | Triangles | Link |
+|---|---|---|
+| `armadillo.obj` | 29,170 | https://github.com/odedstein/meshes, `objects/armadillo/armadillo.obj` |
+| `bunny.obj` | 6,598 | https://github.com/odedstein/meshes, `objects/bunny/bunny.obj` |
+| `dragon.obj` | 871,306 | the Stanford dragon as an OBJ file with 435,545 vertices; its download link was not recorded |
+
+The SHA-256 sums of the three files are in `openvdb_comparison/README.md`. Any closed meshes work with every
+program; the voxel counts below are those of these files.
+
+### Requirements
+
+| | Needed | Used |
+|---|---|---|
+| GPU | 12 GB for the timings up to 3072 voxels; far less for the tests and the figure data | RTX PRO 3000 Blackwell, 12 GB, driver 580.178.04 |
+| CUDA toolkit | 12.0 or newer | 12.0 |
+| CCCL | fetched by NanoVDB's CMake build; `openvdb_comparison/build.sh` takes its path | v3.7.0.dev-150-g051a9a7b20 |
+| OpenVDB | an installation, for the comparison only | 13.0.1 |
+| Python | 3, standard library only, for the viewer and for `stage_timers.py` | 3.12.3 |
+
+### Steps
+
+The example's programs are targets of the NanoVDB examples (`NANOVDB_USE_CUDA=ON`); `<bin>` is
+`<build dir>/nanovdb/nanovdb/examples`.
+
+```
+cmake --build <build dir> --target ex_csg_nanovdb_cuda_csg_operations_test ex_csg_nanovdb_cuda_csg_union_baselines \
+    ex_csg_nanovdb_cuda_csg_timing ex_csg_nanovdb_cuda_mesh_to_band \
+    ex_csg_nanovdb_cuda_csg_viewer_slices ex_csg_nanovdb_cuda_csg_viewer_voxels
+
+# mesh level sets at 220 voxels along the longest extent
+<bin>/ex_csg_nanovdb_cuda_mesh_to_band dragon.obj    220 dragon.band
+<bin>/ex_csg_nanovdb_cuda_mesh_to_band armadillo.obj 220 armadillo.band
+<bin>/ex_csg_nanovdb_cuda_mesh_to_band bunny.obj     220 bunny.band
+
+# tests: each prints ALL PASS
+<bin>/ex_csg_nanovdb_cuda_csg_operations_test dragon.band armadillo.band bunny.band
+<bin>/ex_csg_nanovdb_cuda_csg_union_baselines
+
+# data of the CSG figure and of the interactive viewer: two armadillos, the second one moving along x in 21 steps
+<bin>/ex_csg_nanovdb_cuda_csg_viewer_slices armadillo.band armadillo.band slices.json --frames 21 --move-axis x --slice-axis z
+<bin>/ex_csg_nanovdb_cuda_csg_viewer_voxels armadillo.band armadillo.band voxels.json --frames 21 --move-axis x
+
+# comparison with OpenVDB, in nanovdb/nanovdb/examples/ex_csg_nanovdb_cuda/openvdb_comparison/
+CCCL=<cccl checkout> OPENVDB_ROOT=<OpenVDB installation> ./build.sh
+./run_correctness.sh dragon.obj armadillo.obj bunny.obj
+./run_timing.sh dragon.obj armadillo.obj
+```
+
+The figure of the paper and its interactive viewer are drawn from `slices.json` and `voxels.json` by scripts that
+are kept with the paper's sources, not in this repository.
+
+### Numbers
+
+Level sets at 220 voxels: dragon 496,764 active voxels, armadillo 466,322, bunny 681,590 (band half-width and
+background 3 voxels).
+
+| Check | Result |
+|---|---|
+| `csg_operations_test` with the three band files | `ALL PASS` |
+| `csg_union_baselines` | `ALL PASS` |
+| `csg_viewer_slices`, `csg_viewer_voxels` with the commands above | `ALL FRAMES AGREE` at the end of each |
+| `run_correctness.sh`: 15 pairs of inputs, 11 comparisons each against OpenVDB (`prune = false`, defaults, `pruneCancelledTiles`) | 165 of 165 comparisons without a voxel that differs in value, sign or active state |
+| dragon − dragon | 496,764 active voxels by default (as in OpenVDB); 0 with `pruneCancelledLeaves` (as OpenVDB with `pruneCancelledTiles`) |
+
+Median wall times in milliseconds from `run_timing.sh`, the dragon and the armadillo partly overlapping. "In
+place" is `openvdb::tools::csgUnion` and the like, which consume both inputs; "copy" is `csgUnionCopy` and the
+like, which leave them intact as the NanoVDB operations do. "PropagateSign baseline" is the union that merges the
+bands, prunes them and reruns `PropagateSign`.
+
+| Longest extent | Active voxels of the inputs | Operation | NanoVDB | NanoVDB, PropagateSign baseline | OpenVDB in place | OpenVDB copy |
+|---|---|---|---|---|---|---|
+| 220 | 496,764 + 466,322 | union | 1.66 | 2.48 | 0.47 | 2.28 |
+| | | intersection | 1.57 | | 0.56 | 1.34 |
+| | | difference | 1.61 | | 0.38 | 1.64 |
+| 1024 | 10,874,985 + 10,138,209 | union | 4.50 | 8.31 | 1.85 | 10.26 |
+| | | intersection | 1.94 | | 5.43 | 2.70 |
+| | | difference | 3.01 | | 1.57 | 6.73 |
+| 2048 | 43,507,506 + 40,566,676 | union | 15.14 | 28.48 | 5.45 | 47.29 |
+| | | intersection | 3.27 | | 23.57 | 8.94 |
+| | | difference | 8.18 | | 5.47 | 28.01 |
+| 3072 | 97,899,716 + 91,286,911 | union | 33.53 | 66.87 | 10.09 | 95.34 |
+| | | intersection | 6.02 | | 48.13 | 16.75 |
+| | | difference | 17.73 | | 11.02 | 55.98 |
+
+### How closely a reproduction matches
+
+- **The results of the operations are deterministic.** The tests compare values exactly, and the comparison with
+  OpenVDB is exact in every voxel.
+- **The times are not.** They need an idle GPU, mains power and the `performance` power profile on the laptop.
+  OpenVDB's in-place times vary most: across three runs the in-place union at 2048 had medians between 4.5 and
+  5.4 ms.
+
+### How this branch's copy was checked
+
+All of the above was run from this branch on the laptop: the tests and the two viewer programs with the binaries
+of the CMake build, the comparison with the binaries of `openvdb_comparison/build.sh`. The band files were made by
+this branch's `mesh_to_band`.

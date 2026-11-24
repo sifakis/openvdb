@@ -11,6 +11,7 @@ Sections:
 - [Constructive solid geometry](#constructive-solid-geometry)
 - [Hydra](#hydra)
 - [Mean curvature flow](#mean-curvature-flow)
+- [Mesh pile](#mesh-pile)
 
 ## City flood scene
 
@@ -508,3 +509,128 @@ kernel of its own. From this branch, on the laptop:
 - `make_movie.sh` at resolution 128 with 8 frames, from the mesh to the movie.
 
 The 60,000-step run and its 361 images were not repeated from this branch.
+
+## Mesh pile
+
+A stress test of `MeshToSDF`: eight bins shaped like the letters of SIGGRAPH, filled with 1,589 triangle meshes that
+overlap one another and the bins. The whole scene, 104,428,862 triangles, is converted by one call into one
+narrow-band signed distance field with 1,416,920,079 active voxels.
+
+| | |
+|---|---|
+| Code | `nanovdb/nanovdb/examples/ex_mesh_to_sdf_pile_cuda/` (its `README.md` describes the scene, the meshes and their licenses, the files and the limits) |
+| Result | `output/pile/`: `scene/` (the triangle soup), `sdf.faces` (the voxels of the surface), `sdf_slice_0.bin` .. `sdf_slice_72.bin` (the sign on horizontal planes), `run.log` |
+| Animation | `Supplementary material/video/Applications/mesh_to_sdf_pile.mp4` of the paper's repository (777 frames, 1920 x 1080, 24 frames per second, 32.4 s), made by `figure factory/MeshToSDFPile/make_animation.py` of the paper's repository from that output; the `README.md` there describes it |
+| Hardware, conversion | NVIDIA GeForce RTX 5090 (32 GB) |
+| Hardware, scene and animation | NVIDIA RTX PRO 3000 Blackwell laptop GPU (12 GB), Intel Core Ultra 7 265H (16 threads), 62 GB of memory |
+
+### Meshes to download
+
+24 OBJ files of https://github.com/odedstein/meshes at commit `835213277571d625722d25880c9c3010c6f45a5a`, 222 MB.
+`get_meshes.sh` of the example downloads them and checks their SHA-256 sums. The example's `README.md` lists every
+file with its triangle count, author and license (public domain, CC0, CC BY 3.0 or 4.0, and the Stanford
+repository's terms for the bunny and the armadillo).
+
+### Requirements
+
+| | Needed | Used |
+|---|---|---|
+| GPU, conversion | 32 GB for the paper's scene (the CUDA memory pool peaked at 30.5 GiB); 12 GB for a scene of one letter | RTX 5090, 32 GB |
+| GPU, animation | an RTX GPU supported by ovrtx, and 3.2 GiB for the conversion of a part of the scene | RTX PRO 3000 Blackwell, 12 GB, driver 580.178.04 |
+| Disk | example: 6 GB (scene 3.7 GB, surface voxels 1.4 GB, planes 1.0 GB); animation: 6 GB (pictures 1.0 GB, frames 1.0 GB, the planes of the last part 4 GB) | |
+| CUDA toolkit | 12.0 or newer | 12.9 for the conversion (`CUDA_ARCH_FLAGS=-arch=sm_120`), 12.0 on the laptop |
+| CCCL | a checkout of https://github.com/NVIDIA/cccl, if the toolkit's Thrust has no `<cuda/std/...>` headers | v3.4.2 on the laptop |
+| Host compiler | C++17 | g++ 13.3.0 on the laptop |
+| OpenVDB | an installation, for `mesh_band` (the scene's bins) | 13.0.1 |
+| Python, scene | `numpy`, `scipy`, `Pillow`; the font DejaVu Sans Bold | Python 3.12.3, numpy 2.5.3, scipy 1.18.1, Pillow 12.3.0 with FreeType 2.14.3, DejaVu Sans Bold 2.37 |
+| Python, animation | `ovrtx`, `ovstage`, `usd-core`, `numpy`, `scipy`, `Pillow` | ovrtx 0.5.1, ovstage 0.2.1, usd-core 26.8 |
+| ffmpeg, fonts DejaVu Sans and DejaVu Sans Bold | for the animation | ffmpeg 6.1.1 |
+
+### Steps
+
+In `nanovdb/nanovdb/examples/ex_mesh_to_sdf_pile_cuda/`:
+
+```
+CCCL=<cccl checkout> OPENVDB_ROOT=<OpenVDB installation> ./build.sh
+./get_meshes.sh meshes
+export SCENE_PYTHON=<python with numpy, scipy, Pillow>
+./run.sh meshes                    # the scene and its conversion at 2048 voxels per unit -> output/pile/
+./run.sh meshes 1024 R small       # a scene of one letter, for a 12 GB GPU -> output/small/
+```
+
+The two steps of `run.sh` can run on different machines: it keeps an `output/pile/scene/` that is already there.
+The paper's scene was made on the laptop and converted on the RTX 5090.
+
+The animation, in `figure factory/MeshToSDFPile/` of the paper's repository, on a machine that has `output/pile/`
+and the example's `bin/mesh_to_sdf_pile` built:
+
+```
+<python with the packages above> make_animation.py --run <example>/output/pile --converter <example>/bin/mesh_to_sdf_pile
+```
+
+It renders 633 pictures into its own `work/` folder and writes the movie to the path above.
+
+### Settings
+
+`run.sh` with only the mesh directory uses exactly these.
+
+| | |
+|---|---|
+| Scene (`make_scene.py`) | word SIGGRAPH in DejaVu Sans Bold, cap height 1; walls 0.24 high, walls and floors 0.025 thick, on a grid of 384 cells per unit; meshes of longest extent 0.12 x (0.8 to 1.15), lattice spacing 0.62 x 0.12, four layers; random seed 7 |
+| Conversion (`mesh_to_sdf_pile`) | 2048 voxels per unit (voxel size 0.00048828125), band of 3 voxels on either side, `BarrierSigning::Ball`, `NestingRule::Solid` |
+| Shift | `SHIFT_VOXELS="-7905 0 0"`: the scene is converted centered along x and written in its own frame (the example's `README.md`, Limits, says why) |
+| Planes | 72 at heights 0.38 to 0, every 4th voxel; one at height 0.2462, every voxel |
+| Pictures | 1920 x 1080, path tracing, 64 samples per pixel, denoiser on, at most 6 bounces; focal length 50 mm on a 36 mm aperture |
+| Movie | ffmpeg, libx264, crf 16, 24 frames per second |
+
+### Numbers
+
+The scene: 1,589 meshes with 94,854,194 triangles and 8 bins with 9,574,668 triangles; `scene/soup.bin` has the
+SHA-256 sum `00b2f43ea9aad4a45d7f3575993fd410cf079f3f2663a93300d559d7f553461d`.
+
+The conversion on the RTX 5090, one run:
+
+| | |
+|---|---|
+| Active voxels | 1,416,920,079 |
+| Connected components of the band | 91 |
+| Interior voxels of the band | 723,890,059; 202,914,956 of them on the surface |
+| Rasterizing / partitioning / signing / nesting rule | 5028.6 ms / 194.4 ms / 1172.4 ms / 10.8 ms |
+| `MeshToSDF`, whole call | 6423.9 ms, including the first-call start-up of the device code |
+| Peak of the CUDA memory pool | 30,524.6 MiB, of which the input mesh 1,792.6 MiB |
+
+At 2176 and at 2304 voxels per unit the conversion ran out of memory on this GPU; the example's `README.md` has the
+runs at 1024 and 1536.
+
+The animation on the laptop: 633 pictures in about 5 hours (shot 62 min, cut 66 min, zoom 96 min, closing 76 min,
+while other programs used the same GPU during the first three), then 3.4 min to put the frames together and encode.
+
+### How closely a reproduction matches
+
+- **The scene is the same byte for byte** when made with the versions above. Another version of the font or of
+  FreeType may move the letters' outlines; the SHA-256 sum tells.
+- **Two conversions on the RTX 5090 agreed**: the same number of active voxels, and the same values at the
+  2,193,520 samples of the plane at height 0.2461 that both wrote. Whether another GPU model gives the same
+  values was not tested.
+- **The times were measured once.**
+- **The pictures are path traced** and differ in noise from run to run.
+
+### How this branch's copy was checked
+
+The paper's conversion and pictures were made with development copies of these files. From this branch, on the
+laptop:
+
+- `get_meshes.sh` downloaded the 24 files, and their sums match.
+- `make_scene.py` with these files: `soup.bin`, `owners.i32`, `bins.meshbin` and `meshes.meshbin` are identical to
+  the scene the paper's conversion read.
+- `build.sh` builds both programs. `./run.sh meshes 1024 R small`: 13,946,534 triangles, 49,012,119 active voxels,
+  10 components, pool peak 3,886.8 MiB; the surface voxels and the 73 planes are identical to the development
+  program's on the same scene.
+- `bin/mesh_to_sdf_pile` on the part of the paper's scene around the hero, as the animation runs it: the 86 planes
+  are identical to the development program's, and the plane at height 0.2461 equals the RTX 5090 run's there.
+- The paper repository's `make_animation.py`: its cameras equal the development ones; from the development
+  pictures it puts together the same frames, pixel for pixel, up to the last part, which it added; pictures it
+  rendered again equal the movie's exactly or up to path-tracing noise (that folder's `README.md` has the list).
+
+The conversion of the whole scene at 2048 voxels per unit was not repeated from this branch, and `run.sh` was not
+run on the RTX 5090.

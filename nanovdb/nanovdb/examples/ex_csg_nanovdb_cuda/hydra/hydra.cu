@@ -27,8 +27,8 @@
 ///        Writes outDir/body.band, head_<name>.band per head and hydra.band (the format of ../mesh_to_band.cu),
 ///        outDir/hydra.inside (where the result is inside away from its active voxels, per tree level; see
 ///        writeInside) and outDir/scene.json (how the body was placed in the grid, and the heads' names and matrices, for programs
-///        that draw the level sets), and prints the voxel counts, the time of the conversions and of the CSG
-///        operations and the number of surface voxels of the result that lie on a cut.
+///        that draw the level sets), and prints the GPU, the voxel counts, the wall time of every conversion, of
+///        every CSG operation and of the sign propagation of every converted level set (see warmUp) and the number of surface voxels of the result that lie on a cut.
 ///        --operands   also write the level sets that the intersections take: model_<name>.band and
 ///                     cutter_<name>.band
 ///        --band       only convert one mesh, centered and scaled like the body, and write its level set
@@ -71,28 +71,28 @@ static Mesh placed(const Mesh& in, const Matrix& m, const nanovdb::Vec3f& middle
     return out;
 }
 
-static double gMeshToSdfMs = 0, gCsgMs = 0; // wall time of the MeshToSDF conversions and of the CSG operations so far
-template<typename F> static auto timed(double& total, F f)
+/// @brief Runs @a f and sets @a ms to its wall time in milliseconds, the device idle before and after.
+template<typename F> static auto timed(double& ms, F f)
 {
     cudaCheck(cudaDeviceSynchronize());
     const auto t0 = std::chrono::steady_clock::now();
     auto result = f();
     cudaCheck(cudaDeviceSynchronize());
-    total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return result;
 }
 
 /// @brief The narrow-band level set of a closed triangle mesh (points in voxels), half-width W. MeshToSDF runs on
 ///        the device; its voxels closer than W to the surface then go through a host copy into a
-///        LevelSetTracker::State, the form the CSG operations take.
-static StateT meshToLevelSet(const Mesh& m, ResourceT& res)
+///        LevelSetTracker::State, the form the CSG operations take. @a ms receives the wall time of MeshToSDF alone.
+static StateT meshToLevelSet(const Mesh& m, ResourceT& res, double& ms)
 {
     nanovdb::cuda::ResourceRef<ResourceT> ref(res);
     BufT<nanovdb::Vec3f> dPts(cudaStream_t(0), ref, m.points.size(), nanovdb::cuda::noInit);
     BufT<nanovdb::Vec3i> dTris(cudaStream_t(0), ref, m.triangles.size(), nanovdb::cuda::noInit);
     cudaCheck(cudaMemcpy(dPts.data(), m.points.data(), m.points.size() * sizeof(nanovdb::Vec3f), cudaMemcpyHostToDevice));
     cudaCheck(cudaMemcpy(dTris.data(), m.triangles.data(), m.triangles.size() * sizeof(nanovdb::Vec3i), cudaMemcpyHostToDevice));
-    auto converted = timed(gMeshToSdfMs, [&] {
+    auto converted = timed(ms, [&] {
         tools::cuda::MeshToSDF<BuildT, ResourceT> converter(dPts.data(), uint32_t(m.points.size()), dTris.data(), uint32_t(m.triangles.size()), nanovdb::Map(), 0, res);
         converter.setNarrowBandWidth(W);
         return converter.getHandleAndSDF();
@@ -113,6 +113,23 @@ static StateT meshToLevelSet(const Mesh& m, ResourceT& res)
         }
     }
     return makeFromBand(band, Coord(0), res);
+}
+
+/// @brief The wall time in milliseconds of one sign propagation on a level set: tools::cuda::PropagateSign computes
+///        its invert masks again, into masks of its own. The level set already has them: the conversion of a mesh
+///        ends with this same call (in makeFromBand), and a CSG operation makes those of its result from those of
+///        its inputs without it. This call only measures.
+static double signPropagationMs(const StateT& s, ResourceT& res)
+{
+    nanovdb::cuda::ResourceRef<ResourceT> ref(res);
+    const auto* grid = s.grid.template deviceGrid<BuildT>();
+    const auto tree = util::cuda::DeviceGridTraits<BuildT>::getTreeData(grid, 0);
+    BufT<Mask<3>> leaf(cudaStream_t(0), ref, tree.mNodeCount[0], nanovdb::cuda::noInit);
+    BufT<Mask<4>> lower(cudaStream_t(0), ref, tree.mNodeCount[1], nanovdb::cuda::noInit);
+    BufT<Mask<5>> upper(cudaStream_t(0), ref, tree.mNodeCount[2], nanovdb::cuda::noInit);
+    double ms;
+    timed(ms, [&] { return tools::cuda::PropagateSign<BuildT, float, ResourceT>(grid, s.phi.data(), 0, res).propagate(leaf.data(), lower.data(), upper.data()).second; });
+    return ms;
 }
 
 /// @brief The value of a host level set at an active voxel; false if the voxel is not active.
@@ -199,6 +216,19 @@ static void placement(const Mesh& m, float longestExtent, nanovdb::Vec3f& middle
 
 struct Head { std::string name, mesh, cutter; Matrix matrix; };
 
+/// @brief One conversion, one intersection, one union and one sign propagation, not timed. The first call of a tool pays once for work
+///        that is not its own (the driver loads the device code, the memory resource takes its blocks from the
+///        device), so the times that main prints are those of calls after this one.
+static void warmUp(const Mesh& mesh, ResourceT& res)
+{
+    double unused;
+    const StateT a = meshToLevelSet(mesh, res, unused);
+    const StateT b = tools::cuda::csgIntersection<BuildT, float, ResourceT>(a, a, 0, res);
+    const StateT c = tools::cuda::csgUnion<BuildT, float, ResourceT>(a, b, 0, res);
+    signPropagationMs(c, res);
+    cudaCheck(cudaDeviceSynchronize());
+}
+
 int main(int argc, char** argv)
 {
     const Matrix identity = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
@@ -207,7 +237,8 @@ int main(int argc, char** argv)
     if (argc == 5 && std::strcmp(argv[1], "--band") == 0) {
         const Mesh mesh = loadObj(argv[2]);
         placement(mesh, std::stof(argv[3]), middle, scale);
-        printf("%s: %llu active voxels\n", argv[2], (unsigned long long)writeBand(download(meshToLevelSet(placed(mesh, identity, middle, scale), res)), argv[4]));
+        double unused;
+        printf("%s: %llu active voxels\n", argv[2], (unsigned long long)writeBand(download(meshToLevelSet(placed(mesh, identity, middle, scale), res, unused)), argv[4]));
         return 0;
     }
     if (argc < 4) { printf("usage: %s scene.txt longestExtentInVoxels outDir [--operands]\n       %s --band mesh.obj longestExtentInVoxels out.band\n", argv[0], argv[0]); return 1; }
@@ -254,17 +285,29 @@ int main(int argc, char** argv)
     }
     printf("%s: %zu vertices, %zu triangles, longest extent %g voxels, band half-width %g voxels\n", bodyPath.c_str(), bodyMesh.points.size(), bodyMesh.triangles.size(), extent, W);
 
-    const StateT body = meshToLevelSet(placed(bodyMesh, identity, middle, scale), res);
+    {
+        cudaDeviceProp device; int id;
+        cudaCheck(cudaGetDevice(&id));
+        cudaCheck(cudaGetDeviceProperties(&device, id));
+        printf("GPU: %s\n", device.name);
+    }
+    warmUp(placed(bodyMesh, identity, middle, scale), res);
+
+    // Wall times in milliseconds: of every MeshToSDF conversion and of every CSG operation, and their sums.
+    double ms, modelMs, cutterMs, intersectionMs, unionMs, sumModelsMs = 0, sumCuttersMs = 0, sumIntersectionsMs = 0, sumUnionsMs = 0;
+    const StateT body = meshToLevelSet(placed(bodyMesh, identity, middle, scale), res, ms);
+    sumModelsMs += ms;
+    double sumSignMs = signPropagationMs(body, res); // of the level sets converted from meshes: the body, the models, the cutters
     const HostState hostBody = download(body);
-    printf("%-22s %10llu active voxels\n", "body", (unsigned long long)writeBand(hostBody, outDir + "/body.band"));
+    printf("%-22s %10llu active voxels   (MeshToSDF %.2f ms, sign propagation %.3f ms)\n", "body", (unsigned long long)writeBand(hostBody, outDir + "/body.band"), ms, sumSignMs);
 
     // A head: the moved model intersected with the moved cutter. The result grows by one union per head.
     std::unique_ptr<StateT> result;
     std::vector<HostState> hostCutters;
     for (const Head& h : heads) {
         const Mesh headMesh = loadObj(h.mesh);
-        const StateT model = meshToLevelSet(placed(headMesh, h.matrix, middle, scale), res), cutter = meshToLevelSet(placed(loadObj(h.cutter), h.matrix, middle, scale), res);
-        const StateT head = timed(gCsgMs, [&] { return tools::cuda::csgIntersection<BuildT, float, ResourceT>(model, cutter, 0, res); });
+        const StateT model = meshToLevelSet(placed(headMesh, h.matrix, middle, scale), res, modelMs), cutter = meshToLevelSet(placed(loadObj(h.cutter), h.matrix, middle, scale), res, cutterMs);
+        const StateT head = timed(intersectionMs, [&] { return tools::cuda::csgIntersection<BuildT, float, ResourceT>(model, cutter, 0, res); });
         hostCutters.push_back(download(cutter));
         const HostState hostModel = download(model);
         if (writeOperands) {
@@ -273,14 +316,20 @@ int main(int argc, char** argv)
         }
         printf("%-22s %10llu active voxels   (moved model %llu, moved cutter %llu; mesh %zu triangles)\n", ("head " + h.name).c_str(),
                (unsigned long long)writeBand(download(head), outDir + "/head_" + h.name + ".band"), (unsigned long long)hostModel.g()->activeVoxelCount(), (unsigned long long)hostCutters.back().g()->activeVoxelCount(), headMesh.triangles.size());
-        result = std::make_unique<StateT>(timed(gCsgMs, [&] { return tools::cuda::csgUnion<BuildT, float, ResourceT>(result ? *result : body, head, 0, res); }));
+        result = std::make_unique<StateT>(timed(unionMs, [&] { return tools::cuda::csgUnion<BuildT, float, ResourceT>(result ? *result : body, head, 0, res); }));
+        const double modelSignMs = signPropagationMs(model, res), cutterSignMs = signPropagationMs(cutter, res);
+        printf("%-22s MeshToSDF of the model %.2f ms, of the cutter %.2f ms, intersection %.3f ms, union %.3f ms, sign propagation of the model %.3f ms, of the cutter %.3f ms\n",
+               ("time, head " + h.name).c_str(), modelMs, cutterMs, intersectionMs, unionMs, modelSignMs, cutterSignMs);
+        sumModelsMs += modelMs; sumCuttersMs += cutterMs; sumIntersectionsMs += intersectionMs; sumUnionsMs += unionMs; sumSignMs += modelSignMs + cutterSignMs;
     }
     const HostState hostResult = download(*result);
     printf("%-22s %10llu active voxels\n", "hydra", (unsigned long long)writeBand(hostResult, outDir + "/hydra.band"));
     const std::array<uint64_t, 4> inside = writeInside(hostResult, outDir + "/hydra.inside");
     printf("inside the hydra, off its active voxels: %llu voxels of leaves, %llu slots of lower nodes (8 voxels wide), %llu slots of upper nodes (128 voxels wide), %llu root regions\n",
            (unsigned long long)inside[0], (unsigned long long)inside[1], (unsigned long long)inside[2], (unsigned long long)inside[3]);
-    printf("time: %zu MeshToSDF conversions %.1f ms, %zu intersections and %zu unions %.1f ms\n", 2 * heads.size() + 1, gMeshToSdfMs, heads.size(), heads.size(), gCsgMs);
+    printf("time, sums: MeshToSDF of the %zu models %.1f ms, of the %zu cutters %.1f ms, %zu intersections %.2f ms, %zu unions %.2f ms, sign propagation of the %zu converted level sets %.2f ms\n",
+           heads.size() + 1, sumModelsMs, heads.size(), sumCuttersMs, heads.size(), sumIntersectionsMs, heads.size(), sumUnionsMs, 2 * heads.size() + 1, sumSignMs);
+    printf("time, for comparison: one sign propagation on the hydra %.3f ms (not part of the operations above)\n", signPropagationMs(*result, res));
 
     // A cut that shows: a voxel within one voxel of the result's surface whose value is the value of a cutter
     // there. (Intersection and union copy the value of one input, so the comparison is exact.)

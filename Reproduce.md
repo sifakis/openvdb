@@ -376,8 +376,20 @@ Active voxels printed by `bin/hydra` (band half-width 3 voxels; the extent is th
 | 220 voxels | 871,193 | 923 | 0 | 649,775 | 22 |
 | 1024 voxels | 32,611,628 | 323,945 | 0 | 14,707,876 | 175 |
 
-The run at 1024 voxels printed 7159.4 ms for the 17 conversions and 132.6 ms for the 16 CSG operations, each
-measured once and including the first-call start-up of the device code.
+Wall times on an NVIDIA GeForce RTX 5090 (32 GB, driver 595.112.07, CUDA 12.9, idle before the runs). The program
+prints the time of every conversion and of every CSG operation, after one conversion, one intersection, one union
+and one sign propagation that are not timed. Each run was made three times; the sums of the three differed by less
+than 6%, and the table is the second run. The nine models have 23,344,018 triangles, the eight cutters 22,270.
+
+| Body's longest extent | MeshToSDF, nine models | MeshToSDF, eight cutters | one intersection | one union | 16 CSG operations | sign propagation, 17 level sets |
+|---|---|---|---|---|---|---|
+| 220 voxels | 1001.6 ms | 20.7 ms | 0.84 to 1.26 ms | 1.32 to 1.43 ms | 19.1 ms | 0.72 ms |
+| 1024 voxels | 1042.1 ms | 28.6 ms | 1.26 to 1.63 ms | 2.45 to 2.95 ms | 33.7 ms | 1.45 ms |
+
+A level set converted from a mesh gets its invert masks by one sign propagation (`PropagateSign`); the last column
+is the sum of these 17. The CSG operations make the masks of their results without one. For comparison, one sign
+propagation on the finished hydra takes 0.08 ms at 220 and 0.34 ms at 1024 voxels; the program measures all of them
+by running `PropagateSign` once more on the level set.
 
 ### How closely a reproduction matches
 

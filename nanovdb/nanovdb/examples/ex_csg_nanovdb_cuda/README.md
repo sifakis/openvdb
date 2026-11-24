@@ -27,6 +27,9 @@ describes the scene, the commands, every field of the two files, and a Python re
 sets: every voxel of the results, and the wall times. Its programs need an OpenVDB installation and are built by
 its own `build.sh`.
 
+[hydra/](hydra/README.md) is a modeling example: eight intersections and eight unions build a hydra with nine heads
+from nine triangle meshes of snakes. It has its own `build.sh` and `run.sh`.
+
 ## Build
 
 The targets are part of the NanoVDB examples and need CUDA:

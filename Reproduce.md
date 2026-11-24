@@ -9,6 +9,7 @@ Sections:
 
 - [City flood scene](#city-flood-scene)
 - [Constructive solid geometry](#constructive-solid-geometry)
+- [Hydra](#hydra)
 - [Mean curvature flow](#mean-curvature-flow)
 
 ## City flood scene
@@ -291,6 +292,104 @@ bands, prunes them and reruns `PropagateSign`.
 All of the above was run from this branch on the laptop: the tests and the two viewer programs with the binaries
 of the CMake build, the comparison with the binaries of `openvdb_comparison/build.sh`. The band files were made by
 this branch's `mesh_to_band`.
+
+## Hydra
+
+A modeling example for the CSG operations: nine triangle meshes of snakes become one hydra with nine heads. One
+mesh is the body and keeps its own head; each of the other eight gives its head.
+
+```
+hydra = body | (model_1 & cutter_1) | (model_2 & cutter_2) | ... | (model_8 & cutter_8)
+```
+
+`|` is `csgUnion` and `&` is `csgIntersection`; every operand is a narrow-band level set made by `MeshToSDF`: 17
+conversions, eight intersections, eight unions.
+
+| | |
+|---|---|
+| Code | `nanovdb/nanovdb/examples/ex_csg_nanovdb_cuda/hydra/` (its `README.md` describes the operands, how the heads are placed, the files and the limits) |
+| Result | `output/1024/hydra.band` (the level set), `hydra.meshbin` (its surface as triangles), `hydra.png` (path-traced image, 1920 x 1080) |
+| Animation | `Supplementary material/video/Applications/hydra.mp4` of the paper's repository (1036 frames, 1920 x 1080, 24 frames per second, 43.2 s), made by `figure factory/CSG/hydra/make_animation.py` of the paper's repository from the programs of this example; the `README.md` there describes it |
+| Hardware of everything below | NVIDIA RTX PRO 3000 Blackwell laptop GPU (12 GB), Intel Core Ultra 7 265H (16 threads) |
+
+### Meshes
+
+The nine meshes were generated with Meshy AI (www.meshy.ai). They are not in this repository; contact the authors
+for them. The example's `README.md` lists their file names, vertex and triangle counts and SHA-256 sums; together they
+have 23,344,018 triangles and take 1.7 GB.
+
+The lengths of the necks, the places of the cuts and the angles in `plan_hydra.py` were chosen by hand for these
+nine files. With other meshes the programs run, but these numbers need to be chosen again, and the numbers below
+do not apply.
+
+### Requirements
+
+| | Needed | Used |
+|---|---|---|
+| GPU | a CUDA GPU; for the image and the animation an RTX GPU supported by ovrtx | RTX PRO 3000 Blackwell, 12 GB, driver 580.178.04 |
+| Disk | example: 2.6 GB (plan 0.09 GB, run at 220 voxels 0.13 GB, run at 1024 voxels 2.4 GB); animation: 1.7 GB | |
+| CUDA toolkit | 12.0 or newer | 12.0 |
+| CCCL | a checkout of https://github.com/NVIDIA/cccl, if the toolkit's Thrust has no `<cuda/std/...>` headers | v3.7.0.dev-150-g051a9a7b20 |
+| Host compiler | C++17 | g++ 12.4.0 |
+| OpenVDB | an installation, for `band_to_mesh` | 13.0.1 |
+| Python, plan | `numpy`, `scipy` | Python 3.12.3, numpy 2.5.3, scipy 1.18.1 |
+| Python, image and animation | `ovrtx`, `ovstage`, `usd-core`, `numpy`, `scipy`, `Pillow` | ovrtx 0.5.1, ovstage 0.2.1, usd-core 26.8, Pillow 12.3.0 |
+| ffmpeg, font Linux Libertine O | for the animation | ffmpeg 6.1.1 |
+
+### Steps
+
+In `nanovdb/nanovdb/examples/ex_csg_nanovdb_cuda/hydra/`:
+
+```
+CCCL=<cccl checkout> OPENVDB_ROOT=<OpenVDB installation> ./build.sh
+export PLAN_PYTHON=<python with numpy, scipy>
+export RENDER_PYTHON=<python with the packages above>
+./run.sh <directory with the nine meshes> 220      # small run -> output/220/
+./run.sh <directory with the nine meshes>          # 1024 voxels along the body's longest extent -> output/1024/
+```
+
+The first run makes the plan (`output/plan/`: where each head is cut and where it goes), which takes about ten
+minutes; later runs reuse it.
+
+The animation, in `figure factory/CSG/hydra/` of the paper's repository:
+
+```
+<python with the packages above> make_animation.py --code <this repository> --meshes <directory with the nine meshes>
+```
+
+It runs the plan and the programs of this example again into its own `work/` folder (voxel pictures at 220 voxels,
+surface at 1024), renders 306 pictures and writes the movie to the path above. A path-traced picture of the surface at 1024 voxels
+took about 46 s.
+
+### Numbers
+
+Active voxels printed by `bin/hydra` (band half-width 3 voxels; the extent is that of the body):
+
+| Body's longest extent | body | the eight heads together | hydra | triangles of the surface |
+|---|---|---|---|---|
+| 220 voxels | 1,201,117 | 758,362 | 1,760,421 | 856,596 |
+| 1024 voxels | 29,480,970 | 17,874,439 | 42,967,024 | 21,174,084 |
+
+| Body's longest extent | inside, inactive voxels of leaves | inside, slots of lower nodes | inside, slots of upper nodes | surface voxels | of them on a cut |
+|---|---|---|---|---|---|
+| 220 voxels | 871,193 | 923 | 0 | 649,775 | 22 |
+| 1024 voxels | 32,611,628 | 323,945 | 0 | 14,707,876 | 175 |
+
+The run at 1024 voxels printed 7159.4 ms for the 17 conversions and 132.6 ms for the 16 CSG operations, each
+measured once and including the first-call start-up of the device code.
+
+### How closely a reproduction matches
+
+- **The level sets are deterministic for the same plan.** Two runs at 220 voxels wrote the same `body.band`,
+  `head_7.band` and `hydra.band`, byte for byte.
+- **The plan was made once.** Whether another machine, or other versions of numpy and scipy, give the same plan to
+  the last digit was not tested; a plan that differs moves a head slightly and changes the counts above.
+- **The pictures are path traced** and differ in noise from run to run.
+
+### How this branch's copy was checked
+
+Everything above was run on the laptop from this folder of the branch and from the paper repository's folder. It
+was not run on a second machine.
 
 ## Mean curvature flow
 

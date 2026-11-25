@@ -55,6 +55,37 @@ download link was not recorded.
 not. The example is not registered in `examples/CMakeLists.txt`: `build.sh` compiles it directly against this
 repository's headers.
 
+## The hydra
+
+The flow of the movie `hydra_mean_curvature_flow.mp4` starts from the hydra of `../ex_csg_nanovdb_cuda/hydra`: the surface of its
+result at 1024 voxels, written as a mesh, is converted again with a band of 5 voxels and flows at constant volume
+until it is a sphere.
+
+```
+(cd ../ex_csg_nanovdb_cuda/hydra && bin/band_to_mesh output/1024/hydra.band output/1024/hydra.obj)
+mkdir -p output/hydra/band
+bin/mesh_to_sdf_file ../ex_csg_nanovdb_cuda/hydra/output/1024/hydra.obj 1024 5 output/hydra/level_set.sdf > output/hydra/sdf.txt
+bin/mean_curvature_flow output/hydra/level_set.sdf output/hydra/band 248000 360 1 3 > output/hydra/run.log
+```
+
+These are the first two stages of `make_movie.sh` with the hydra's numbers; the script itself would go on to render
+the frames with this example's own camera and look. The paper's movie is drawn from `output/hydra/` by
+`figure factory/MeanCurvatureFlow/make_animation.py` of the paper's repository, with the scene of the hydra movie.
+
+The step count is that of a shorter run, scaled: at 256 voxels the area came within 0.4% of the area of the sphere
+of the same volume after 14,070 steps; the same time at 1024 voxels takes 16 times the steps, and 10% were added.
+
+On an NVIDIA GeForce RTX 5090 (`Reproduce.md` at the repository's root has the full table):
+
+| | |
+|---|---|
+| Input mesh | 10,586,792 vertices, 21,174,084 triangles |
+| Active voxels | 46,026,996 at the start, 12,241,518 at the end |
+| Time | 77.7 minutes for the 248,000 steps, 59 ms per step at the start and 17 ms at the end |
+| Area | 4,688,918 -> 1,221,639 voxels^2; the sphere of the same volume has 1,218,259 |
+| Volume | +0.094% over the run |
+| Frames | 361 files, 28 GB |
+
 ## Files
 
 | File | Content |

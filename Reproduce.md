@@ -11,6 +11,7 @@ Sections:
 - [Constructive solid geometry](#constructive-solid-geometry)
 - [Hydra](#hydra)
 - [Mean curvature flow](#mean-curvature-flow)
+- [Mean curvature flow of the hydra](#mean-curvature-flow-of-the-hydra)
 - [Mesh pile](#mesh-pile)
 
 ## City flood scene
@@ -521,6 +522,132 @@ kernel of its own. From this branch, on the laptop:
 - `make_movie.sh` at resolution 128 with 8 frames, from the mesh to the movie.
 
 The 60,000-step run and its 361 images were not repeated from this branch.
+
+## Mean curvature flow of the hydra
+
+The hydra of the section [Hydra](#hydra) flows by mean curvature with its volume preserved: the small features go
+first, the heads round off and merge into the body, and the body ends as a sphere of the hydra's volume. The
+programs are those of the section [Mean curvature flow](#mean-curvature-flow); the input and the number of steps
+differ.
+
+| | |
+|---|---|
+| Code | `nanovdb/nanovdb/examples/ex_mean_curvature_flow_cuda/` (the flow; its `README.md` has a part on the hydra) and `nanovdb/nanovdb/examples/ex_csg_nanovdb_cuda/hydra/` (the input) |
+| Result | `output/hydra/` of the flow's folder: `sdf.txt`, `run.log` and `band/f_000.band` to `f_360.band`, the 361 frames |
+| Animation | `Supplementary material/video/Applications/hydra_mean_curvature_flow.mp4` of the paper's repository (408 frames, 1920 x 1080, 24 frames per second, 17.0 s), made by `figure factory/MeanCurvatureFlow/make_animation.py` of the paper's repository from this result; the `README.md` there describes it. Its first frame is the last frame of `hydra.mp4`. |
+| Hardware of the flow | NVIDIA GeForce RTX 5090 (32 GB) |
+| Hardware of the pictures | NVIDIA RTX PRO 3000 Blackwell laptop GPU (12 GB) |
+| Simulation | 248,000 steps in 77.7 min (81.3 min with writing the frames) |
+
+### Input
+
+The surface of the hydra at 1024 voxels (`output/1024/hydra.band` of the hydra's folder, from `./run.sh <meshes>`
+of the section [Hydra](#hydra)), written as an OBJ file by that example's `band_to_mesh`: 10,586,792 vertices,
+21,174,084 triangles, 820 MB. Its coordinates are voxels of the hydra's level set.
+
+### Requirements
+
+| | Needed | Used |
+|---|---|---|
+| GPU | 10 GB: on the laptop GPU the conversion of the mesh took 8,740 MiB and the flow's first 43 steps 1,032 MiB (memory in use on the device, sampled every 0.2 s, above what was in use before) | flow: GeForce RTX 5090, 32 GB, driver 595.112.07 |
+| Disk | 29 GB: the mesh 0.8 GB, the level set 0.2 GB, the frames 28 GB | |
+| CUDA toolkit | 12.0 or newer | 12.9 on the RTX 5090, 12.0 on the laptop |
+| CCCL | a checkout of https://github.com/NVIDIA/cccl, if the toolkit's Thrust has no `<cuda/std/...>` headers | on the RTX 5090: a checkout whose version was not recorded |
+| OpenVDB | an installation, for `band_to_mesh` (the input) and `mesh_band` (the pictures) | 13.0.1, on the laptop |
+| Animation | the hydra's animation made first, and what the paper repository's `figure factory/MeanCurvatureFlow/README.md` lists | |
+
+On the RTX 5090 the memory in use on the device, sampled once a second over the conversion and the flow, peaked at
+6,559 MiB (323 MiB were in use before); a sample a second can miss the conversion's peak.
+
+### Steps
+
+```
+# in nanovdb/nanovdb/examples/ex_csg_nanovdb_cuda/hydra/, after its run at 1024 voxels
+bin/band_to_mesh output/1024/hydra.band output/1024/hydra.obj
+
+# in nanovdb/nanovdb/examples/ex_mean_curvature_flow_cuda/, after its build.sh
+mkdir -p output/hydra/band
+bin/mesh_to_sdf_file ../ex_csg_nanovdb_cuda/hydra/output/1024/hydra.obj 1024 5 output/hydra/level_set.sdf > output/hydra/sdf.txt
+bin/mean_curvature_flow output/hydra/level_set.sdf output/hydra/band 248000 360 1 3 > output/hydra/run.log
+```
+
+The animation, in `figure factory/MeanCurvatureFlow/` of the paper's repository, after the hydra's animation has
+been made there:
+
+```
+<python with ovrtx> make_animation.py --code <this repository> --run <the flow's output/hydra> \
+    --gpu "NVIDIA GeForce RTX 5090" --timing-log ../CSG/hydra/timing_rtx5090/log_1024_2.txt
+```
+
+It turns every frame into triangles with this example's `bin/mesh_band`, renders 361 pictures with the scene of
+the hydra animation's last picture, and writes the movie to the path above. `output/hydra/` can be copied from
+the machine that ran the flow to the one that renders.
+
+### Settings
+
+| | |
+|---|---|
+| Level set (`mesh_to_sdf_file`) | 1024 voxels along the mesh's longest side (voxel size 1.20395 in the mesh's units), band of 5 voxels on either side |
+| Flow (`mean_curvature_flow`) | volume-preserving, 248,000 steps, time step `dx^2 / 3` |
+| Frames | 361; frame k after `round(248000 (k / 360)^3)` steps, so frames 0 to 4 are at step 0 |
+| Number of steps | from a run at 256 voxels (60,000 steps, same schedule): the area was within 0.4% of the area of the sphere of the same volume after 14,070 steps; times 16 for the same time at 1024 voxels, plus 10%, rounded up to a thousand |
+| Tracker | `LevelSetTracker` defaults: HJ-WENO5, TVD-RK2, 3 renormalization steps per `track()` |
+| Pictures | 1920 x 1080, path tracing, 96 samples per pixel; camera, material, floor and lights of the hydra animation's picture `surface_000` |
+| Movie | ffmpeg, libx264, crf 18, 24 frames per second |
+
+### Numbers
+
+`output/hydra/sdf.txt`: 46,026,996 active voxels, 22,617,630 of them negative.
+
+From `output/hydra/run.log` on the RTX 5090 (area and volume in voxels, from the band alone; the average curvature
+in 1 / voxel; the time per step since the frame before):
+
+| Frame | Step | Active voxels | Area | Volume against the start | Average curvature | Time per step |
+|---|---|---|---|---|---|---|
+| 0 | 0 | 46,026,996 | 4,688,917.6 | | | |
+| 60 | 1,148 | 32,808,745 | 3,275,203.9 | +0.122% | 0.005749 | 40.4 ms |
+| 120 | 9,185 | 22,664,283 | 2,261,861.5 | +0.117% | 0.004552 | 28.9 ms |
+| 180 | 31,000 | 16,575,583 | 1,654,403.2 | +0.110% | 0.003575 | 22.2 ms |
+| 240 | 73,481 | 12,888,355 | 1,286,508.9 | +0.105% | 0.003183 | 17.7 ms |
+| 300 | 143,519 | 12,380,063 | 1,235,556.8 | +0.100% | 0.003208 | 17.2 ms |
+| 360 | 248,000 | 12,241,518 | 1,221,639.0 | +0.094% | 0.003211 | 16.9 ms |
+
+The starting volume is 126,320,309.5 voxels. The measured volume is +0.094% after the first step, at most +0.123%
+(step 105) and +0.094% at the end. The sphere of the last frame's volume has radius 311.36 voxels, area
+1,218,259 and curvature 0.003212; the last frame's area is 0.28% above it. In the pictures the surface stays in
+one piece.
+
+The times per step, each multiplied by the steps of its stretch, add up to 4,663 s (77.7 min, 18.8 ms per step on
+average); the first step took 59 ms. The program ran for 81.3 min.
+
+### How closely a reproduction matches
+
+- **The level set and the start of the flow are the same byte for byte on two GPUs.** From this branch on the
+  laptop GPU: `hydra.obj`, the level set at 1024 voxels and the frame after 43 steps equal the files of the RTX 5090's
+  run; so do the level set at 256 voxels and the frame after 278 steps of the run at 256 voxels. Whether a whole
+  run is the same was not checked.
+- **The times are not deterministic.**
+- **The pictures are path traced** and differ in noise from run to run; the paper repository's `README.md` gives
+  the differences that were measured.
+
+### How this branch's copy was checked
+
+The RTX 5090's run was made with a copy of this branch's sources (the same headers, `MeanCurvature.cuh`,
+`mesh_to_sdf_file.cu` and `build.sh`) in which `mean_curvature_flow.cu` also saved its state every five minutes,
+so that a run that had stopped could go on. That code is not in this branch; the run was not interrupted.
+
+From this branch, on the laptop:
+
+- `build.sh` builds the four programs.
+- `band_to_mesh` on the hydra's `output/1024/hydra.band`: the OBJ file is identical to the one the run started from.
+- `mesh_to_sdf_file` at 1024 voxels: the file is identical to the level set of the RTX 5090's run (14.8 s with
+  reading the mesh).
+- `mean_curvature_flow` at 1024 voxels for 43 steps: frame 0 and the frame after 43 steps are identical to frames 0
+  and 20 of the RTX 5090's run (256 ms per step).
+- The same at 256 voxels: the level set, and the frame after 278 steps against frame 60 of the RTX 5090's run at
+  256 voxels, are identical.
+
+The 248,000-step run was not repeated from this branch.
 
 ## Mesh pile
 

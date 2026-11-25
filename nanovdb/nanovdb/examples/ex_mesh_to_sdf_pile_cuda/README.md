@@ -106,7 +106,7 @@ paper's repository.
 | `sdf.faces` | Every interior voxel of the band that has an exterior face neighbour, 7 bytes each: the surface as the voxels see it. 1.4 GB for the paper's run. |
 | `sdf_slice_0.bin` .. `sdf_slice_71.bin` | The signed distance on 72 horizontal planes from height 0.38 down to the ground, every 4th voxel at 2048 voxels per unit: the value of an active voxel, elsewhere plus or minus the band width by the sign `PropagateSign` gives. Also, per sample, where the tree stores that sign. |
 | `sdf_slice_72.bin` | The plane at height 0.2462, every voxel. |
-| `run.log` | The GPU, the stage times and the `RESULT` line. |
+| `run.log` | The GPU, the stage times, the `RESULT` line and the index bounding box of the active voxels. |
 
 ## Numbers
 
@@ -115,7 +115,7 @@ One run on an NVIDIA GeForce RTX 5090 (32 GB), CUDA toolkit 12.9, built with `-a
 
 | | |
 |---|---|
-| Active voxels | 1,416,920,079, in a bounding box of about 27 billion |
+| Active voxels | 1,416,920,079, in an index bounding box of 15,659 x 2,230 x 774 voxels (27.0 billion) |
 | Connected components of the band | 91 |
 | Interior voxels of the band | 723,890,059; 202,914,956 of them have an exterior face neighbour (286,485,298 faces) |
 | Rasterizing the mesh | 5028.6 ms |

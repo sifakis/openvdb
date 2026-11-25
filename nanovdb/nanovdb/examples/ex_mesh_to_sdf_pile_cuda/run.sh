@@ -41,6 +41,6 @@ SLICES=$(awk -v s="$STRIDE" 'BEGIN { for (k = 0; k < 72; ++k) printf "%sz%.5f:%d
 } > "$OUT/run.log"
 SHIFT_VOXELS="$SHIFT" bin/mesh_to_sdf_pile "$OUT/scene/soup.bin" "$VOXELS" "$OUT/sdf" 3 ball 0 "$SLICES" >> "$OUT/run.log" 2>&1
 CODE=$?
-grep -E "completed|RESULT|interior voxels" "$OUT/run.log"
+grep -E "completed|RESULT|interior voxels|bounding box" "$OUT/run.log"
 if [ $CODE -ne 0 ]; then tail -n 3 "$OUT/run.log"; echo "FAILED (exit code $CODE), see $OUT/run.log"; fi
 exit $CODE

@@ -605,6 +605,7 @@ The conversion on the RTX 5090, one run:
 | | |
 |---|---|
 | Active voxels | 1,416,920,079 |
+| Index bounding box of the active voxels | 15,659 x 2,230 x 774 voxels: indices 75..15733, -92..2137, -58..715 in the scene's frame |
 | Connected components of the band | 91 |
 | Interior voxels of the band | 723,890,059; 202,914,956 of them on the surface |
 | Rasterizing / partitioning / signing / nesting rule | 5028.6 ms / 194.4 ms / 1172.4 ms / 10.8 ms |
@@ -644,5 +645,11 @@ laptop:
   pictures it puts together the same frames, pixel for pixel, up to the last part, which it added; pictures it
   rendered again equal the movie's exactly or up to path-tracing noise (that folder's `README.md` has the list).
 
-The conversion of the whole scene at 2048 voxels per unit was not repeated from this branch, and `run.sh` was not
-run on the RTX 5090.
+The conversion of the whole scene at 2048 voxels per unit was repeated on the RTX 5090 with this branch's
+`mesh_to_sdf_pile.cu`, built against a copy of this branch's headers and given the arguments of `run.sh`: the same
+triangles, active voxels, components and pool peak; `sdf.faces` and the plane at height 0.2462 are identical to the
+paper run's files (SHA-256); the 72 horizontal planes have the same headers and the same values, bit for bit (the
+paper run's files are of an earlier format, without the bytes that say where a sample's sign is stored). This run
+printed the index bounding box above; when the paper's run was made, the converter did not print it. Its times:
+5033.0 / 195.7 / 1191.2 / 10.8 ms for the four stages, 6448.4 ms for the whole call. `run.sh` itself was not run on
+the RTX 5090.

@@ -13,7 +13,7 @@
 // from the origin: SignCertifier (BarrierSigning::Ball) was seen to give wrong signs where a voxel's index exceeds
 // 8192, where float32 world coordinates are only good to about 1/1000 voxel.
 // Prints the stage timings, the active voxels, the components of the band and the high-water mark of the CUDA
-// memory pool. Writes
+// memory pool; with the files, also the index bounding box of the active voxels in the soup's own frame. Writes
 //   <out prefix>.faces  the surface as the voxels see it: every interior voxel (phi < 0) that has an exterior face
 //                       neighbour. char[8] "FACES001", uint64 count, double voxel size; then per voxel int16 i, j, k
 //                       and a uint8 whose bit f is set when the neighbour in direction f (+x, -x, +y, -y, +z, -z)
@@ -37,6 +37,7 @@
 #include <nanovdb/tools/cuda/PropagateSign.cuh>
 #include <nanovdb/util/cuda/DeviceGridTraits.cuh>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -212,6 +213,7 @@ int main(int argc, char** argv)
     const bool writeBand = argc > 6 && std::atoi(argv[6]) != 0;
     std::vector<char> records, faces;
     uint64_t bandCount = 0, negative = 0, surfaceVoxels = 0, faceCount = 0;
+    int boxLo[3] = {INT_MAX, INT_MAX, INT_MAX}, boxHi[3] = {INT_MIN, INT_MIN, INT_MIN}; // of the active voxels
     static const int step[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
     for (uint32_t l = 0; l < tree.nodeCount(0); ++l) {
         const auto& leaf = tree.template getFirstNode<0>()[l];
@@ -220,6 +222,7 @@ int main(int argc, char** argv)
             const nanovdb::Coord c = leaf.offsetToGlobalCoord(n);
             const float p = float(phi[leaf.getValue(n)] / vs);
             const int16_t xyz[3] = {int16_t(c[0] - shift[0]), int16_t(c[1] - shift[1]), int16_t(c[2] - shift[2])};
+            for (int a = 0; a < 3; ++a) boxLo[a] = std::min(boxLo[a], c[a] - shift[a]), boxHi[a] = std::max(boxHi[a], c[a] - shift[a]);
             if (writeBand && std::fabs(p) < 2.f) {
                 records.insert(records.end(), reinterpret_cast<const char*>(xyz), reinterpret_cast<const char*>(xyz) + 6);
                 records.insert(records.end(), reinterpret_cast<const char*>(&p), reinterpret_cast<const char*>(&p) + 4);
@@ -259,5 +262,7 @@ int main(int argc, char** argv)
     }
     std::printf("%llu interior voxels of the band; %llu of them have an exterior neighbour, with %llu faces in all -> %s.faces\n",
                 (unsigned long long)negative, (unsigned long long)surfaceVoxels, (unsigned long long)faceCount, prefix.c_str());
+    std::printf("active voxels: indices %d..%d, %d..%d, %d..%d; bounding box %d x %d x %d voxels\n", boxLo[0], boxHi[0], boxLo[1], boxHi[1],
+                boxLo[2], boxHi[2], boxHi[0] - boxLo[0] + 1, boxHi[1] - boxLo[1] + 1, boxHi[2] - boxLo[2] + 1);
     return 0;
 }

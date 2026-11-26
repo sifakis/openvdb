@@ -7,9 +7,10 @@
 From out.log: the number of steps, the mean time per step, the peak device memory and the range of the water's volume
 (level set + drops, in percent of the start). From each given frame (default: the last one), with the voxel size of
 voxel.txt: the wet cells below street level under the city blocks (x 520..1000 m, z < 812 m, more than 1.5 m below the
-street; west and east of that the river itself is there), which must be 0 if the ground holds the water; how far the
-water on the streets reaches; and in four places the share of columns that are wet and of those the share at least
-three cells deep, which is the least the solver carries well.
+street; west and east of that the river itself is there), which must be 0 if the ground holds the water; the wet
+cells more than 4 m below the street anywhere (the basin's floor is 3 m below it); how far the water on the streets
+reaches; and in four places the share of columns that are wet and of those the share at least three cells deep, which
+is the least the solver carries well.
 A frame file holds the level set within 2 voxels of the surface: int32 count, nx, ny, nz, then per cell int16 x, y, z
 and float32 value (negative in the water). Cell (i, j, k) is at world (i h, j h - 21, k h) meters.
 """
@@ -37,7 +38,7 @@ for frame in frames:
     x, y, z = wet[:, 0] * h, wet[:, 1] * h - 21, wet[:, 2] * h
     under = (x > 520) & (x < 1000) & (z < 812) & (y < -1.5)
     street = (y > -1.0) & (z < 812)
-    print(f"frame {int(frame)}: {count} band cells, {len(wet)} wet, {under.sum()} wet under the blocks; "
+    print(f"frame {int(frame)}: {count} band cells, {len(wet)} wet, {under.sum()} wet under the blocks, {(y < -4.0).sum()} wet more than 4 m below the street; "
           f"street water x {x[street].min():.0f}..{x[street].max():.0f} m, z {z[street].min():.0f}..{z[street].max():.0f} m")
     for name, (x0, x1, z0, z1) in places.items():
         inside = (x >= x0) & (x < x1) & (z >= z0) & (z < z1) & (y > -1.0)

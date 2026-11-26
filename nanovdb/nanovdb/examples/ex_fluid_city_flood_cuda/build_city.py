@@ -19,6 +19,9 @@ river, up to just below the streets, and a prism from every roof triangle down t
 Tank frame: cell (i, j, k) covers world [i h, (i + 1) h] x [j h - base, (j + 1) h - base] x [k h, (k + 1) h], where
 base (21 m) puts the river bed above the tank's floor; the mesh is written as (world + (0, base, 0)) - h / 2, so its
 coordinate divided by h is the cell-center index.
+--bankwall height x z x z ...: a wall 2 m thick along the polyline (x, z), from 1 m below the street to `height`
+above it; it can be given several times. For walls that follow the bank where it is not parallel to x. Its mesh is
+also written to <out>.bankwalls.obj in world meters, for a renderer.
 --region x0 x1 z0 z1: only the city's triangles with their centroid in this rectangle, and the ground blocks cut to it,
 are written (the solids the water can reach in the run; the tank stays the whole city).
 --clip <m>: every triangle is cut at this height above the street (0: not cut). The water never gets higher, and the
@@ -40,6 +43,7 @@ p.add_argument("--gate", type=float, nargs="+", default=[760.0, 790.0])       # 
 p.add_argument("--parapet", type=float, nargs=3)                              # x0 x1 height: a low wall along the bank
 p.add_argument("--wall", type=float, default=2.0)                             # thickness of the walls
 p.add_argument("--clip", type=float, default=0.0)
+p.add_argument("--bankwall", type=float, nargs="+", action="append", default=[])
 p.add_argument("--region", type=float, nargs=4)                               # x0 x1 z0 z1: only the solids in this rectangle
 a = p.parse_args()
 h = a.voxel
@@ -190,6 +194,26 @@ for west, east in zip(ends[0::2], ends[1::2]):                       # the flood
 if a.parapet:
     box((a.parapet[0], -1.0, bank - T), (x0 - T, a.parapet[2], bank + 0.5))
     box((x1 + T, -1.0, bank - T), (a.parapet[1], a.parapet[2], bank + 0.5))
+wall_points, wall_tris = [], []
+for spec in a.bankwall:
+    height, line = spec[0], np.asarray(spec[1:], np.float64).reshape(-1, 2)
+    for (xa, za), (xb, zb) in zip(line[:-1], line[1:]):
+        along = np.array([xb - xa, zb - za])
+        length = np.linalg.norm(along)
+        along /= length
+        side = np.array([-along[1], along[0]])                       # (along, up, side) is right-handed, as (x, y, z)
+        ends = [np.array([xa, za]) - 0.5 * T * along, np.array([xb, zb]) + 0.5 * T * along]   # the pieces overlap at the corners
+        pts = [(e[0] + w * side[0], y, e[1] + w * side[1]) for e in ends for y in (-1.0, height) for w in (-0.5 * T, 0.5 * T)]
+        quads = [(0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1), (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)]
+        piece = np.asarray([q[:3] for q in quads] + [(q[0], q[2], q[3]) for q in quads], np.int64)
+        wall_tris.append(piece + 8 * len(wall_points))
+        wall_points.append(np.asarray(pts, np.float64))
+        add(pts, piece)
+if wall_points:
+    with open(a.out + ".bankwalls.obj", "w") as f:
+        np.savetxt(f, np.vstack(wall_points), fmt="v %.5f %.5f %.5f")
+        np.savetxt(f, np.vstack(wall_tris) + 1, fmt="f %d %d %d")
+    print(f"bank walls: {len(wall_points)} pieces")
 
 # gen_sdf takes the mesh's largest extent divided by its resolution as the voxel size: two specks at the tank's floor make
 # the extent along x a whole number of voxels, so that the voxel size is h exactly.

@@ -6,8 +6,10 @@
 # bin/mesh_band) and renders output/<name>/<movie name>/movie.mp4 at 24 frames per second (the run has 8 frames per
 # simulated second, so the movie plays at three times real time). Defaults: name "flood", movie name "movie", and the
 # look of the paper's movie.
-# A frame that has a mesh newer than its band file and an image newer than that mesh is not redone, so the script can
-# be stopped and started again. A batch whose renderer crashed is tried again, up to three passes.
+# A frame's mesh is made right before its batch is rendered. A frame that has an image newer than its band file is
+# not redone, so the script can be stopped and started again. A batch whose renderer crashed is tried again, up to
+# three passes. REMOVE_MESH=1 removes a batch's meshes once its images exist: the 641 meshes of the paper's run are
+# 147 GB together (62 to 451 MB each), and making one takes about a second.
 #
 # Needs: bin/mesh_band (./build.sh with an OpenVDB installation), ffmpeg, the city pack in assets/ (./get_assets.sh)
 # and RENDER_PYTHON: a Python with ovrtx, ovstage, pxr (usd-core), numpy and Pillow (default: python3).
@@ -21,8 +23,9 @@
 #   BATCH   frames per renderer process (default 2)
 #   FIRST, LAST   a frame range; no movie is made then
 # Water layers one cell deep are not drawn, and drops only over water three cells deep: the solver cannot carry
-# thinner water (it stalls and flickers). The boxes drawn (the basin and the walls) are the scene's own: the
-# RENDER_BOXES line of output/<name>/build.txt.
+# thinner water (it stalls and flickers). The boxes drawn (the basin and the flood wall) are the scene's own: the
+# RENDER_BOXES line of output/<name>/build.txt. The walls along the bank, if the scene has them
+# (output/<name>/scene.obj.bankwalls.obj), are drawn as the same concrete.
 set -u
 cd "$(dirname "$0")"
 NAME=${1:-flood}; MOVIE=${2:-movie}
@@ -40,21 +43,25 @@ SIZE=${SIZE:---width 2560 --height 1440}
 SPRAY=${SPRAY:---spray-above 0.6 --spray-in-air 1.0 --spray-min-depth 3 --spray-scale 2 --spray-min 0.06 --spray-max 600000 --spray-color 0.90 0.94 0.97}
 WATER=${WATER:-0.40 0.62 0.60 4 --water-roughness 0.08}   # grey-green, slightly rough
 BOXES=$(grep "^RENDER_BOXES=" $D/build.txt | cut -d= -f2)
-LOOK="--thin --water $WATER --water-min-cells 2 --dome 1000 --sun 50 60 8 --box $BOXES --spray $D/out $SPRAY"
+WALLS=; [ -s $D/scene.obj.bankwalls.obj ] && WALLS="--walls $D/scene.obj.bankwalls.obj"
+LOOK="--thin --water $WATER --water-min-cells 2 --dome 1000 --sun 50 60 8 --box $BOXES $WALLS --spray $D/out $SPRAY"
 N=${BATCH:-2}
-one() {  # render the frames $1..$2
+one() {  # mesh and render the frames $1..$2
+  local i f
+  for ((i = $1; i <= $2; ++i)); do
+    f=$(printf "f_%03d" $i)
+    [ -s $M/$f.meshbin ] && [ $M/$f.meshbin -nt $D/out/$f.band ] || bin/mesh_band $D/out/$f.band $M/$f.meshbin > /dev/null || echo "MESH FAILED $f"
+  done
   $PY render_city.py $D/$MOVIE --frames $M --voxel $H --origin 0 -21 0 --first $1 --count $(($2 - $1 + 1)) $CAM $SIZE --samples 48 $LOOK \
     > $D/$MOVIE/render_$1.log 2>&1 || { echo "RENDER FAILED at $1"; tail -n 3 $D/$MOVIE/render_$1.log | cut -c1-300; }
+  [ "${REMOVE_MESH:-0}" = 1 ] || return 0
+  for ((i = $1; i <= $2; ++i)); do [ -s $D/$MOVIE/$(printf "frame_%04d.png" $i) ] && rm -f $M/$(printf "f_%03d.meshbin" $i); done
 }
 for pass in 1 2 3; do
-  for ((i = first; i <= last; ++i)); do
-    f=$(printf "f_%03d" $i)
-    [ -s $M/$f.meshbin ] && [ $M/$f.meshbin -nt $D/out/$f.band ] || echo $f
-  done | xargs -r -P 2 -I{} sh -c "bin/mesh_band $D/out/{}.band $M/{}.meshbin > /dev/null || echo MESH FAILED {}"
   for ((b = first; b <= last; b += N)); do
     e=$((b + N - 1 > last ? last : b + N - 1))
     todo=0
-    for ((i = b; i <= e; ++i)); do [ $D/$MOVIE/$(printf "frame_%04d.png" $i) -nt $M/$(printf "f_%03d.meshbin" $i) ] || todo=1; done
+    for ((i = b; i <= e; ++i)); do [ $D/$MOVIE/$(printf "frame_%04d.png" $i) -nt $D/out/$(printf "f_%03d.band" $i) ] || todo=1; done
     [ $todo = 1 ] && one $b $e
   done
   missing=0

@@ -12,6 +12,8 @@ Everything is in the scene's world frame, in meters: x 0..1911, y up from the st
 tools/export_city.py writes the obstacle mesh in the same frame. A water vertex in cell-center coordinates c goes to
 (c + 0.5) * voxel + origin (origin 0 -21 0 for build_city.py's tank).
 --box x0 y0 z0 x1 y1 z1 ...: plain concrete boxes, for the basin's walls and the flood wall.
+--walls FILE: an OBJ triangle mesh drawn as the same concrete: the walls along the bank, which build_city.py writes
+as <scene>.bankwalls.obj.
 Needs a Python with ovrtx, ovstage, pxr (usd-core), numpy and Pillow.
 """
 import argparse, time
@@ -201,6 +203,18 @@ def author(args, frames, dest, first=0):
         for k in range(0, len(args.box), 6):
             b = args.box[k:k + 6]
             cube(stage, f"Box{k // 6}", [(b[a] + b[a + 3]) / 2 for a in range(3)], [b[a + 3] - b[a] for a in range(3)], gray)
+    if args.walls:  # a triangle mesh (OBJ: v and f lines) drawn as concrete with flat faces: the walls along the bank
+        lines = [line.split() for line in open(args.walls)]
+        points = np.array([[float(v) for v in l[1:4]] for l in lines if l and l[0] == "v"], np.float32)
+        faces = np.array([[int(v.split("/")[0]) - 1 for v in l[1:4]] for l in lines if l and l[0] == "f"], np.int32)
+        walls = UsdGeom.Mesh.Define(stage, "/World/Walls")
+        walls.CreateSubdivisionSchemeAttr("none")
+        walls.CreatePointsAttr(Vt.Vec3fArray.FromNumpy(points))
+        walls.CreateFaceVertexCountsAttr(Vt.IntArray.FromNumpy(np.full(len(faces), 3, np.int32)))
+        walls.CreateFaceVertexIndicesAttr(Vt.IntArray.FromNumpy(faces.reshape(-1)))
+        walls.CreateDoubleSidedAttr(True)
+        walls.CreateExtentAttr(Vt.Vec3fArray.FromNumpy(np.array([points.min(0), points.max(0)], np.float32)))
+        UsdShade.MaterialBindingAPI.Apply(walls.GetPrim()).Bind(material(stage, "WallConcrete", (0.55, 0.55, 0.53), 0.8))
 
     camera = UsdGeom.Camera.Define(stage, "/World/Camera")
     camera.CreateFocalLengthAttr(args.focal)
@@ -326,6 +340,7 @@ if __name__ == "__main__":
     p.add_argument("--target2", type=float, nargs=3)
     p.add_argument("--total", type=int, default=240)  # frames of the whole movie (for the camera move)
     p.add_argument("--box", type=float, nargs="*", default=[])
+    p.add_argument("--walls", type=Path)  # an OBJ triangle mesh drawn as concrete
     p.add_argument("--dome", type=float, default=800)
     p.add_argument("--sun", type=float, nargs=3)  # elevation, azimuth (degrees), intensity
     p.add_argument("--water", type=float, nargs=4, default=[0.72, 0.90, 0.97, 4.0])  # color r g b, depth in m

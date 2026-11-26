@@ -3,7 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # run_city.sh [name] [voxel in m] [seconds] [build_city.py options]: the city flood. Builds the scene's solids
-# (build_city.py: the city, the ground under it, the basin in the river, the flood wall with its openings), runs
+# (build_city.py: the city, the ground under it, the basin in the river, the flood wall with its openings, the walls
+# along the bank), runs
 # MeshToSDF on them and then the solver; everything goes to output/<name>/. Without arguments it is the paper's run:
 # name "flood", 0.25 m voxels, 80 seconds, and the scene options listed below as SCENE.
 # The solids are built once per name (output/<name>/scene.sdf is reused).
@@ -13,6 +14,7 @@
 #
 # Output in output/<name>/:
 #   build.txt    the scene: triangle counts, the tank size in cells, the basin's water box, the boxes a renderer draws
+#   scene.obj.bankwalls.obj   the walls along the bank as a mesh, for render_movie.sh
 #   voxel.txt    the voxel size, for render_movie.sh
 #   sdf.txt      MeshToSDF's report (voxel size, active and negative voxels)
 #   scene.sdf    the solids as the solver reads them
@@ -23,8 +25,8 @@
 #                newest are kept
 #
 # If the solver stops with an error it is started again from the newest state file, up to MAX_ATTEMPTS (default 6)
-# times and at most twice from the same file. The water and its velocity continue exactly; the drops in the air and
-# the marker particles are not in the file and start anew there. Frames after that time are written again.
+# times and at most twice from the same file. The file holds the water, its velocity, the marker particles and the
+# drops in the air, so the run goes on with all of them. Frames after that time are written again.
 #
 # Solver switches (environment; the defaults are the ones of the paper's run):
 #   PLS=16 PLS_WIDTH=2   marker particles (particle level set): 16 per cell within 2 cells of the surface
@@ -37,7 +39,14 @@ set -u
 cd "$(dirname "$0")"
 NAME=${1:-flood}; H=${2:-0.25}; END=${3:-80}
 if [ $# -gt 3 ]; then shift 3; SCENE=("$@")
-else SCENE=(--basin 550 1000 100 --head 10 --gate 655 700 740 810 855 900 --parapet 520 1150 4 --clip 12 --region 150 1500 0 930); fi
+else
+  # The walls along the bank, 8 m high, as polylines x z x z ...: west of the basin, and east of it with a last piece
+  # across the east end of the ground.
+  WEST=(548 812 520 809.5 480 808.5 440 806.5 400 801.5 360 796.5 320 790.5 280 784.5 240 776.5 200 767.5 160 758.5 120 750.5 80 740.5 40 722.5 3 706)
+  EAST=(1002 813.5 1060 824.5 1120 835.5 1180 848.5 1240 864.5 1300 878.5 1360 888.5 1420 895.5 1460 899.5 1490 905.5 1520 910.5 1550 916.5 1580 919.5 1598 921.5 1598 2)
+  SCENE=(--basin 550 1000 100 --head 14 --gate 560 600 655 700 740 810 855 900 950 990 --clip 16 --region 0 1600 0 930
+         --bankwall 8 "${WEST[@]}" --bankwall 8 "${EAST[@]}")
+fi
 PY=${RENDER_PYTHON:-python3}
 D=output/$NAME
 LOG=$D/out.log

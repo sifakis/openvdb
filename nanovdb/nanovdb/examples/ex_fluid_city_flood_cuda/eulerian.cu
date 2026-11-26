@@ -407,7 +407,7 @@ struct Simulation
     double volumeErrorSum = 0;   // sum of x over the steps so far
     double volumeNow = 0, volumeError = 0, controlDivergence = 0; // of the last step
     // Particle level set (pls.cuh; PLS=<particles per cell>): marker particles move with the flow and rebuild the level
-    // set where it lost or gained water against them. Not in the checkpoints: a continued run seeds them again.
+    // set where it lost or gained water against them. A checkpoint holds them (see save()).
     std::optional<pls::Particles> markers;
     // SPRAY=1: escaped negative markers become drops that carry the volume the level set loses (spray.cuh).
     std::optional<spray::Drops> drops;
@@ -645,7 +645,7 @@ struct Simulation
     {
         const GridT*   grid   = this->bandGrid();
         const uint32_t leaves = nanovdb::util::cuda::DeviceGridTraits<BuildT>::getTreeData(grid, cudaStream_t(0)).mNodeCount[0];
-        markers->reseed(grid, leaves, band->phi.size(), band->phi.data(), this->masksOf(*band), solid, uint32_t(stats.steps) * 2654435761u + 12345u);
+        markers->reseed(grid, leaves, band->phi.size(), band->phi.data(), this->masksOf(*band), solid, uint32_t(stats.steps + stepsBefore) * 2654435761u + 12345u);
         markerLost += markers->lost;
     }
     void correctWithMarkers(StateT& s)
@@ -800,7 +800,7 @@ struct Simulation
     template <typename DisplacementT>
     void transportBand(DisplacementT displacement)
     {
-        if (markers && stats.steps % reseedEvery == 0) this->reseedMarkers();
+        if (markers && (stats.steps + stepsBefore) % reseedEvery == 0) this->reseedMarkers();
         const uint32_t bandLeaves = nanovdb::util::cuda::DeviceGridTraits<BuildT>::getTreeData(this->bandGrid(), cudaStream_t(0)).mNodeCount[0];
         const size_t   bandCount  = band->phi.size();
         BufferT<float> scratch    = makeBuffer<float>(3 * bandCount);
@@ -896,7 +896,7 @@ struct Simulation
         stats.maxSpeed = this->maxSpeed();
         const double dt = std::min(dtLimit, cfl / (stats.maxSpeed + std::sqrt(gravity)));
         stats.dt = dt;
-        if (markers && stats.steps % reseedEvery == 0) this->reseedMarkers();
+        if (markers && (stats.steps + stepsBefore) % reseedEvery == 0) this->reseedMarkers();
         const advect::StaggeredVelocity carried{this->domainGrid(), {u[0].data(), u[1].data(), u[2].data()}, advect::RealT(dt)};
         if (diagnose) {
             double budget[8];
@@ -1271,6 +1271,19 @@ struct Simulation
         put(domainPhi->data(), domainPhi->size_bytes());
         put(released->data(), released->size_bytes());
         for (int a = 0; a < 3; ++a) put(u[a].data(), u[a].size_bytes());
+        // The marker particles and the drops, after the fields (a file that ends here is one without them): the step
+        // count since the run's start, which the reseeding and its random numbers follow; the sums of the spray's budget and of the report;
+        // every chunk of markers as it is on the device; the drops.
+        const uint64_t tail[2]   = {kCheckpointTail, uint64_t(stats.steps + stepsBefore)};
+        const double   sums[3]   = {waterTarget, sprayEmitted, sprayDeposited};
+        const int64_t  counts[5] = {airRemoved, markerEscaped[0], markerEscaped[1], markerSignChanges, markerLost};
+        const uint64_t chunks    = markers ? markers->chunks.size() : 0;
+        os.write(reinterpret_cast<const char*>(tail), sizeof(tail));
+        os.write(reinterpret_cast<const char*>(sums), sizeof(sums));
+        os.write(reinterpret_cast<const char*>(counts), sizeof(counts));
+        os.write(reinterpret_cast<const char*>(&chunks), sizeof(chunks));
+        for (uint64_t c = 0; c < chunks; ++c) put(markers->chunks[c].data().get(), pls::Particles::kChunk * sizeof(pls::Particle));
+        put(drops ? drops->drops.data().get() : nullptr, drops ? drops->drops.size() * sizeof(spray::Drop) : 0);
         os.close();
         std::rename((path + ".tmp").c_str(), path.c_str());
     }
@@ -1286,6 +1299,10 @@ struct Simulation
         if (n) cudaCheck(cudaMemcpy(static_cast<void*>(b.data()), host.data(), n, cudaMemcpyHostToDevice));
         return b;
     }
+    static constexpr uint64_t kCheckpointTail = 0x53504f5244534c50ull; // "PLSDROPS": the markers and the drops follow
+    bool restoredParticles = false; // load() found them in the file
+    long stepsBefore = 0; // steps of the run before the checkpoint this process started from; stats.steps counts from there
+
     void load(const std::string& path, double extra[3])
     {
         std::ifstream is(path, std::ios::binary);
@@ -1303,6 +1320,41 @@ struct Simulation
         const auto tree = nanovdb::util::cuda::DeviceGridTraits<BuildT>::getTreeData(this->domainGrid(), cudaStream_t(0));
         domainLeaves = tree.mNodeCount[0], domainCount = tree.mVoxelCount + 1;
         gTime = time;
+        // The markers and the drops, if the file has them (see save()); without them both start anew.
+        uint64_t tail[2] = {0, 0};
+        is.read(reinterpret_cast<char*>(tail), sizeof(tail));
+        if (!is || tail[0] != kCheckpointTail) return;
+        double   sums[3];
+        int64_t  counts[5];
+        uint64_t chunks = 0, bytes = 0;
+        is.read(reinterpret_cast<char*>(sums), sizeof(sums));
+        is.read(reinterpret_cast<char*>(counts), sizeof(counts));
+        is.read(reinterpret_cast<char*>(&chunks), sizeof(chunks));
+        stepsBefore = long(tail[1]);
+        waterTarget = sums[0], sprayEmitted = sums[1], sprayDeposited = sums[2];
+        airRemoved = long(counts[0]), markerEscaped[0] = long(counts[1]), markerEscaped[1] = long(counts[2]);
+        markerSignChanges = long(counts[3]), markerLost = long(counts[4]);
+        std::vector<char> host;
+        if (markers) markers->chunks.clear();
+        for (uint64_t c = 0; c < chunks; ++c) {
+            is.read(reinterpret_cast<char*>(&bytes), sizeof(bytes));
+            host.resize(bytes);
+            is.read(host.data(), std::streamsize(bytes));
+            if (!is || bytes != pls::Particles::kChunk * sizeof(pls::Particle)) throw std::runtime_error("checkpoint: bad chunk of markers");
+            if (!markers) continue;
+            markers->chunks.emplace_back(pls::Particles::kChunk);
+            cudaCheck(cudaMemcpy(markers->chunks.back().data().get(), host.data(), bytes, cudaMemcpyHostToDevice));
+        }
+        if (markers) markers->recount();
+        is.read(reinterpret_cast<char*>(&bytes), sizeof(bytes));
+        host.resize(bytes);
+        is.read(host.data(), std::streamsize(bytes));
+        if (!is) throw std::runtime_error("checkpoint: short file (drops)");
+        if (drops) {
+            drops->drops.resize(bytes / sizeof(spray::Drop));
+            if (bytes) cudaCheck(cudaMemcpy(drops->drops.data().get(), host.data(), bytes, cudaMemcpyHostToDevice));
+        }
+        restoredParticles = true;
     }
 
     // CHECK=1: an exact test of what PropagateSign needs, before a tracker is built or prunes. On the host, flood
@@ -1996,7 +2048,11 @@ static int runDam(int nx, int ny, int nz, double width, double height, double en
         sim.load(path, extra);
         firstVolume = extra[0], firstStep = int(extra[1]) + 1, reportIndex = int(extra[2]);
         nextReport = sim.time * timeScale;
-        std::printf("continuing from %s: T* %.3f, step %d\n", path, sim.time * timeScale, firstStep - 1);
+        std::printf("continuing from %s: T* %.3f, step %d", path, sim.time * timeScale, firstStep - 1);
+        if (sim.restoredParticles)
+            std::printf("; %zu markers and %zu drops are in the file\n", sim.markers ? sim.markers->size() : size_t(0), sim.drops ? sim.drops->size() : size_t(0));
+        else
+            std::printf("; the file has no markers and no drops: they start anew\n");
     }
     if (sim.drops && (!sim.markers || sim.pipeline != 2 || sim.volumeControl)) throw std::runtime_error("SPRAY needs PLS and PIPE=2, and no VOLCTL");
     if (sim.volumeControl) {
